@@ -75,9 +75,17 @@ def verify_cook(entrypoint, pin, env):
     need(entrypoint.is_absolute() and entrypoint.is_file(), 'absolute cook entrypoint required')
     root = entrypoint.parent.parent
     need(entrypoint.resolve() == root.resolve() / 'bin/cook', 'use the reviewed source bin/cook entrypoint')
+    # The reviewed checkout may be owned by another account (root) and read-only.
+    # Trust exactly this resolved path for these calls only; never '*', never a
+    # gitconfig write. No fsmonitor, hooks or optional index-lock refreshes run.
+    checkout = str(root.resolve())
+    prefix = ['git', '-c', 'safe.directory=' + checkout, '-c', 'core.fsmonitor=false',
+              '-c', 'core.hooksPath=/dev/null', '--no-optional-locks', '-C', checkout]
+    prefix_flags = (1, 3, 5, 7, 8)
     def git(*args, flag_indices=()):
-        return command(['git', '-C', str(root), *args], env=env, capture=True,
-                       flag_indices=(1,) + tuple(index + 3 for index in flag_indices)).decode().strip()
+        return command(prefix + list(args), env=env, capture=True,
+                       flag_indices=prefix_flags + tuple(index + len(prefix) for index in flag_indices)
+                       ).decode().strip()
     need(git('rev-parse', 'HEAD') == pin, 'cook checkout differs from requested pin')
     need(git('rev-parse', 'HEAD^{tree}') == git('rev-parse', COOK_COMMIT + '^{tree}'),
          'unsupported cook source tree')

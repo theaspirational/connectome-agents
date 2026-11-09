@@ -784,6 +784,49 @@ class AdapterTests(ScratchTest):
             with self.assertRaisesRegex(adapter.AdapterError, 'clean'):
                 adapter.verify_cook(str(source / 'bin/cook'), commit, env)
 
+    def test_source_checkout_git_argv_trusts_exact_resolved_path(self):
+        source = self.work / 'source'
+        commit = repository(source, {'bin/cook': 'example'})
+        link = self.work / 'link'; link.symlink_to(source)
+        checkout = str(source.resolve())
+        prefix = ['git', '-c', 'safe.directory=' + checkout, '-c', 'core.fsmonitor=false',
+                  '-c', 'core.hooksPath=/dev/null', '--no-optional-locks', '-C', checkout]
+        calls = []
+        def capture(argv, env, capture, flag_indices):
+            adapter.validate_arguments(argv, flag_indices)
+            calls.append((argv, tuple(flag_indices)))
+            return ('' if 'status' in argv else commit).encode()
+        with patch.object(adapter, 'COOK_COMMIT', commit), patch.object(adapter, 'command', side_effect=capture):
+            adapter.verify_cook(str(link / 'bin/cook'), commit, {})
+        self.assertEqual([argv[len(prefix):] for argv, _ in calls], [
+            ['rev-parse', 'HEAD'], ['rev-parse', 'HEAD^{tree}'], ['rev-parse', commit + '^{tree}'],
+            ['status', '--porcelain', '--untracked-files=normal']])
+        for argv, flags in calls:
+            self.assertEqual(argv[:len(prefix)], prefix)
+            self.assertNotIn('safe.directory=*', argv)
+            self.assertEqual(flags, (1, 3, 5, 7, 8) + ((len(prefix) + 1, len(prefix) + 2) if 'status' in argv else ()))
+
+    @unittest.skipUnless(shutil.which('fakeroot'), 'fakeroot unavailable')
+    def test_source_checkout_owned_by_another_uid_is_verified(self):
+        # Under fakeroot the euid is 0 and the chowned checkout reports uid 4242,
+        # which trips Git's real ownership check without touching any gitconfig.
+        source = self.work / 'source'
+        commit = repository(source, {'bin/cook': 'example'})
+        # Only fakeroot's own preload state is added to the stripped Git env, so
+        # Git still sees the faked euid and ownership.
+        program = ('import sys; sys.path.insert(0, sys.argv[1]); import connectome_cook as a; '
+                   'a.COOK_COMMIT = sys.argv[3]; a.verify_cook(sys.argv[2] + "/bin/cook", sys.argv[3], '
+                   'dict({k: v for k, v in a.os.environ.items() if k == "PATH" or k == "FAKED_MODE" '
+                   'or k == "FAKEROOTKEY" or k.startswith("LD_")}, HOME=sys.argv[4]))')
+        home = self.work / 'home'; home.mkdir()
+        env = {'PATH': os.environ['PATH'], 'HOME': str(home)}
+        script = ('chown -R 4242:4242 "$1" && ! git -C "$1" rev-parse HEAD 2>/dev/null && '
+                  'exec "$2" -I -c "$3" "$4" "$1" "$5" "$6"')
+        subprocess.run(['fakeroot', 'sh', '-c', script, 'sh', str(source), sys.executable, program,
+                        str(ROOT / 'roles/connectome_agent/module_utils'), commit, str(home)],
+                       env=env, check=True, stdout=subprocess.DEVNULL)
+        self.assertFalse((home / '.gitconfig').exists())
+
     def test_invocation_names_only_fresh_dir_and_post_build_validation(self):
         spec = self.spec()
         spec_path = self.build / 'deployment.json'; spec_path.write_text(json.dumps(spec))
