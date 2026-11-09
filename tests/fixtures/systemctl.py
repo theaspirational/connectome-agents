@@ -12,4 +12,11 @@ if args[0] == 'is-active':
     fail = root / 'fail-health'
     if fail.exists() and fail.read_text() == str((root / 'current').resolve()):
         sys.exit(3)
+
+if args[0] == 'show':
+    current = (root / 'current').resolve()
+    reject = root / 'reject-env'
+    if not reject.exists() or reject.read_text() != str(current):
+        print(str(current / 'secrets.env') + ' (ignore_errors=no)')
+
 sys.exit(0)

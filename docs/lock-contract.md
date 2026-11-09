@@ -203,6 +203,9 @@ explanation. CLI argument errors also use a fixed envelope without echoing argv.
 | `E_ADAPTER_INPUT` | Invalid adapter input or unavailable local prerequisite. |
 | `E_LOCK_INVALID` | Cook lock or framework provenance lock failed validation. |
 | `E_LOCK_STATE_PATH` | Returned persistent state/layout differs from the request. |
+| `E_ANCESTOR_WRITABLE` | Existing group/other-writable ancestor; the deployment result names `ancestor_path`. No chmod or writes occur. |
+| `E_SYSTEMD_PATH` | Use literal absolute paths without whitespace, specifiers, globs or escapes. |
+| `E_ENVIRONMENT_FILE` | Manager did not accept the required non-optional environment file. |
 | `E_SECRETS_MODE` | Require owned directory 0700/file 0600 without symlinks; never repaired automatically. |
 | `E_BUDGETS_UNSUPPORTED` | Remove nonempty budgets explicitly; no enforcement is implied. |
 | `E_COOK_FAILED` | Child command failed; raw output remains redacted. |
@@ -213,6 +216,14 @@ if it belongs to the literal allowlist in `connectome_errors.py` (host engine,
 layout, unit, private-directory and dependency codes). Only the code survives, never its surrounding
 message, paths or values. Ansible accepts only the exact closed envelope and
 regenerates the diagnostic locally; tool output cannot supply arbitrary messages.
+The deployment's local ancestor preflight is the one path-bearing exception:
+`E_ANCESTOR_WRITABLE` adds `ancestor_path`, a directory inspected locally with
+lstat, not a path or message supplied by a subprocess. Existing writable ancestors
+(including sticky writable directories) are refused, not chmodded. All directories
+the role creates receive exact modes independent of umask: missing ancestors
+0755, private roots/builds/state/bookkeeping and artifact parents 0700. Existing
+directories are never chmodded. This preflight also runs in check mode and before
+the Ansible boundary creates its serialization root/lock.
 Activation and provider tasks remain `no_log` to protect secret-bearing inputs.
 
 ## Offline tests
@@ -232,8 +243,11 @@ install cook dependencies or download runtimes. Run with a private 0700 `TMPDIR`
 under non-group-writable ancestors owned by the current user (or root), not the
 worktree hierarchy: cook rejects unsafe ancestors of split-layout roots.
 Missing prerequisites produce an explicit unittest skip reason. Available
-prerequisites followed by a failed build are a failure, not a skip. Unit scratch remains under the ignored worktree `.cache/`; the real-cook
-checkout, empty HOME and split-layout roots use `TMPDIR` and are cleaned up.
+prerequisites followed by a failed build are a failure, not a skip. Schema/adapter
+unit scratch remains under the ignored worktree `.cache/`.
+Deployment lifecycle fixtures use private `TMPDIR` (default: the account home),
+not group-writable worktree ancestors. Real-cook checkout, empty HOME and
+split-layout roots also use `TMPDIR`; all temporary fixtures are cleaned up.
 
 Directory names use a **deployment request ID**: SHA-256 of the canonical merged
 spec, resolved pins and adapter argv. That is separate from cook's `build.id`,
@@ -258,11 +272,26 @@ reads only these names on the target from the agent account's
 override is shown in check plans. Before start, directory 0700/file 0600, uid and
 non-symlink checks fail closed without repair. See [secret providers](layering.md#secret-providers).
 
+The adapter previously emitted `requirements: {}` even without secrets; it now
+omits that empty cook-only key, eliminating the host's ignored-key warning in
+no-secret deployments. With declared secrets it must retain nonempty cook
+`requirements` declarations (`required: false`, no values) so cook records even
+runtime-only secret names in the lock. The reviewed cook's `lowerToConfiguration`
+preserves this build-only metadata, so the host may still warn in that case. It
+is ignored at runtime; the role enforces the required names and supplies values.
+The adapter does not patch cook output or rewrite its lock identity/digests to
+silence that upstream lowering limitation.
+
 Each build's `secrets.env` is atomically written mode 0600 within private build
 storage. Values are double-quoted, with quote/backslash escaping; multiline,
 carriage-return and NUL values are refused. They are environment values, not
 shell assignments to execute. A private drop-in adds this env file to every
-managed unit. Unit links go into the configured systemd user directory;
+managed unit with a bare absolute `EnvironmentFile=` path (no quotes).
+Path directives are not shell commands: the role refuses whitespace, quotes,
+backslashes, `%` specifiers, wildcard syntax and other ambiguous characters
+instead of escaping; accepted paths use only ASCII letters/digits and `_./:@+-`.
+`Environment=DATA_DIR=...` and fallback unit paths use these same literal paths.
+Unit links go into the configured systemd user directory;
 unmanaged units are neither overwritten nor disabled/deleted when retired.
 The ownership preflight covers all manifest entries and new/retired unit paths
 before changing the env file, current pointer or service manager. Exact ownership,
@@ -270,6 +299,15 @@ not merely containment in `builds/`, is required. No state lives under `current`
 
 Activation switches `current` atomically, reloads the manager, enables/restarts
 managed units, then checks `is-active` and the optional argv health command.
+When the build declares required secrets, each unit must also report the exact
+`secrets.env` path with `ignore_errors=no` via
+`systemctl --user show -p EnvironmentFiles --value UNIT`. This checks the loaded
+manager state after reload/restart, not just on-disk text; missing/rejected files
+or failed inspection fail health and trigger rollback. Identical-request health
+checks and rollback health use the respective build's declarations too. This
+proves acceptance, not application-level consumption of each secret. The directive
+and `show` semantics were checked against local systemd.exec(5), systemctl(1)
+and org.freedesktop.systemd1(5) (systemd 255).
 On failure the previous pointer, unit set and env reference are restored and
 restarted. No previous build is rebuilt or deleted. Successful identical
 requests with identical env/unit links do not rebuild or restart, but do recheck
@@ -299,8 +337,14 @@ and their links are recorded, rather than adopting cook output files. Old
 installed unit files are retained and remain tracked.
 Secret env contents are not hashed into this manifest.
 
-Every recorded artifact must still exist with the recorded type and exact
-content/target before prepare or activation, including rollback, retirement and check mode.
+Every recorded artifact must still match its recorded type and exact
+content/target before prepare or activation, including rollback, retirement and
+check mode, with one narrow absence exception: `systemctl disable` may remove
+recorded unit/enablement symlinks under unit_dir. Apply recreates those absent
+links without rebuilding; update/rollback also tolerate them. Check mode reports
+the repair as a change without writes. A replacement file, dangling/retargeted
+link, missing drop-in/generated regular unit or missing `current` still fails
+closed; nothing unrecorded is adopted.
 Unknown pre-existing request build directories and files/links at installed unit,
 drop-in, enablement/alias and `current` destinations are never adopted, even if
 they match the desired content/target. Unknown build directories are left unchanged
@@ -334,8 +378,9 @@ file with a valid schema, not authenticated against an external ownership record
 The manifest is updated atomically after each artifact change, so normal
 activation failure can restore the previous unit set using the same ownership
 rules. This is not a crash-atomic multi-file transaction: interruption between
-an artifact write and manifest update can require manual recovery. Missing,
-modified or corrupt manifests/artifacts fail closed. There is no automatic
+an artifact write and manifest update can require manual recovery. Missing
+(except the unit-link case above), modified or corrupt manifests/artifacts fail
+closed. There is no automatic
 adoption/migration for older deployments without a manifest or a build-directory
 entry. Stop the affected agent and have an operator inspect, back up and remove legacy/conflicting
 artifacts before a fresh deployment; do not erase a manifest to bypass drift.

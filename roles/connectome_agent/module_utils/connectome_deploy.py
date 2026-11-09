@@ -24,13 +24,48 @@ class DeployError(SafeError):
     pass
 
 
+class AncestorWritable(DeployError):
+    """Only a locally inspected directory path, never tool output, is public."""
+    def __init__(self, path):
+        super().__init__('group/other-writable ancestor: ' + str(path), 'E_ANCESTOR_WRITABLE')
+        self.path = str(path)
+
+    def public(self):
+        return dict(super().public(), ancestor_path=self.path)
+
+
+def check_ancestors(path):
+    for parent in reversed(Path(path).parents):
+        try:
+            info = parent.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(info.st_mode) and info.st_mode & 0o022:
+            raise AncestorWritable(parent)
+
+
+def make_directory(path, mode=0o700):
+    """Set exact modes only on directories this call creates, never repair."""
+    path = Path(path)
+    if not path.parent.exists():
+        make_directory(path.parent, 0o755)
+    try:
+        path.mkdir(mode=mode)
+    except FileExistsError:
+        if not path.is_dir() or path.is_symlink():
+            raise DeployError('refusing non-directory or symlinked directory') from None
+    else:
+        # mkdir's mode is masked by umask; chmod only our new directory.
+        path.chmod(mode)
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'))
 
 
 def atomic_write(path, content, mode=0o600):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    make_directory(path.parent)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.write-')
     try:
         os.fchmod(fd, mode)
@@ -44,7 +79,7 @@ def atomic_write(path, content, mode=0o600):
 
 def link(path, target):
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    make_directory(path.parent)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.link-')
     os.close(fd)
     tmp = Path(temporary)
@@ -167,11 +202,21 @@ class Deployment:
                 value != os.path.abspath(value) or any(ord(c) < 32 or ord(c) == 127 for c in value)):
             raise DeployError('secrets_file must be a canonical absolute path')
         self.secrets_file = Path(os.path.abspath(value))
+        self._path_preflight()
         self._validate_state()
         self.manifest_path = self.state / 'ownership.json'
         self.lock_path()
 
+    def _path_preflight(self):
+        for path in (self.root, self.state_dir, self.secrets_file, self.unit_dir):
+            self._systemd_path(str(path))
+            check_ancestors(path)
+        # Root and unit_dir become parents of installed files too.
+        for path in (self.root, self.unit_dir):
+            check_ancestors(path / '.path-check')
+
     def validate_paths(self):
+        self._path_preflight()
         validate_config(self.config)
         base_path(self.base)
         base_path(self.unit_dir)
@@ -204,7 +249,7 @@ class Deployment:
 
     def _ensure_state(self):
         self._validate_state()
-        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        make_directory(self.state_dir)
         self._validate_state()
 
     def _check_secrets_file(self):
@@ -309,10 +354,10 @@ class Deployment:
             # contained a plausible .prepared marker. Only our own incomplete,
             # inactive request directory may be recursively discarded.
             shutil.rmtree(self.build)
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.builds.mkdir(exist_ok=True, mode=0o700)
-        self.build.mkdir(mode=0o700)
-        self.state.mkdir(exist_ok=True, mode=0o700)
+        make_directory(self.root)
+        make_directory(self.builds)
+        make_directory(self.build)
+        make_directory(self.state)
         self.owned[self.build] = {'kind': 'directory'}
         self._save_ownership()  # persist ownership before invoking cook
         recipe = inside(self.build, 'deployment.json')
@@ -344,8 +389,8 @@ class Deployment:
             identifier(name)
             unit = inside(build, 'connectome-' + name + '.service')
             body = ('[Unit]\nDescription=Connectome agent\n[Service]\nType=simple\n'
-                    'WorkingDirectory=' + self._systemd_quote(self._config(build)['state_dir']) + '\nExecStart=' +
-                    self._systemd_quote(str(script)) + '\nRestart=on-failure\n[Install]\nWantedBy=default.target\n')
+                    'WorkingDirectory=' + self._systemd_path(self._config(build)['state_dir']) + '\nExecStart=' +
+                    self._systemd_path(str(script)) + '\nRestart=on-failure\n[Install]\nWantedBy=default.target\n')
             self.rendered_units[unit] = body
             return {unit.name: unit}
         result = {}
@@ -365,12 +410,34 @@ class Deployment:
         return result
 
     @staticmethod
-    def _systemd_quote(value):
-        return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+    def _systemd_path(value):
+        # EnvironmentFile/WorkingDirectory take paths, not shell-quoted words.
+        # Refuse specifiers, globs, escapes, whitespace and other ambiguous input
+        # instead of attempting directive-dependent escaping.
+        if not re.fullmatch(r'/[A-Za-z0-9_./:@+-]+', value):
+            raise DeployError('systemd paths require an absolute literal path without whitespace or special characters',
+                              'E_SYSTEMD_PATH')
+        return value
+
+    def _check_environment_file(self, name, build):
+        expected = self._systemd_path(str(inside(build, 'secrets.env')))
+        try:
+            result = subprocess.run(self.systemctl + ['show', '-p', 'EnvironmentFiles', '--value', name],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+        except OSError:
+            raise DeployError('cannot inspect unit environment file', 'E_ENVIRONMENT_FILE') from None
+        # systemctl show is the documented machine-readable manager view, not
+        # the on-disk text. Require this exact non-optional file in every unit.
+        accepted = re.search(rb'(?:^|\s)' + re.escape(expected.encode()) +
+                             rb' \(ignore_errors=no\)(?:\s|$)', result.stdout)
+        if result.returncode or not accepted:
+            raise DeployError('required unit environment file not accepted', 'E_ENVIRONMENT_FILE')
 
     def _health(self, units, lock, build):
         for name in units:
             run(self.systemctl + ['is-active', '--quiet', name])
+            if secret_names(self._config(build)):
+                self._check_environment_file(name, build)
         health = lock.get('health', self._config(build).get('health', {}))
         if health.get('command'):
             if not isinstance(health['command'], list):
@@ -404,6 +471,7 @@ class Deployment:
             raise DeployError('refusing symlinked artifact parent directory')
         if any(parent.exists() and not parent.is_dir() for parent in path.parents):
             raise DeployError('refusing non-directory artifact parent')
+        check_ancestors(path)
 
     def _matches(self, path, record):
         self._safe_parent(path)
@@ -451,9 +519,15 @@ class Deployment:
         if self.build.exists() and self.owned.get(self.build) != {'kind': 'directory'}:
             raise DeployError('refusing unmanaged build directory; no matching ownership manifest entry')
 
+    def _missing_unit_link(self, path, record):
+        # systemctl disable removes unit/enablement symlinks. Recreate only
+        # recorded, absent unit-dir links; never adopt a replacement or a file.
+        return (record['kind'] == 'link' and path.is_relative_to(self.unit_dir) and
+                path.name.endswith('.service') and not path.exists() and not path.is_symlink())
+
     def _verify_ownership(self):
         for path, record in self.owned.items():
-            if not self._matches(path, record):
+            if not self._matches(path, record) and not self._missing_unit_link(path, record):
                 raise DeployError('refusing unmanaged, modified or missing artifact; ownership mismatch')
 
     def _save_ownership(self):
@@ -463,7 +537,7 @@ class Deployment:
     def _put(self, path, record, content=None):
         # Callers preflight the entire transaction before the first mutation.
         self._preflight({path: (record, content)})
-        if path in self.owned and self.owned[path] == record:
+        if path in self.owned and self.owned[path] == record and self._matches(path, record):
             return
         if record['kind'] == 'link':
             link(path, record['target'])
@@ -473,9 +547,14 @@ class Deployment:
         self._save_ownership()
 
     def _remove(self, path):
-        if path not in self.owned or not self._matches(path, self.owned[path]):
+        if path not in self.owned:
             raise DeployError('refusing to remove unmanaged or modified artifact')
-        path.unlink()
+        if self._missing_unit_link(path, self.owned[path]):
+            pass
+        elif self._matches(path, self.owned[path]):
+            path.unlink()
+        else:
+            raise DeployError('refusing to remove unmanaged or modified artifact')
         del self.owned[path]
         self._save_ownership()
 
@@ -526,9 +605,9 @@ class Deployment:
                 additions[source] = (self._file_record(body), body)
             additions[self._unit_path(name)] = (self._link_record(source), None)
             body = ('[Service]\nEnvironment=' +
-                    self._systemd_quote('DATA_DIR=' + self._config(build)['state_dir']) +
+                    'DATA_DIR=' + self._systemd_path(self._config(build)['state_dir']) +
                     '\nEnvironmentFile=' +
-                    self._systemd_quote(str(inside(build, 'secrets.env'))) + '\n')
+                    self._systemd_path(str(inside(build, 'secrets.env'))) + '\n')
             additions[self._dropin(name)] = (self._file_record(body), body)
             for path, artifact in additions.items():
                 if path in result and result[path] != artifact:
@@ -557,8 +636,10 @@ class Deployment:
         for path in list(self.owned):
             if path.is_relative_to(self.unit_dir) and path not in artifacts:
                 self._remove(path)
-                if path.parent != self.unit_dir and not list(path.parent.iterdir()):
+                if path.parent != self.unit_dir and path.parent.exists() and not list(path.parent.iterdir()):
                     path.parent.rmdir()
+        if artifacts:
+            make_directory(self.unit_dir)
         for path, (record, content) in artifacts.items():
             self._put(path, record, content)
         run(self.systemctl + ['daemon-reload'])
@@ -599,7 +680,7 @@ class Deployment:
         env_path = inside(self.build, 'secrets.env')
         same_env = (env_path.is_file() and env_path.read_text() == env and
                     env_path.stat().st_mode & 0o777 == 0o600)
-        same_units = all(path in self.owned and self.owned[path] == record
+        same_units = all(path in self.owned and self.owned[path] == record and self._matches(path, record)
                          for path, (record, _) in artifacts.items())
         retired = any(path.is_relative_to(self.unit_dir) and path not in artifacts for path in self.owned)
         if self.check:
@@ -614,7 +695,7 @@ class Deployment:
             self._put(self.current, self._link_record(self.build))
             self._install(units, previous_units, self.build)
             self._health(units, lock, self.build)
-        except Exception:
+        except Exception as error:
             try:
                 if previous:
                     if previous == self.build and old_env is not None:
@@ -627,5 +708,6 @@ class Deployment:
                     self._install({}, units, self.build)
             except Exception:
                 raise DeployError('activation failed; rollback recovery also failed') from None
-            raise DeployError('activation failed; previous deployment restored') from None
+            raise DeployError('activation failed; previous deployment restored',
+                              error.code if isinstance(error, DeployError) else 'E_DEPLOY_FAILED') from None
         return {'changed': True, 'build_dir': str(self.build), 'build_id': lock['build']['id']}

@@ -31,7 +31,9 @@ parents and unit/drop-in parents must not be symlink aliases, even within the
 deployment tree. An atomic `state/ownership.json` records created build directories
 and installed unit files, drop-ins and links by exact path and target/content hash.
 Unrecorded unit destinations and `current` are not adopted or overwritten; recorded
-files/links must still match before replacement or retirement. Incomplete, inactive
+files/links must still match before replacement or retirement, except absent
+recorded unit/enablement symlinks removed by `systemctl disable`, which apply
+recreates without rebuilding. Incomplete, inactive
 owned build directories may be recursively cleaned, including untracked contents;
 this is not protection for arbitrary files placed inside them. Runtime state is external and never rewritten, moved or deleted by the role;
 trusted cook/runtime code can modify it. Secret env files and cook outputs are
@@ -65,7 +67,14 @@ must be trusted. There is no fd/openat race-hardening claim. See the
    prerequisite). Each agent needs its own root and unique unit names.
    `connectome_root` must resolve within `connectome_base` (default: the account's
    `.local/share/connectome`). Override both when relocating deployments. Bases
-   and their ancestors must not be symlinks. Agent and connector identifiers use
+   and their ancestors must not be symlinks. Existing ancestors of root,
+   state and secrets must not be group/other-writable: preflight fails with
+   `E_ANCESTOR_WRITABLE` and `ancestor_path`, never repairs their permissions.
+   The role sets exact modes on directories it creates (0755 missing ancestors,
+   0700 private directories), independent of umask. Systemd paths accept only
+   absolute literal ASCII paths using letters, digits and `_./:@+-`; whitespace,
+   quotes, specifiers, globs and escapes are refused, not escaped.
+   Agent and connector identifiers use
    `[a-z0-9][a-z0-9-]{0,62}` and are checked before any deployment writes.
 
 ```sh

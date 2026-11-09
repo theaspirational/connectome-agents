@@ -16,7 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'roles/connectome_agent/module_utils'))
 from connectome_config import merge_layers, public_catalog
-from connectome_deploy import Deployment, DeployError
+from connectome_deploy import Deployment, DeployError, make_directory
 
 
 def read(path):
@@ -44,8 +44,10 @@ class MockProvider:
 
 class DeployTests(unittest.TestCase):
     def setUp(self):
-        (ROOT / '.cache').mkdir(exist_ok=True)
-        self.tmp = tempfile.TemporaryDirectory(dir=ROOT / '.cache')
+        old_mask = os.umask(0o022)
+        self.addCleanup(os.umask, old_mask)
+        # Deployment fixtures must have non-writable ancestors, like real cook.
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', Path.home()))
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / 'agent'
         self.units = Path(self.tmp.name) / 'units'
@@ -79,6 +81,180 @@ class DeployTests(unittest.TestCase):
                 p.lstat().st_mode, p.lstat().st_mtime_ns,
                 p.read_bytes() if p.is_file() else None)
                 for p in [path, *path.rglob('*')]}
+
+    def test_rendered_systemd_paths_are_bare_literals(self):
+        dep = self.deployment()
+        self.apply(dep)
+        dropin = self.units / 'connectome-example.service.d/90-connectome-env.conf'
+        self.assertEqual(dropin.read_text(), '[Service]\nEnvironment=DATA_DIR=' +
+                         str(dep.state_dir) + '\nEnvironmentFile=' + str(dep.build / 'secrets.env') + '\n')
+        unit = (dep.build / 'connectome-example.service').read_text()
+        self.assertIn('WorkingDirectory=' + str(dep.state_dir) + '\n', unit)
+        self.assertIn('ExecStart=' + str(dep.build / 'run.sh') + '\n', unit)
+
+    def test_ambiguous_systemd_paths_fail_before_writes(self):
+        for bad in ('a b', 'a\tb', 'a\nb', 'a%b', 'a*b', 'a?b', 'a[b]', 'a"b', "a'b", 'a\\b', 'a$b', 'a;b'):
+            for field in ('root', 'unit_dir', 'state_dir', 'secrets_file'):
+                with self.subTest(bad=bad, field=field):
+                    config = copy.deepcopy(self.config)
+                    root, units = self.root, self.units
+                    path = str(Path(self.tmp.name) / bad)
+                    if field == 'root':
+                        root = Path(path)
+                    elif field == 'unit_dir':
+                        units = Path(path)
+                    else:
+                        config[field] = path
+                    before = self.snapshot()
+                    with self.assertRaises(DeployError):
+                        Deployment(root, units, config, self.versions, self.cook)
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_directory_modes_ignore_umask_without_repairing_existing_dirs(self):
+        for mask in (0o002, 0o077):
+            with self.subTest(umask=mask):
+                base = Path(self.tmp.name) / ('mask-' + str(mask))
+                self.root = base / '.local/share/connectome/example'
+                self.units = base / '.config/systemd/user'
+                self.config['state_dir'] = str(base / '.local/state/connectome/example')
+                self.systemctl[-1] = str(self.root)
+                old = os.umask(mask)
+                try:
+                    dep = self.deployment()
+                    self.apply(dep)
+                finally:
+                    os.umask(old)
+                for path in (base, base / '.local', base / '.local/share',
+                             base / '.local/share/connectome', base / '.local/state',
+                             base / '.local/state/connectome', base / '.config', base / '.config/systemd'):
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755, str(path))
+                for path in (dep.root, dep.builds, dep.build, dep.state, dep.state_dir, dep.unit_dir,
+                             dep.unit_dir / 'connectome-example.service.d', dep.unit_dir / 'default.target.wants'):
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700, str(path))
+        existing = Path(self.tmp.name) / 'existing'
+        existing.mkdir(mode=0o750)
+        make_directory(existing)
+        self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o750)
+
+    def test_directory_helper_sets_exact_modes_under_fully_restrictive_umask(self):
+        path = Path(self.tmp.name) / 'ancestor/private'
+        old = os.umask(0o777)
+        try:
+            make_directory(path)
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+
+    def test_writable_ancestors_are_named_and_never_modified(self):
+        for field in ('root', 'state_dir', 'secrets_file'):
+            for mode in (0o775, 0o757):
+                with self.subTest(field=field, mode=mode):
+                    parent = Path(self.tmp.name) / 'unsafe'
+                    parent.mkdir()
+                    parent.chmod(mode)
+                    config = copy.deepcopy(self.config)
+                    root = self.root
+                    if field == 'root':
+                        root = parent / 'agent'
+                    else:
+                        config[field] = str(parent / 'nested/leaf')
+                    before = self.snapshot()
+                    for check in (False, True):
+                        with self.assertRaises(DeployError) as error:
+                            Deployment(root, self.units, config, self.versions, self.cook, check=check)
+                        self.assertEqual(error.exception.public()['error_code'], 'E_ANCESTOR_WRITABLE')
+                        self.assertEqual(error.exception.public()['ancestor_path'], str(parent))
+                        self.assertEqual(self.snapshot(), before)
+                    parent.rmdir()
+        dep = self.deployment()
+        self.root.parent.chmod(0o775)
+        try:
+            before = self.snapshot()
+            with self.assertRaises(DeployError) as error:
+                dep.prepare()
+            self.assertEqual(error.exception.code, 'E_ANCESTOR_WRITABLE')
+            self.assertEqual(self.snapshot(), before)
+        finally:
+            self.root.parent.chmod(0o700)
+
+    def test_required_env_file_manager_rejection_rolls_back(self):
+        self.config['required_secrets'] = ['EXAMPLE_SECRET']
+        first = self.deployment()
+        self.apply(first)
+        config = copy.deepcopy(self.config)
+        config['description'] = 'Second request'
+        bad = self.deployment(config)
+        bad.prepare()
+        (self.root / 'reject-env').write_text(str(bad.build))
+        before = (self.root / 'systemctl-calls').read_text().splitlines()
+        with self.assertRaisesRegex(DeployError, 'restored') as error:
+            bad.activate(self.provider.get(bad.names))
+        self.assertEqual(error.exception.code, 'E_ENVIRONMENT_FILE')
+        self.assertEqual(first.current.resolve(), first.build)
+        calls = [json.loads(line) for line in (self.root / 'systemctl-calls').read_text().splitlines()[len(before):]]
+        self.assertEqual(sum(call[0] == 'show' for call in calls), 2)  # candidate and rollback
+        self.assertIn(str(first.build / 'secrets.env'),
+                      (self.units / 'connectome-example.service.d/90-connectome-env.conf').read_text())
+
+    def test_first_activation_env_file_rejection_removes_units(self):
+        self.config['required_secrets'] = ['EXAMPLE_SECRET']
+        dep = self.deployment()
+        dep.prepare()
+        (self.root / 'reject-env').write_text(str(dep.build))
+        with self.assertRaises(DeployError) as error:
+            dep.activate(self.provider.get(dep.names))
+        self.assertEqual(error.exception.code, 'E_ENVIRONMENT_FILE')
+        self.assertFalse(dep.current.exists())
+        self.assertFalse((self.units / 'connectome-example.service').exists())
+
+    def test_environment_file_health_requires_exact_nonoptional_manager_path(self):
+        dep = self.deployment()
+        expected = str(dep.build / 'secrets.env').encode()
+        for output, code in ((b'', 0), (expected + b' (ignore_errors=yes)\n', 0),
+                             (expected + b'.other (ignore_errors=no)\n', 0),
+                             (expected + b' (ignore_errors=no)\n', 1)):
+            with self.subTest(output=output), patch('connectome_deploy.subprocess.run',
+                    return_value=SimpleNamespace(returncode=code, stdout=output)):
+                with self.assertRaises(DeployError) as error:
+                    dep._check_environment_file('example.service', dep.build)
+                self.assertEqual(error.exception.code, 'E_ENVIRONMENT_FILE')
+        with patch('connectome_deploy.subprocess.run', return_value=SimpleNamespace(
+                returncode=0, stdout=b'/other (ignore_errors=yes) ' + expected + b' (ignore_errors=no)\n')):
+            dep._check_environment_file('example.service', dep.build)
+
+    def test_apply_recreates_disabled_unit_links_without_rebuild(self):
+        first = self.deployment()
+        self.apply(first)
+        unit = self.units / 'connectome-example.service'
+        enabled = self.units / 'default.target.wants/connectome-example.service'
+        unit.unlink()
+        enabled.unlink()
+        enabled.parent.rmdir()
+        before = (self.root / 'cook-calls').read_text()
+        snapshot = self.snapshot()
+        check = self.deployment(check=True)
+        self.assertFalse(check.prepare()['changed'])
+        self.assertTrue(check.activate({})['changed'])
+        self.assertEqual(self.snapshot(), snapshot)
+        self.assertTrue(self.apply(self.deployment())['changed'])
+        self.assertEqual(unit.resolve(), first.build / unit.name)
+        self.assertTrue(enabled.is_symlink())
+        self.assertEqual((self.root / 'cook-calls').read_text(), before)
+        self.assertFalse(self.apply(self.deployment())['changed'])
+        # Update and rollback tolerate links removed by systemctl disable too.
+        unit.unlink()
+        enabled.unlink()
+        config = copy.deepcopy(self.config)
+        config['name'] = 'renamed'
+        bad = self.deployment(config)
+        bad.prepare()
+        (self.root / 'fail-health').write_text(str(bad.build))
+        with self.assertRaisesRegex(DeployError, 'restored'):
+            bad.activate({})
+        self.assertTrue(unit.is_symlink())
+        self.assertTrue(enabled.is_symlink())
+        self.assertEqual(first.current.resolve(), first.build)
 
     def test_registry_archive_plan_and_retained_sidecar(self):
         from test_cook import framework_archive
@@ -338,7 +514,7 @@ class DeployTests(unittest.TestCase):
         self.assertFalse(self.apply(first)['changed'])
         self.assertEqual(before, {p: p.stat().st_mtime_ns for p in before})
         after = (self.root / 'systemctl-calls').read_text().splitlines()[len(calls):]
-        self.assertTrue(all(json.loads(line)[0] == 'is-active' for line in after))
+        self.assertEqual([json.loads(line)[0] for line in after], ['is-active', 'show'])
         self.assertEqual(len((self.root / 'cook-calls').read_text().splitlines()), 1)
         second_config = copy.deepcopy(self.config)
         second_config['budgets']['max_cost'] = 3
@@ -678,6 +854,8 @@ class DeployTests(unittest.TestCase):
             old_link = os.readlink(path) if path.is_symlink() else None
             old_content = None if old_link else path.read_bytes()
             for kind in ('modified', 'missing'):
+                if kind == 'missing' and path.is_relative_to(self.units) and path.is_symlink():
+                    continue
                 with self.subTest(path=path.name, kind=kind):
                     path.unlink()
                     if kind == 'modified':

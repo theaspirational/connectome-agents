@@ -104,12 +104,15 @@ class ErrorTests(unittest.TestCase):
     def test_ansible_boundary_displays_each_code_and_fixed_message(self):
         class Failed(Exception):
             pass
-        for code in errors.MESSAGES:
-            with self.subTest(code=code):
+        failures = [(errors.SafeError(SENTINEL, code), errors.diagnostic(code)) for code in errors.MESSAGES]
+        ancestor = deploy.AncestorWritable('/example/ancestor')
+        failures.append((ancestor, dict(errors.diagnostic('E_ANCESTOR_WRITABLE'), ancestor_path='/example/ancestor')))
+        for failure, expected in failures:
+            with self.subTest(code=failure.code):
                 module = Mock(params={'operation': 'prepare', 'secrets': None}, check_mode=True)
                 module.fail_json.side_effect = Failed()
                 engine = Mock()
-                engine.prepare.side_effect = errors.SafeError(SENTINEL, code)
+                engine.prepare.side_effect = failure
                 modules = {
                     'ansible.module_utils.basic': SimpleNamespace(AnsibleModule=Mock(return_value=module)),
                     'ansible.module_utils.connectome_deploy': deploy,
@@ -122,5 +125,5 @@ class ErrorTests(unittest.TestCase):
                     spec.loader.exec_module(boundary)
                     with patch.object(boundary, 'Deployment', return_value=engine), self.assertRaises(Failed):
                         boundary.main()
-                module.fail_json.assert_called_once_with(invocation={}, exception=None, **errors.diagnostic(code))
+                module.fail_json.assert_called_once_with(invocation={}, exception=None, **expected)
                 module.exit_json.assert_not_called()

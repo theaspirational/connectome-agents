@@ -292,6 +292,14 @@ class AdapterTests(ScratchTest):
         recipe, _ = adapter.recipe_from_spec(spec)
         self.assertNotIn('budgets', recipe)
 
+    def test_no_secret_recipe_omits_cook_only_requirements(self):
+        spec = self.spec()
+        spec['config']['connectors'] = {}
+        spec['pins']['connectors'] = {}
+        recipe, names = adapter.recipe_from_spec(spec)
+        self.assertEqual(names, [])
+        self.assertNotIn('requirements', recipe)
+
     def test_translate_normalized_spec_and_quote_build_argv(self):
         spec = self.spec(); before = deepcopy(spec)
         recipe, names = adapter.recipe_from_spec(spec)
@@ -627,7 +635,10 @@ class RealCookTests(unittest.TestCase):
     def test_real_cook_offline_registry_release_build(self):
         self.real_build(registry=True)
 
-    def real_build(self, registry):
+    def test_real_cook_offline_no_secrets_build(self):
+        self.real_build(registry=False, with_secrets=False)
+
+    def real_build(self, registry, with_secrets=True):
         """No fake runtimes/Git/dependency tools, downloads, or network recipes."""
         required = ('CONNECTOME_TEST_COOK_SOURCE', 'CONNECTOME_TEST_BUN', 'CONNECTOME_TEST_COOK_DEPS')
         missing_env = [name for name in required if not os.environ.get(name)]
@@ -670,8 +681,10 @@ class RealCookTests(unittest.TestCase):
         host_pin = repository(host, {'package.json': json.dumps({'name': 'example-host', 'version': '1.0.0',
                      'type': 'module', 'engines': {'bun': '>=1.0.0', 'node': '>=20.0.0'},
                      'dependencies': {adapter.FRAMEWORK: '^1.0.0'}}), 'src/index.ts': 'console.log("example");\n'})
-        spec = {'config': {'name': 'example', 'state_dir': str(self.work / 'state'), 'agent': {'systemPrompt': 'Offline example'},
-                          'required_secrets': ['EXAMPLE_SECRET'], 'connectors': {}, 'modules': {},
+        spec = {'config': {'name': 'example', 'state_dir': str(self.work / 'state'),
+                          'secrets_file': str(self.work / 'secrets/example.json'),
+                          'agent': {'systemPrompt': 'Offline example'},
+                          'required_secrets': ['EXAMPLE_SECRET'] if with_secrets else [], 'connectors': {}, 'modules': {},
                           'cook': {'host_repo': str(host), 'framework_archive': artifact, 'connector_state': {}}},
                 'pins': {'runtime': {'cook': adapter.COOK_COMMIT, 'connectome-host': host_pin,
                                      'agent-framework': framework_pin}, 'connectors': {}}}
@@ -693,7 +706,12 @@ class RealCookTests(unittest.TestCase):
         self.assertEqual(record['connectomeHost']['commit'], host_pin)
         self.assertEqual(record['build']['dir'], str(self.build))
         self.assertEqual(record['state']['path'], str(self.work / 'state'))
-        self.assertEqual(record['requirements'][0]['envName'], 'EXAMPLE_SECRET')
+        if with_secrets:
+            self.assertEqual(record['requirements'][0]['envName'], 'EXAMPLE_SECRET')
+        else:
+            self.assertEqual(record['requirements'], [])
+            rendered = Path(record['layout']['config']) / 'recipes/cook-recipe.json'
+            self.assertNotIn('requirements', json.loads(rendered.read_text()))
         self.assertTrue((self.build / 'run.sh').is_file())
         self.assertIn("export DATA_DIR='" + str(self.work / 'state') + "'",
                       (self.build / 'run.sh').read_text())

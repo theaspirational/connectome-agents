@@ -119,7 +119,7 @@ def recipe_from_spec(spec):
     need(isinstance(agent, dict) and isinstance(agent.get('systemPrompt'), str) and agent['systemPrompt'],
          'agent.systemPrompt is required by cook')
     recipe = {'name': config['name'], 'agent': deepcopy(agent), 'modules': {},
-              'mcpServers': {}, 'extensions': {}, 'requirements': {}}
+              'mcpServers': {}, 'extensions': {}}
     if 'description' in config:
         recipe['description'] = config['description']
     for section in ('connectors', 'modules'):
@@ -146,6 +146,10 @@ def recipe_from_spec(spec):
     names = secret_names(config)
     need(not set(names) & BASE_ENV and not set(names) & {'DATA_DIR', 'WORKSPACE_DIR'},
          'secret names overlap adapter-owned environment')
+    # Cook needs nonempty declarations to record runtime-only names in its
+    # lock. Never emit an empty cook-only block to the host configuration.
+    if names:
+        recipe['requirements'] = {}
     for name in names:
         recipe['requirements'][name] = {'exposeAs': name, 'required': False}
     # A secret-looking env field must be a reference, never a literal/default.

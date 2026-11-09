@@ -3,6 +3,9 @@ import json
 import re
 
 MESSAGES = {
+    'E_ANCESTOR_WRITABLE': 'Existing ancestor is group/other-writable; inspect ancestor_path and repair explicitly; not changed.',
+    'E_SYSTEMD_PATH': 'Systemd paths must be absolute literals without whitespace or special characters.',
+    'E_ENVIRONMENT_FILE': 'Required unit environment file was not accepted by the user service manager.',
     'E_ARCHIVE_GITHEAD': 'Framework archive gitHead is missing or differs from the requested pin.',
     'E_ARCHIVE_IDENTITY': 'Framework archive package name or version differs from the declared release.',
     'E_ARCHIVE_HASH': 'Framework archive sha256 verification failed.',

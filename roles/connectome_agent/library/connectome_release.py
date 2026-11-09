@@ -1,7 +1,7 @@
 #!/usr/bin/python
 """Ansible boundary for the shared, offline-tested deployment engine."""
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.connectome_deploy import Deployment
+from ansible.module_utils.connectome_deploy import Deployment, make_directory
 from ansible.module_utils.connectome_errors import SafeError, diagnostic
 import fcntl
 
@@ -30,7 +30,7 @@ def main():
             result = execute()
         else:
             deployment.validate_paths()
-            deployment.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            make_directory(deployment.root)
             # Serialize mutations of this agent's user units and current pointer.
             with open(deployment.lock_path(), 'a') as stream:
                 fcntl.flock(stream, fcntl.LOCK_EX)
