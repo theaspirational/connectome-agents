@@ -1,8 +1,8 @@
 # Lock v2 contract and cook boundary
 
 Source inspected offline: [the public cook fork](https://github.com/theaspirational/connectome-cook),
-commit `7955a3132cb54ee975e5a672578cf8922abc6e22` (the supplied fork main
-has the same tree). In particular: `src/lockfile.ts`, `src/cli.ts`,
+commit `28236dd51045c99604ddc7ba6a2eb0c02679fd3d` (public fork main,
+tree `188047b296b03341926c22881a45f903861773a4`). In particular: `src/lockfile.ts`, `src/cli.ts`,
 `src/backends/host.ts`, and the engine/layout/unit/dependency documentation.
 This is a source compatibility target, **not** a claim of a completed live-host
 qualification. The offline real-cook test reports whether prerequisites let it run.

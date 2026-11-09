@@ -16,7 +16,7 @@ import tarfile
 from connectome_deploy import secret_names, validate_config, resolve_pins, DeployError
 from connectome_lock import read_lock, LockError, text, credential_shaped, repository
 
-COOK_COMMIT = '7955a3132cb54ee975e5a672578cf8922abc6e22'
+COOK_COMMIT = '28236dd51045c99604ddc7ba6a2eb0c02679fd3d'
 FRAMEWORK = '@' + 'animalabs/agent-framework'
 BASE_ENV = {'PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'}
 
