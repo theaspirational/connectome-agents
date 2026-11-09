@@ -118,4 +118,9 @@ Without a denylist the checker warns clearly and runs **generic rules only**;
 that mode cannot check private identifiers. See the coverage document for policy
 matching details and limits.
 
+Hash-pinned local runtime packages can be supplied through the closed
+[`cook.host_dependencies` list](docs/lock-contract.md#additional-or-generic-host-inputs),
+including operator-supplied prebuilt artifacts. The legacy framework archive
+configuration remains supported.
+
 License: [MIT](LICENSE).

@@ -276,7 +276,26 @@ class DeployTests(unittest.TestCase):
         (deployment.build / 'framework.lock.json').write_text(json.dumps(before))
         (deployment.build / '.prepared').write_text(deployment.request_id)
         Path(artifact['path']).unlink()
-        self.assertEqual(deployment.plan()['framework_archive'], before)
+        with patch.object(deployment, '_lock', return_value={'hostDependencies': [{'version': before['version']}]}):
+            plan = deployment.plan()
+        self.assertEqual(plan['framework_archive'], before)
+        self.assertEqual(plan['host_dependencies'][0]['kind'], 'artifact')
+        self.assertEqual(plan['host_dependencies'][0]['payload'],
+                         'operator-supplied prebuilt payload, verified out of band')
+
+    def test_generic_archive_check_plan_is_complete_and_mutation_free(self):
+        from test_cook import framework_archive
+        artifact = framework_archive(Path(self.tmp.name) / 'context.tgz', None,
+                                     name="@animalabs/context-manager")
+        config = copy.deepcopy(self.config)
+        config['cook'] = {'host_dependencies': [{'name': "@animalabs/context-manager",
+            'archive': artifact['path'], 'sha256': artifact['sha256'], 'kind': 'artifact', 'version': '1.0.0'}]}
+        deployment = self.deployment(config, check=True)
+        plan = deployment.prepare()['plan']['host_dependencies']
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0], dict(config['cook']['host_dependencies'][0],
+            commit_verifiable=False, payload='operator-supplied prebuilt payload, verified out of band'))
+        self.assertFalse(self.root.exists())
 
     def test_secrets_permissions_report_typed_code(self):
         Path(self.config['secrets_file']).chmod(0o644)

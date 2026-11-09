@@ -102,7 +102,7 @@ def contained_file(build, value):
     return path
 
 
-def map_lock(data, build, host_pin=None, required_names=()):
+def map_lock(data, build, host_pin=None, required_names=(), config=None, framework_pin=None, framework_record=None):
     """Return the role's deployment record; do not rewrite cook's identity.
 
     launch.userUnit is cook's actual export hint. The role consumes path/hash
@@ -205,22 +205,47 @@ def map_lock(data, build, host_pin=None, required_names=()):
                 'invalid connector state names/paths')
     if 'hostDependencies' in data:
         require(isinstance(data['hostDependencies'], list), 'invalid host dependency inventory')
+        seen = set()
         for dependency in data['hostDependencies']:
-            require(isinstance(dependency, dict) and set(dependency) == {
+            require(isinstance(dependency, dict) and set(dependency) - {'provenance'} == {
                 'name', 'originalRange', 'version', 'sha256', 'size', 'snapshot', 'packageJsonDelta'} and
                 all(text(dependency[k]) for k in ('name', 'originalRange', 'snapshot')) and
                 version(dependency['version']) and
                 digest(dependency['sha256']) and type(dependency['size']) is int and dependency['size'] > 0,
                 'invalid host dependency record')
+            try:
+                from ansible.module_utils.connectome_archive import npm_name, validate_dependency_record
+            except ImportError:
+                from connectome_archive import npm_name, validate_dependency_record
+            require(npm_name(dependency['name']) and dependency['name'] not in seen,
+                    'invalid or duplicate host dependency name')
+            seen.add(dependency['name'])
+            if 'provenance' in dependency:
+                try:
+                    provenance = dependency['provenance']
+                    validate_dependency_record(provenance)
+                    require(all(provenance[k] == dependency[k] for k in ('name', 'sha256', 'version')),
+                            'dependency provenance identity mismatch')
+                except ValueError:
+                    raise LockError('invalid host dependency provenance') from None
             delta = dependency['packageJsonDelta']
             require(isinstance(delta, dict) and set(delta) == {'direct', 'override'}, 'invalid dependency delta')
             for kind, sections in (('direct', {'dependencies', 'devDependencies', 'optionalDependencies'}),
                                    ('override', {'overrides', 'resolutions'})):
                 edit = delta[kind]
                 require(isinstance(edit, dict) and set(edit) == {'section', 'name', 'before', 'after'} and
-                        edit['section'] in sections and text(edit['name']) and text(edit['after']) and
+                        edit['section'] in sections and edit['name'] == dependency['name'] and text(edit['after']) and
                         (text(edit['before']) if kind == 'direct' else edit['before'] is None),
                         'invalid dependency policy edit')
+    if config is not None:
+        try:
+            try:
+                from ansible.module_utils.connectome_archive import check_dependencies
+            except ImportError:
+                from connectome_archive import check_dependencies
+            check_dependencies(data, config, framework_pin, framework_record)
+        except ValueError:
+            raise LockError('host dependencies differ from config') from None
     if 'health' in data:
         health = data['health']
         require(isinstance(health, dict) and set(health) == {'command'} and

@@ -26,7 +26,7 @@ qualification. The offline real-cook test reports whether prerequisites let it r
 | `launch.userUnit` | emitted when exporting | contained `.service` file; adapter/role maps it to a path/SHA-256 unit record without rewriting the lock |
 | `engines` | emitted with selected engines | Bun/Node path, realPath and observed version |
 | `layout`, `state.path` | emitted with split layout | explicit roots/bindings and persistent state outside build |
-| `hostDependencies` | emitted with local inputs | archive hash/version/size/snapshot and package.json policy delta |
+| `hostDependencies` | emitted with local inputs | archive hash/version/size/snapshot and package.json policy delta; adapter adds closed provenance for list/legacy-marked inputs |
 | `incomplete` | emitted on interrupted/failed reconcile | always refused for deployment |
 | `units[]` | **planned** deployment extension, not emitted | optional contained path/SHA-256 records; mutually exclusive with exported unit hint |
 | `health` | **planned** deployment extension, not emitted | optional command argv; otherwise effective agent health |
@@ -98,9 +98,10 @@ The framework archive must be a cook-compatible **local** gzip/ustar npm archive
 pinned by the required SHA-256. When `package.json` contains `gitHead`, it must
 match the requested framework commit, including for registry releases. A present
 but empty, null or mismatched `gitHead` never falls back to release identity.
-Without `gitHead`, the default still refuses. For registry tarballs that omit it
-(such as the npm-published framework 0.32.0), explicitly attest the release in a
-private/group/agent layer:
+Without `gitHead`, the default still refuses. For already-provisioned tarballs
+that omit it, the historical flag below remains accepted in a private/group/agent
+layer. Despite its legacy spelling, it now maps to **artifact**, never a registry
+claim (it provides neither registry origin nor registry integrity):
 
 ```yaml
 cook:
@@ -114,23 +115,133 @@ cook:
 
 `registry_release` must be the boolean `true`, with both expected `name` and
 concrete `version`. They must exactly match the archive's package.json, and the
-name must be the framework package. This does **not** verify the commit by other
-means: the archive is pinned by its hash, not authenticated as that commit. No
+name must be the framework package. This declares an **operator-supplied prebuilt
+payload, verified out of band**. It does **not** verify a registry origin or the
+commit by other means: the archive is pinned by its hash, not authenticated as that commit. No
 registry lookup, Git fetch or other acquisition is performed by this check.
 Supply a trusted, authenticated archive/hash pair; even a matching `gitHead` is
 an artifact assertion, **not source authentication**.
 
-The nonsecret plan's `framework_archive` and the role-owned
+The compatibility plan field `framework_archive` and the role-owned
 `BUILD/framework.lock.json` record schema `connectome.framework-archive/v1`,
 SHA-256, package name/version, `requested_commit`, `registry_release` and
 `commit_verifiable`. Absent gitHead is explicitly `commit_verifiable: false`;
-the requested pin is never presented as verified. The sidecar is separate from
-cook's unchanged `connectome.lock` and build identity. Prepared builds validate
+the requested pin is never presented as verified. Here `registry_release` is
+only the historical config flag, not an origin assertion. The sidecar remains
+compatible; normalized plan `host_dependencies` and new lock provenance label
+the marked input `kind: artifact`, `commit_verifiable: false` and
+`payload: operator-supplied prebuilt payload, verified out of band`. The operator
+is responsible for out-of-band verification. The role itself checks only local
+bytes and manifest declarations, without authenticating their source. Prepared builds validate
 it against the request and cook's dependency hash/name/version; retained builds
 do not need the original input archive. Legacy gitHead-only builds without a
-sidecar remain usable, with plan provenance `not_recorded_legacy_build`; registry
-release builds require the sidecar. Change the immutable adapter path/argv to
+sidecar remain usable, with plan provenance `not_recorded_legacy_build`; legacy-
+marked builds require the sidecar. Change the immutable adapter path/argv to
 materialize a new request after upgrading the adapter.
+
+### Additional or generic host inputs
+
+`cook.host_dependencies` is an optional **replacement-merged list** of closed
+records. It can supplement `framework_archive`, or replace that legacy field
+with an explicit framework record. Unknown keys and duplicate package names
+(including a duplicate of the legacy framework input) are refused before any
+subprocess. Each record requires `name`, `archive`, `sha256`, `kind`, and
+`version`; only `git_commit` also requires `commit`. Only `registry_release`
+requires `registry_url` and `registry_integrity`; these keys are forbidden for
+other kinds. Names must be lowercase,
+URL-safe npm names (scoped names supported); versions must be concrete, not
+ranges. Archives are absolute local regular files, never symlinks. No registry
+lookup, download, pack, build, extraction or lifecycle script is added by the
+adapter. Cook's existing install policy applies; see the script policy below.
+This is not a new script sandbox or a frozen transitive dependency closure.
+
+For example, retain the legacy framework declaration above and add:
+
+```yaml
+cook:
+  host_dependencies:
+    - name: "@animalabs/context-manager"
+      archive: /absolute/inputs/context-manager-prebuilt.tgz
+      sha256: REPLACE_WITH_REVIEWED_ARCHIVE_SHA256
+      kind: artifact
+      version: '1.0.0'
+```
+
+Kinds have deliberately different provenance claims:
+
+- `git_commit`: requires a nonzero full lowercase 40-hex `commit` and exactly
+  matching package.json `gitHead`; records `commit_verifiable: true`.
+- `registry_release`: additionally requires a credential-free HTTPS registry
+  **origin** URL (no path except `/`, query or fragment) in `registry_url`, and a
+  canonical SRI `sha512-BASE64` digest in `registry_integrity`. The local bytes
+  must match both configured SHA-256 and SHA-512. Plan and lock record
+  `registry_comparison: bytes were not compared against the registry`. This is
+  operator-supplied registry metadata, not evidence of an online comparison or
+  a Git commit claim. No registry connection is made.
+- `artifact`: **operator-supplied prebuilt payload, verified out of band**, not
+  source acquisition or a build performed by the adapter. The operator must
+  obtain/build and authenticate it separately; the role cannot attest that
+  out-of-band verification itself occurred.
+
+Both release and artifact allow absent `gitHead` and record
+`commit_verifiable: false`, even if the manifest contains a syntactically valid
+40-hex gitHead. Empty/null/malformed present gitHead is refused. `commit` is
+forbidden for these kinds. Every archive must match the declared SHA-256 and
+package.json name/version. The legacy framework rules above remain unchanged,
+including checking a legacy-marked artifact's present gitHead against the runtime
+framework pin.
+The generic framework `git_commit` declaration's explicit commit is its authority;
+`versions.yml` remains required for compatibility but does not override that
+explicit declaration.
+
+Plans expose all resolved inputs as `host_dependencies` when the list or the
+legacy release mark is used.
+Each cook v2 `hostDependencies` entry retains cook's original range, version,
+hash, snapshot, size and policy delta, and gains a closed `provenance` record:
+the exact configured fields plus `commit_verifiable`, and, for `artifact`,
+`payload: operator-supplied prebuilt payload, verified out of band`. Registry
+records also retain the exact origin, expected integrity and no-comparison statement. A legacy framework combined with
+the list is normalized into the same inventory (its inferred version and
+sidecar attestation are retained). List-enabled and legacy-marked builds add this metadata
+to cook's lock; cook's build identity and generated output digests are not
+rewritten. Unmarked legacy-only configs preserve cook argv and lock bytes exactly
+(the baseline compatibility test checks both byte-for-byte). The historical
+marked configs keep the same argv, but new locks gain the artifact provenance.
+
+The lock reader cross-checks the complete ordered inventory and provenance
+against the saved config: missing, extra, duplicate, reordered, changed identity,
+hash, kind, archive path, commit, registry origin/integrity or provenance records
+fail closed. Prepare,
+activation, retained-build plans and rollback all use this validation. Retained
+builds use the recorded inventory/legacy sidecar, not the original archive
+paths, so removing provisioned input archives does not break reuse. Existing
+legacy-only gitHead builds keep their documented sidecar compatibility.
+
+#### Install script policy (reviewed cook tree)
+
+The role preserves cook's install script policy; it does not invoke a separate
+package installer, `npm pack`, or archive lifecycle/build command. In this
+adapter cook runs the selected Bun executable as `bun install` for the host
+checkout. It does **not** pass a global `--ignore-scripts`: host/root lifecycle
+scripts and Bun's ordinarily trusted/default-trusted transitive dependencies
+remain subject to Bun's existing policy. Do not treat the host pin as untrusted
+code or infer that all scripts are blocked.
+
+For each selected local input cook refuses a host `trustedDependencies` entry
+naming that input (`E_HOST_DEPENDENCY_TRUSTED`) before host installation; malformed
+trust lists also refuse. For other inputs Bun applies its existing trust rules:
+untrusted packages' lifecycle scripts remain blocked, while Bun's default trust
+policy is not replaced. The real-cook synthetic packages exercise a blocked
+postinstall marker and a trusted-input refusal. Connector descriptor `build`
+argv are still quoted into cook's explicit custom shell build commands: they
+are trusted operator code, not archive lifecycle opt-ins.
+
+The closed dependency and cook schemas provide **no script-enabling options**;
+`allow_scripts`, `ignore_scripts`, `scripts`, `trustedDependencies` and other
+unknown options are refused. The adapter never adds `--trust`, changes a host
+trust list or relaxes cook's trusted-input refusal. This refuses config opt-ins
+for local dependency lifecycle scripts without pretending to sandbox cook's
+existing trusted host/connector execution.
 
 Cook also checks name/version against the host range and binds all same-name Bun
 lock entries to the hash-pinned archive before recording `hostDependencies`.
@@ -189,7 +300,7 @@ adapter checks returned layout, framework hash and exact component commits.
 The adapter emits only a closed JSON error envelope on stderr: `error_code`,
 `msg` (code plus a fixed message), and optionally `cook_error_code`. The prepare
 Ansible task displays that code/message directly, for example:
-`E_ARCHIVE_GITHEAD: Framework archive gitHead is missing or differs from the requested pin.`
+`E_ARCHIVE_GITHEAD: Archive gitHead is missing, invalid or differs from the requested commit.`
 Raw stderr/stdout, exception text, argv and config values are never relayed.
 Failure results also suppress Ansible's implicit invocation and debug traceback.
 Unknown/malformed subprocess output becomes `E_COOK_FAILED`, not a guessed
@@ -197,11 +308,11 @@ explanation. CLI argument errors also use a fixed envelope without echoing argv.
 
 | Code | Meaning / operator action |
 | --- | --- |
-| `E_ARCHIVE_GITHEAD` | Missing or mismatched gitHead; inspect pin or explicitly attest a registry release. |
-| `E_ARCHIVE_IDENTITY` | Registry declaration or package name/version mismatch. |
+| `E_ARCHIVE_GITHEAD` | Missing, malformed or mismatched gitHead; inspect kind and commit declaration. |
+| `E_ARCHIVE_IDENTITY` | Invalid declaration or package name/version mismatch. |
 | `E_ARCHIVE_HASH` | Archive SHA-256 check failed. |
 | `E_ADAPTER_INPUT` | Invalid adapter input or unavailable local prerequisite. |
-| `E_LOCK_INVALID` | Cook lock or framework provenance lock failed validation. |
+| `E_LOCK_INVALID` | Cook lock, dependency inventory or framework provenance failed validation. |
 | `E_LOCK_STATE_PATH` | Returned persistent state/layout differs from the request. |
 | `E_ANCESTOR_WRITABLE` | Existing group/other-writable ancestor; the deployment result names `ancestor_path`. No chmod or writes occur. |
 | `E_SYSTEMD_PATH` | Use literal absolute paths without whitespace, specifiers, globs or escapes. |
@@ -231,8 +342,9 @@ Activation and provider tasks remain `no_log` to protect secret-bearing inputs.
 Schema fixtures are recorded synthetic/anonymized cases, not claimed live-build
 captures. Unit doubles test invocation separately. `RealCookTests` uses the exact
 reviewed cook tree, real Git, real Bun/Node and real dependency installation for a
-tiny all-local host/framework recipe, covering both matching gitHead and explicit
-registry-release archives without gitHead; it never replaces those tools. Set
+tiny all-local host recipe, covering matching gitHead, explicit registry releases
+without gitHead, and two dependencies (framework plus a synthetic context-manager
+prebuilt artifact), through both combined legacy and generic-only declarations; it never replaces those tools. Set
 `CONNECTOME_TEST_COOK_SOURCE` to a local clone containing the reviewed commit,
 `CONNECTOME_TEST_COOK_DEPS` to an already-installed cook `node_modules` directory,
 and `CONNECTOME_TEST_BUN` to an installed Bun binary. Optional

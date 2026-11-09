@@ -13,11 +13,15 @@ import tempfile
 try:
     from ansible.module_utils.connectome_lock import read_lock, LockError
     from ansible.module_utils.connectome_errors import SafeError, adapter_diagnostic
-    from ansible.module_utils.connectome_archive import framework_provenance, validate_provenance
+    from ansible.module_utils.connectome_archive import (framework_provenance, validate_provenance,
+                                                        dependency_provenance, dependency_inputs,
+                                                        records_metadata, provenance_record)
 except ImportError:
     from connectome_lock import read_lock, LockError
     from connectome_errors import SafeError, adapter_diagnostic
-    from connectome_archive import framework_provenance, validate_provenance
+    from connectome_archive import (framework_provenance, validate_provenance,
+                                   dependency_provenance, dependency_inputs,
+                                   records_metadata, provenance_record)
 
 
 class DeployError(SafeError):
@@ -101,6 +105,9 @@ def validate_config(config):
     identifier(config.get('name', 'example'))
     for name in config.get('connectors', {}):
         identifier(name)
+    if 'host_dependencies' in config.get('cook', {}):
+        # Shape/duplicate preflight only; archive IO remains in the plan/adapter.
+        dependency_inputs(config, '1' * 40)
 
 
 def base_path(value):
@@ -286,6 +293,15 @@ class Deployment:
             else:
                 result['framework_archive'] = framework_provenance(
                     self.config, self.pins['runtime']['agent-framework'])
+        if records_metadata(self.config):
+            if (self.build / '.prepared').is_file():
+                data = self._lock()
+                entries = dependency_inputs(self.config, self.pins['runtime']['agent-framework'])
+                result['host_dependencies'] = [provenance_record(dict(entry, version=dep['version']))
+                    for entry, dep in zip(entries, data.get('hostDependencies', []))]
+            else:
+                result['host_dependencies'] = dependency_provenance(
+                    self.config, self.pins['runtime']['agent-framework'])
         return result
 
     def lock_path(self):
@@ -294,8 +310,18 @@ class Deployment:
     def _lock(self, build=None):
         build = build or self.build
         inside(self.builds, build)
+        config = self.config if build == self.build else self._config(build)
+        pin = (self.pins['runtime']['agent-framework'] if build == self.build else
+               json.loads((build / 'deployment.json').read_text())['pins']['runtime']['agent-framework'])
+        recorded = None
+        if 'framework_archive' in config.get('cook', {}) and (build / 'framework.lock.json').exists():
+            try:
+                recorded = validate_provenance(json.loads((build / 'framework.lock.json').read_text()), config, pin)
+            except (OSError, ValueError):
+                raise DeployError('invalid framework provenance', 'E_LOCK_INVALID') from None
         try:
-            data = read_lock(inside(build, 'connectome.lock'),
+            data = read_lock(inside(build, 'connectome.lock'), config=config, framework_pin=pin,
+                             framework_record=recorded,
                              host_pin=self.pins['runtime']['connectome-host'] if build == self.build else None,
                              required_names=self.names if build == self.build else ())
         except LockError as error:

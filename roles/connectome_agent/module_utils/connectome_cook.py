@@ -15,7 +15,7 @@ import tempfile
 from connectome_deploy import secret_names, validate_config, resolve_pins, DeployError
 from connectome_lock import read_lock, LockError, text, credential_shaped, repository
 from connectome_errors import SafeError, diagnostic, cook_code_from_stream
-from connectome_archive import FRAMEWORK, ArchiveError, framework_provenance
+from connectome_archive import FRAMEWORK, ArchiveError, framework_provenance, dependency_provenance, records_metadata
 
 COOK_COMMIT = '28236dd51045c99604ddc7ba6a2eb0c02679fd3d'
 BASE_ENV = {'PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'}
@@ -188,13 +188,16 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     need(config.get('state_dir') == str(state), 'adapter state must match configured state_dir')
     settings = config.get('cook', {})
     need(isinstance(settings, dict), 'cook settings must be a mapping')
-    need(set(settings) == {'host_repo', 'framework_archive', 'connector_state'},
-         'cook requires host_repo, framework_archive and explicit connector_state')
+    need({'host_repo', 'connector_state'} <= settings.keys() and
+         settings.keys() <= {'host_repo', 'framework_archive', 'host_dependencies', 'connector_state'} and
+         ('framework_archive' in settings or 'host_dependencies' in settings),
+         'cook requires host_repo, local dependencies and explicit connector_state')
     need(repository(settings['host_repo']), 'cook.host_repo requires a safe HTTPS, SSH/scp or absolute local repository')
-    provenance = framework_provenance(config, pins['agent-framework'])
-    artifact = settings['framework_archive']
-    dependency = FRAMEWORK + '=' + artifact['path'] + '#sha256=' + artifact['sha256']
-    (build / 'framework.lock.json').write_text(json.dumps(provenance, sort_keys=True, indent=2) + '\n')
+    dependencies = dependency_provenance(config, pins['agent-framework'])
+    provenance = None
+    if 'framework_archive' in settings:
+        provenance = framework_provenance(config, pins['agent-framework'])
+        (build / 'framework.lock.json').write_text(json.dumps(provenance, sort_keys=True, indent=2) + '\n')
     recipe_path = build / 'cook-recipe.json'
     recipe_path.write_text(json.dumps(recipe, sort_keys=True, indent=2) + '\n')
     # Config/credentials are per-request, state/workspace persist. All roots
@@ -214,7 +217,9 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
             ('--out', str(build)), ('--no-prompts', None), ('--yes', None), ('--strict', None),
             ('--ch-repo', settings['host_repo']), ('--ch-ref', pins['connectome-host']),
             ('--bun-path', bun_path), ('--node-path', node_path), ('--layout', str(layout_path)),
-            ('--host-dependency', dependency), ('--user-unit', 'connectome-' + config['name'] + '.service')):
+            *((('--host-dependency', d['name'] + '=' + d['archive'] + '#sha256=' + d['sha256'])
+              for d in dependencies)),
+            ('--user-unit', 'connectome-' + config['name'] + '.service')):
         flag_indices.append(len(argv))
         argv.append(flag)
         if value is not None:
@@ -232,9 +237,25 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     actual = {(entry.get('url'), entry.get('commit')) for entry in lock['components']}
     need(actual == expected and all(c['kind'] == 'git' and c['role'] == 'mcp' for c in lock['components']),
          'cook component provenance differs from enabled inputs')
-    need(any(d.get('name') == FRAMEWORK and d.get('version') == provenance['version'] and
-             d.get('sha256') == settings['framework_archive']['sha256']
-             for d in lock.get('hostDependencies', [])), 'cook omitted pinned framework input', 'E_LOCK_INVALID')
+    # Validate cook's inventory before adding config-only provenance. Legacy
+    # configs never rewrite cook's lock, argv or build identity.
+    expected = {d['name']: d for d in dependencies}
+    need(len(lock.get('hostDependencies', [])) == len(expected) and
+         {d['name'] for d in lock.get('hostDependencies', [])} == set(expected),
+         'cook dependency inventory differs from inputs', 'E_LOCK_INVALID')
+    for dep in lock.get('hostDependencies', []):
+        record = expected[dep['name']]
+        need(dep['version'] == record['version'] and dep['sha256'] == record['sha256'],
+             'cook dependency identity differs from inputs', 'E_LOCK_INVALID')
+    if records_metadata(config):
+        # Keep cook's raw schema (not the reader's derived units) on disk.
+        path = build / 'connectome.lock'
+        raw = json.loads(path.read_text())
+        for dep in raw['hostDependencies']:
+            dep['provenance'] = expected[dep['name']]
+        path.write_text(json.dumps(raw, sort_keys=True, indent=2) + '\n')
+    lock = read_lock(build / 'connectome.lock', host_pin=pins['connectome-host'], required_names=names,
+                     config=config, framework_pin=pins['agent-framework'], framework_record=provenance)
     # No values were supplied. Refuse unexpected value-bearing generated env,
     # so run.sh cannot override the role's runtime EnvironmentFile secrets.
     env_file = Path(layout['config']) / '.env'

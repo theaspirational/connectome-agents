@@ -1,5 +1,6 @@
 """Schema/adapter unit tests and a separately identified, genuine offline build."""
 from copy import deepcopy
+import base64
 import hashlib
 import io
 import json
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'roles/connectome_agent/module_utils'))
 import connectome_cook as adapter
 from connectome_lock import read_lock, LockError, names_only
-from connectome_archive import validate_provenance
+from connectome_archive import validate_provenance, dependency_provenance, dependency_inputs
 from connectome_deploy import run, DeployError, Deployment
 from connectome_errors import diagnostic
 
@@ -546,6 +547,201 @@ class AdapterTests(ScratchTest):
                 validate_provenance(modified, spec['config'], 'd' * 40)
             self.assertEqual(error.exception.code, 'E_LOCK_INVALID')
 
+    def dependency(self, kind='artifact', **changes):
+        artifact = framework_archive(self.work / 'context.tgz', None,
+                                     name="@animalabs/context-manager")
+        result = {'name': "@animalabs/context-manager", 'archive': artifact['path'],
+                  'sha256': artifact['sha256'], 'version': '1.0.0', 'kind': kind}
+        if kind == 'registry_release':
+            result.update(registry_url='https://registry.npmjs.org', registry_integrity=
+                'sha512-' + base64.b64encode(hashlib.sha512(Path(artifact['path']).read_bytes()).digest()).decode())
+        result.update(changes)
+        return result
+
+    def test_generic_closed_schema_names_duplicates_and_no_subprocess(self):
+        valid = self.dependency()
+        cases = [None, {}, 'package', [None], [dict(valid, extra=True)],
+                 [dict(valid, kind='unknown')], [dict(valid, kind=[])],
+                 [dict(valid, kind='git_commit')], [dict(valid, commit='d' * 40)],
+                 [dict(valid, kind='git_commit', commit='main')],
+                 [dict(valid, kind='git_commit', commit='0' * 40)],
+                 [dict(valid, archive='relative.tgz')], [dict(valid, sha256='bad')],
+                 [dict(valid, version='^1.0.0')], [valid, valid],
+                 [dict(valid, name=adapter.FRAMEWORK)]]
+        for name in ('', 'Upper', '-option', '.hidden', '_hidden', 'with space', 'a/b', "@scope",
+                     "@scope/../bad", 'a%2fb', 'node_modules', 'favicon.ico', 'a' * 215):
+            cases.append([dict(valid, name=name)])
+        for key in valid:
+            cases.append([{k: v for k, v in valid.items() if k != key}])
+        for entries in cases:
+            spec = self.spec()
+            spec['config']['cook']['host_dependencies'] = entries
+            with self.subTest(entries=entries), patch.object(adapter, 'command') as run:
+                with self.assertRaises((adapter.AdapterError, DeployError)) as error:
+                    self.invoke(spec)
+                self.assertIn(error.exception.code, ('E_ADAPTER_INPUT', 'E_ARCHIVE_IDENTITY', 'E_ARCHIVE_HASH'))
+                run.assert_not_called()
+        for name in ('example', "@scope/example", 'a.b_c-1', "@a/b"):
+            dependency_inputs({'cook': {'host_dependencies': [dict(valid, name=name)]}}, 'd' * 40)
+
+    def test_registry_claim_requires_origin_and_sha512_without_network(self):
+        spec = self.spec()
+        entry = self.dependency('registry_release')
+        spec['config']['cook']['host_dependencies'] = [entry]
+        with patch.object(adapter.subprocess, 'run') as run:
+            record = dependency_provenance(spec['config'], 'd' * 40)[1]
+            self.assertEqual(record['registry_comparison'], 'bytes were not compared against the registry')
+            self.assertEqual(record['registry_url'], entry['registry_url'])
+            self.assertEqual(record['registry_integrity'], entry['registry_integrity'])
+            self.assertFalse(record['commit_verifiable'])
+            run.assert_not_called()
+        cases = [{'registry_url': None}, {'registry_integrity': None},
+                 {'registry_url': 'http://registry.npmjs.org'},
+                 {'registry_url': 'https://user:pass' + '@' + 'example.invalid'},
+                 {'registry_url': 'https://registry.npmjs.org/path'},
+                 {'registry_url': 'https://registry.npmjs.org?token=x'},
+                 {'registry_integrity': 'sha256-' + 'A' * 44},
+                 {'registry_integrity': 'sha512-invalid'},
+                 {'registry_integrity': 'sha512-' + base64.b64encode(b'x' * 64).decode()}]
+        for change in cases:
+            spec['config']['cook']['host_dependencies'] = [dict(entry, **change)]
+            with self.subTest(change=change), self.assertRaises(adapter.AdapterError):
+                dependency_provenance(spec['config'], 'd' * 40)
+        for key in ('registry_url', 'registry_integrity'):
+            changed = dict(entry); changed.pop(key)
+            spec['config']['cook']['host_dependencies'] = [changed]
+            with self.assertRaises(adapter.AdapterError):
+                dependency_provenance(spec['config'], 'd' * 40)
+        for key in ('allow_scripts', 'ignore_scripts', 'trustedDependencies', 'scripts'):
+            spec['config']['cook']['host_dependencies'] = [dict(self.dependency(), **{key: True})]
+            with self.subTest(key=key), patch.object(adapter, 'command') as run:
+                with self.assertRaises(adapter.AdapterError):
+                    self.invoke(spec)
+                run.assert_not_called()
+            spec['config']['cook']['host_dependencies'] = [self.dependency()]
+            spec['config']['cook'][key] = True
+            with self.subTest(cook_option=key), patch.object(adapter, 'command') as run:
+                with self.assertRaises(adapter.AdapterError):
+                    self.invoke(spec)
+                run.assert_not_called()
+            del spec['config']['cook'][key]
+        legacy = framework_archive(self.work / 'release.tgz', None)
+        legacy.update(registry_release=True, name=adapter.FRAMEWORK, version='1.0.0')
+        spec['config']['cook'] = {'framework_archive': legacy}
+        record = dependency_provenance(spec['config'], 'd' * 40)[0]
+        self.assertEqual(record['kind'], 'artifact')
+        self.assertEqual(record['payload'], 'operator-supplied prebuilt payload, verified out of band')
+        self.assertNotIn('registry_url', record)
+        self.assertNotIn('registry_integrity', record)
+
+    def test_generic_archive_identity_hash_file_and_githead_rules(self):
+        spec = self.spec()
+        settings = spec['config']['cook']
+        for kind in ('artifact', 'registry_release', 'git_commit'):
+            for head in (None, 'd' * 40, 'c' * 40, '', False):
+                entry = self.dependency(kind)
+                artifact = framework_archive(Path(entry['archive']), head,
+                                             name=entry['name'])
+                entry['sha256'] = artifact['sha256']
+                if kind == 'registry_release':
+                    entry['registry_integrity'] = 'sha512-' + base64.b64encode(
+                        hashlib.sha512(Path(entry['archive']).read_bytes()).digest()).decode()
+                if kind == 'git_commit':
+                    entry['commit'] = 'd' * 40
+                settings['host_dependencies'] = [entry]
+                good = head == 'd' * 40 if kind == 'git_commit' else head in (None, 'd' * 40, 'c' * 40)
+                with self.subTest(kind=kind, head=head):
+                    if good:
+                        records = dependency_provenance(spec['config'], 'd' * 40)
+                        self.assertEqual(records[1]['commit_verifiable'], kind == 'git_commit')
+                        if kind == 'artifact':
+                            self.assertEqual(records[1]['payload'], 'operator-supplied prebuilt payload, verified out of band')
+                    else:
+                        with self.assertRaises(adapter.AdapterError) as error:
+                            dependency_provenance(spec['config'], 'd' * 40)
+                        self.assertEqual(error.exception.code, 'E_ARCHIVE_GITHEAD')
+        for change, code in (({'name': 'other'}, 'E_ARCHIVE_IDENTITY'),
+                             ({'version': '2.0.0'}, 'E_ARCHIVE_IDENTITY'),
+                             ({'sha256': '0' * 64}, 'E_ARCHIVE_HASH'),
+                             ({'archive': str(self.work)}, 'E_ADAPTER_INPUT')):
+            settings['host_dependencies'] = [dict(self.dependency(), **change)]
+            with self.subTest(change=change), self.assertRaises(adapter.AdapterError) as error:
+                dependency_provenance(spec['config'], 'd' * 40)
+            self.assertEqual(error.exception.code, code)
+        entry = self.dependency()
+        link = self.work / 'link.tgz'; link.symlink_to(entry['archive'])
+        settings['host_dependencies'] = [dict(entry, archive=str(link))]
+        with self.assertRaises(adapter.AdapterError):
+            dependency_provenance(spec['config'], 'd' * 40)
+        Path(entry['archive']).write_bytes(b'not an archive')
+        entry['sha256'] = hashlib.sha256(Path(entry['archive']).read_bytes()).hexdigest()
+        settings['host_dependencies'] = [entry]
+        with self.assertRaises(adapter.AdapterError) as error:
+            dependency_provenance(spec['config'], 'd' * 40)
+        self.assertEqual(error.exception.code, 'E_ADAPTER_INPUT')
+
+    def test_generic_plan_lock_exact_binding_and_retention(self):
+        spec = self.spec()
+        spec['config']['connectors'] = {}; spec['pins']['connectors'] = {}
+        spec['config']['cook']['host_dependencies'] = [self.dependency()]
+        dependencies = dependency_provenance(spec['config'], 'd' * 40)
+        calls = []
+        def materialize(argv, **kwargs):
+            calls.append(argv)
+            record = fixture(); record['build']['dir'] = str(self.build)
+            record['components'] = []
+            record['layout'] = json.loads((self.build / 'cook-layout.json').read_text())
+            record['state'] = {'path': spec['config']['state_dir']}
+            record['launch']['script'] = str(self.build / 'run.sh')
+            (self.build / 'run.sh').write_text('exit 0')
+            record['hostDependencies'] = []
+            for entry in dependencies:
+                snapshot = str(self.build / (entry['name'].split('/')[-1] + '.tgz'))
+                record['hostDependencies'].append({'name': entry['name'], 'version': entry['version'],
+                    'sha256': entry['sha256'], 'originalRange': '^1.0.0', 'size': 123, 'snapshot': snapshot,
+                    'packageJsonDelta': {'direct': {'section': 'dependencies', 'name': entry['name'],
+                        'before': '^1.0.0', 'after': 'file:' + snapshot},
+                        'override': {'section': 'overrides', 'name': entry['name'],
+                        'before': None, 'after': 'file:' + snapshot}}})
+            (self.build / 'connectome.lock').write_text(json.dumps(record))
+        with patch.object(adapter, 'verify_cook'), patch.object(adapter, 'command', side_effect=materialize):
+            record = self.invoke(spec)
+        self.assertEqual([calls[0][i + 1] for i, arg in enumerate(calls[0]) if arg == '--host-dependency'],
+            [d['name'] + '=' + d['archive'] + '#sha256=' + d['sha256'] for d in dependencies])
+        self.assertEqual([d['provenance'] for d in record['hostDependencies']], dependencies)
+        # Reader cross-checks config even after the operator removes inputs.
+        for entry in dependencies:
+            Path(entry['archive']).unlink()
+        path = self.build / 'connectome.lock'
+        original = path.read_text()
+        kwargs = dict(config=spec['config'], framework_pin='d' * 40)
+        read_lock(path, **kwargs)
+        for mutate in ('missing', 'extra', 'duplicate', 'order', 'provenance', 'hash', 'version', 'kind', 'archive', 'commit', 'verifiable', 'payload'):
+            data = json.loads(original)
+            dep = data['hostDependencies'][1]
+            if mutate == 'missing': data['hostDependencies'].pop()
+            if mutate == 'order': data['hostDependencies'].reverse()
+            if mutate == 'provenance': dep.pop('provenance')
+            if mutate in ('extra', 'duplicate'): data['hostDependencies'].append(deepcopy(dep))
+            if mutate == 'extra': data['hostDependencies'][-1]['name'] = 'extra'
+            if mutate == 'hash': dep['sha256'] = '0' * 64
+            if mutate == 'version': dep['version'] = '2.0.0'
+            if mutate == 'kind': dep['provenance']['kind'] = 'registry_release'; dep['provenance'].pop('payload')
+            if mutate == 'archive': dep['provenance']['archive'] += '.other'
+            if mutate == 'commit': dep['provenance']['commit'] = 'd' * 40
+            if mutate == 'verifiable': dep['provenance']['commit_verifiable'] = True
+            if mutate == 'payload': dep['provenance']['payload'] = 'source'
+            path.write_text(json.dumps(data))
+            with self.subTest(mutate=mutate), self.assertRaises(LockError):
+                read_lock(path, **kwargs)
+        path.write_text(original)
+        # Config drift is refused too, not merely self-consistency of the lock.
+        for key, value in (('archive', '/elsewhere.tgz'), ('version', '2.0.0'), ('sha256', '0' * 64),
+                           ('name', 'other'), ('kind', 'registry_release')):
+            changed = deepcopy(spec['config']); changed['cook']['host_dependencies'][0][key] = value
+            with self.subTest(config_field=key), self.assertRaises(LockError):
+                read_lock(path, config=changed, framework_pin='d' * 40)
+
     def test_lock_state_mismatch_has_typed_code(self):
         with patch.object(adapter, 'verify_cook'), patch.object(adapter, 'command'), \
                 patch.object(adapter, 'read_lock', return_value={'state': {'path': '/wrong'}, 'layout': {}}):
@@ -569,6 +765,7 @@ class AdapterTests(ScratchTest):
         spec = self.spec()
         spec_path = self.build / 'deployment.json'; spec_path.write_text(json.dumps(spec))
         calls = []
+        raw_locks = []
         def materialize(argv, cwd, env, flag_indices):
             # UNIT double only. RealCookTests below never replaces a tool.
             adapter.validate_arguments(argv, flag_indices)
@@ -599,12 +796,22 @@ class AdapterTests(ScratchTest):
                 'url': spec['config']['connectors']['extra']['repo'], 'ref': 'e' * 40,
                 'commit': 'e' * 40, 'path': str(self.build / 'connectors/extra'), 'install': 'make build'}]
             (self.build / 'run.sh').write_text('#!/bin/sh\nexit 0\n')
-            (self.build / 'connectome.lock').write_text(json.dumps(record))
+            raw_locks.append(json.dumps(record).encode())
+            (self.build / 'connectome.lock').write_bytes(raw_locks[-1])
         with patch.object(adapter, 'verify_cook'), patch.object(adapter, 'command', side_effect=materialize), \
                 patch.dict(os.environ, {'EXAMPLE_SECRET': 'synthetic-answer', 'COOK_PASS_ENV': 'EXAMPLE_SECRET',
                                        'BUN_OPTIONS': 'untrusted'}):
             result = adapter.adapt(str(spec_path), str(self.build), str(self.work / 'state'),
                                    sys.executable, '/tmp/example/bin/cook', sys.executable, sys.executable)
+        # Exact pre-generic invocation contract from baseline 0be0db3.
+        expected_argv = [sys.executable, '/tmp/example/bin/cook', 'install', str(self.build / 'cook-recipe.json'),
+            '--out', str(self.build), '--no-prompts', '--yes', '--strict',
+            '--ch-repo', spec['config']['cook']['host_repo'], '--ch-ref', 'c' * 40,
+            '--bun-path', sys.executable, '--node-path', sys.executable, '--layout', str(self.build / 'cook-layout.json'),
+            '--host-dependency', adapter.FRAMEWORK + '=' + spec['config']['cook']['framework_archive']['path'] +
+            '#sha256=' + spec['config']['cook']['framework_archive']['sha256'], '--user-unit', 'connectome-example.service']
+        self.assertEqual(json.dumps(calls[0]).encode(), json.dumps(expected_argv).encode())
+        self.assertEqual((self.build / 'connectome.lock').read_bytes(), raw_locks[0])
         self.assertEqual(result['build']['id'], 'b' * 64)
         provenance = json.loads((self.build / 'framework.lock.json').read_text())
         self.assertTrue(provenance['commit_verifiable'])
@@ -638,7 +845,20 @@ class RealCookTests(unittest.TestCase):
     def test_real_cook_offline_no_secrets_build(self):
         self.real_build(registry=False, with_secrets=False)
 
-    def real_build(self, registry, with_secrets=True):
+    def test_real_cook_offline_two_dependencies(self):
+        self.real_build(registry=False, two_dependencies=True)
+
+    def test_real_cook_offline_generic_only_two_dependencies(self):
+        self.real_build(registry=False, two_dependencies=True, generic_only=True)
+
+    def test_real_cook_offline_registry_origin_and_integrity(self):
+        self.real_build(registry=False, two_dependencies=True, generic_only=True, registry_input=True)
+
+    def test_real_cook_refuses_trusted_lifecycle_dependency(self):
+        self.real_build(registry=False, two_dependencies=True, trusted=True)
+
+    def real_build(self, registry, with_secrets=True, two_dependencies=False, generic_only=False,
+                   trusted=False, registry_input=False):
         """No fake runtimes/Git/dependency tools, downloads, or network recipes."""
         required = ('CONNECTOME_TEST_COOK_SOURCE', 'CONNECTOME_TEST_BUN', 'CONNECTOME_TEST_COOK_DEPS')
         missing_env = [name for name in required if not os.environ.get(name)]
@@ -677,10 +897,18 @@ class RealCookTests(unittest.TestCase):
         artifact = framework_archive(self.work / 'framework.tgz', None if registry else framework_pin)
         if registry:
             artifact.update(registry_release=True, name=adapter.FRAMEWORK, version='1.0.0')
+        dependencies = {adapter.FRAMEWORK: '^1.0.0'}
+        extra = None
+        if two_dependencies:
+            name = "@animalabs/context-manager"
+            extra = framework_archive(self.work / 'context.tgz', None, name=name,
+                scripts={'postinstall': 'touch ' + str(self.work / 'lifecycle-ran')})
+            dependencies[name] = '^1.0.0'
         host = self.work / 'host'
         host_pin = repository(host, {'package.json': json.dumps({'name': 'example-host', 'version': '1.0.0',
                      'type': 'module', 'engines': {'bun': '>=1.0.0', 'node': '>=20.0.0'},
-                     'dependencies': {adapter.FRAMEWORK: '^1.0.0'}}), 'src/index.ts': 'console.log("example");\n'})
+                     'dependencies': dependencies,
+                     **({'trustedDependencies': ["@animalabs/context-manager"]} if trusted else {})}), 'src/index.ts': 'console.log("example");\n'})
         spec = {'config': {'name': 'example', 'state_dir': str(self.work / 'state'),
                           'secrets_file': str(self.work / 'secrets/example.json'),
                           'agent': {'systemPrompt': 'Offline example'},
@@ -688,6 +916,18 @@ class RealCookTests(unittest.TestCase):
                           'cook': {'host_repo': str(host), 'framework_archive': artifact, 'connector_state': {}}},
                 'pins': {'runtime': {'cook': adapter.COOK_COMMIT, 'connectome-host': host_pin,
                                      'agent-framework': framework_pin}, 'connectors': {}}}
+        if two_dependencies:
+            spec['config']['cook']['host_dependencies'] = [{'name': "@animalabs/context-manager",
+                'archive': extra['path'], 'sha256': extra['sha256'], 'kind': 'artifact', 'version': '1.0.0'}]
+        if registry_input:
+            spec['config']['cook']['host_dependencies'][0].update(kind='registry_release',
+                registry_url='https://registry.npmjs.org', registry_integrity='sha512-' +
+                base64.b64encode(hashlib.sha512(Path(extra['path']).read_bytes()).digest()).decode())
+        if generic_only:
+            spec['config']['cook'].pop('framework_archive')
+            spec['config']['cook']['host_dependencies'].insert(0, {'name': adapter.FRAMEWORK,
+                'archive': artifact['path'], 'sha256': artifact['sha256'], 'version': '1.0.0',
+                'kind': 'git_commit', 'commit': framework_pin})
         spec_path = self.build / 'deployment.json'; spec_path.write_text(json.dumps(spec))
         # All acquisition is file-local. An empty private HOME prevents reuse
         # of operator credentials; Git's protocol allowlist prohibits remotes.
@@ -695,14 +935,53 @@ class RealCookTests(unittest.TestCase):
         environment = {'HOME': str(home), 'GIT_ALLOW_PROTOCOL': 'file',
                        'EXAMPLE_SECRET': 'synthetic-answer'}
         with patch.dict(os.environ, environment), patch.object(adapter, 'BASE_ENV', adapter.BASE_ENV | {'GIT_ALLOW_PROTOCOL'}):
+            if trusted:
+                with self.assertRaises(adapter.AdapterError) as error:
+                    adapter.adapt(str(spec_path), str(self.build), str(self.work / 'state'),
+                        str(Path(bun).absolute()), str(checkout / 'bin/cook'),
+                        str(Path(bun).absolute()), str(Path(node).absolute()))
+                self.assertEqual(error.exception.code, 'E_COOK_FAILED')
+                self.assertEqual(error.exception.cook_error_code, 'E_HOST_DEPENDENCY_TRUSTED')
+                self.assertFalse((self.work / 'lifecycle-ran').exists())
+                return
             record = adapter.adapt(str(spec_path), str(self.build), str(self.work / 'state'),
                                    str(Path(bun).absolute()), str(checkout / 'bin/cook'),
                                    str(Path(bun).absolute()), str(Path(node).absolute()))
         self.assertEqual(record['version'], 2)
-        provenance = json.loads((self.build / 'framework.lock.json').read_text())
-        self.assertEqual(provenance['commit_verifiable'], not registry)
-        self.assertEqual(provenance['registry_release'], registry)
-        self.assertEqual(provenance['sha256'], artifact['sha256'])
+        if not generic_only:
+            provenance = json.loads((self.build / 'framework.lock.json').read_text())
+            self.assertEqual(provenance['commit_verifiable'], not registry)
+            self.assertEqual(provenance['registry_release'], registry)
+            self.assertEqual(provenance['sha256'], artifact['sha256'])
+        if registry:
+            self.assertEqual(record['hostDependencies'][0]['provenance']['kind'], 'artifact')
+            self.assertEqual(record['hostDependencies'][0]['provenance']['payload'],
+                             'operator-supplied prebuilt payload, verified out of band')
+        if two_dependencies:
+            self.assertEqual(len(record['hostDependencies']), 2)
+            self.assertFalse((self.work / 'lifecycle-ran').exists())
+            read_lock(self.build / 'connectome.lock', config=spec['config'], framework_pin=framework_pin)
+            for dep in record['hostDependencies']:
+                self.assertEqual(dep['sha256'], dep['provenance']['sha256'])
+            payload = next(d for d in record['hostDependencies'] if d['name'] == "@animalabs/context-manager")
+            self.assertFalse(payload['provenance']['commit_verifiable'])
+            if registry_input:
+                self.assertEqual(payload['provenance']['registry_comparison'],
+                                 'bytes were not compared against the registry')
+                lock_path = self.build / 'connectome.lock'
+                original = lock_path.read_text()
+                for key, value in (('registry_url', 'https://example.invalid'),
+                    ('registry_integrity', 'sha512-' + base64.b64encode(b'x' * 64).decode()),
+                    ('registry_comparison', 'verified online')):
+                    data = json.loads(original)
+                    data['hostDependencies'][1]['provenance'][key] = value
+                    lock_path.write_text(json.dumps(data))
+                    with self.subTest(field=key), self.assertRaises(LockError):
+                        read_lock(lock_path, config=spec['config'], framework_pin=framework_pin)
+                lock_path.write_text(original)
+            else:
+                self.assertEqual(payload['provenance']['payload'],
+                                 'operator-supplied prebuilt payload, verified out of band')
         self.assertEqual(record['connectomeHost']['commit'], host_pin)
         self.assertEqual(record['build']['dir'], str(self.build))
         self.assertEqual(record['state']['path'], str(self.work / 'state'))
@@ -724,6 +1003,14 @@ class RealCookTests(unittest.TestCase):
         deployment = Deployment(self.build.parent.parent, self.work / 'units', spec['config'],
                                 {'runtime': spec['pins']['runtime']}, ['unused'])
         self.assertEqual(deployment._lock(self.build)['build'], record['build'])
+        if two_dependencies:
+            # Adapter fixture uses a literal request path rather than role hashing.
+            deployment.build = self.build
+            Path(extra['path']).unlink()
+            (self.build / '.prepared').write_text(deployment.request_id)
+            self.assertEqual(len(deployment.plan()['host_dependencies']), 2)
+        if generic_only:
+            return
         (self.build / 'framework.lock.json').unlink()
         if registry:
             with self.assertRaises(DeployError) as error:
