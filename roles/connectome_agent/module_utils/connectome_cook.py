@@ -18,7 +18,7 @@ from connectome_lock import read_lock, LockError, text, credential_shaped, repos
 from connectome_errors import SafeError, diagnostic, cook_code_from_stream
 from connectome_archive import FRAMEWORK, ArchiveError, framework_provenance, dependency_provenance, records_metadata
 
-COOK_COMMIT = '061c579a6c3478a013d2e7b8dd5963d2c333f015'
+COOK_COMMIT = '011d73bc6c6103e0124df80191885a6585409c56'
 BASE_ENV = {'PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'}
 
 

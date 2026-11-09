@@ -976,8 +976,9 @@ class Deployment:
 
     def _activation_plan(self):
         lock = self._lock()
-        # Like the selected runtimes, host-installed servers are trusted only
-        # as root-maintained files; cook never fetched, built or pinned them.
+        # Host-installed servers are trusted only as root-maintained files
+        # (full chain check below); cook never fetched, built or pinned them.
+        # The selected bun/node runtimes only get an absolute-path + X_OK check.
         if lock.get('external'):
             try:
                 recipe = json.loads(inside(self.build, 'cook-recipe.json').read_text())

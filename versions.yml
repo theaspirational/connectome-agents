@@ -6,7 +6,7 @@
 runtime:
   connectome-host: cef933981dc0699fc00e5189b129d854ff8d43f6
   agent-framework: aa134e75fc19bc8cb3b73cb1ec53465dd9cf5c91
-  cook: 061c579a6c3478a013d2e7b8dd5963d2c333f015
+  cook: 011d73bc6c6103e0124df80191885a6585409c56
 connectors:
   slack-mcpl: df784a37f1a34074dea4139c587b37321f2afe05
   telegram-bot-mcpl: 0cdbdd45daa9caaaab6c4dabf231a215f802e48f
