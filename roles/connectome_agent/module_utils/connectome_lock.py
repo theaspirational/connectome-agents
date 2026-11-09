@@ -94,6 +94,16 @@ def names_only(value):
         require(not credential_shaped(value), 'lock contains a value-looking secret')
 
 
+def external_name(value):
+    return text(value) and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', value) is not None
+
+
+def external_command(value):
+    """A literal, absolute, lexically normal executable path; ownership is checked at activation."""
+    return (text(value) and value.startswith('/') and '${' not in value and
+            value == str(Path(value)) and value != '/' and '..' not in Path(value).parts)
+
+
 def contained_file(build, value):
     require(text(value), 'lock artifact path required')
     path = build / value
@@ -115,7 +125,7 @@ def map_lock(data, build, host_pin=None, required_names=(), config=None, framewo
     required = {'version', 'backend', 'cook', 'recipe', 'recipePath', 'createdAt',
                 'connectomeHost', 'components', 'localExtensions', 'requirements',
                 'build', 'credentials', 'outputs', 'launch'}
-    optional = {'state', 'layout', 'engines', 'hostDependencies', 'incomplete', 'units', 'health'}
+    optional = {'state', 'layout', 'engines', 'hostDependencies', 'incomplete', 'units', 'health', 'external'}
     require(required <= data.keys(), 'lock missing required v2 fields')
     require(data.keys() <= required | optional, 'lock contains unsupported fields')
     names_only(data)
@@ -216,6 +226,22 @@ def map_lock(data, build, host_pin=None, required_names=(), config=None, framewo
             require(isinstance(bindings, dict) and all(
                 re.fullmatch(r'[A-Z_][A-Z0-9_]*', k) and text(v) for k, v in bindings.items()),
                 'invalid connector state names/paths')
+    if 'external' in data:
+        # Host-installed MCP servers (recipe source.external). Cook omits the
+        # key when there are none and never records a commit, args or env.
+        external = data['external']
+        require(isinstance(external, list) and bool(external) and all(
+            isinstance(server, dict) and set(server) == {'name', 'command'} and
+            external_name(server['name']) and external_command(server['command'])
+            for server in external), 'invalid external server record')
+        names = [server['name'] for server in external]
+        require(len(set(names)) == len(names), 'duplicate external server name')
+        # ASCII names: Python order equals cook's JavaScript string order.
+        require(names == sorted(names),
+                'external servers must be sorted as cook writes them')
+        if 'layout' in data:
+            require(not set(names) & data['layout']['connectorState'].keys(),
+                    'connector state must not name an external server')
     if 'hostDependencies' in data:
         require(isinstance(data['hostDependencies'], list), 'invalid host dependency inventory')
         seen = set()

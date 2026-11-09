@@ -6,6 +6,8 @@ MESSAGES = {
     'E_UNIT_ACTIVE': 'Install-only deployment refuses an active or transitioning unit; no instance is stopped.',
     'E_UNIT_EXCLUSIVE': 'A mutually exclusive unit is active or activating; stop it explicitly before starting this agent.',
     'E_ANCESTOR_WRITABLE': 'Existing ancestor is group/other-writable; inspect ancestor_path and repair explicitly; not changed.',
+    'E_EXTERNAL_COMMAND': 'External MCP server command must be an existing root-owned regular file, not group/other-writable, under root-owned non-writable directories; not changed.',
+    'E_EXTERNAL_ACCESS': 'External MCP server command, path argument or an ancestor is not readable and executable/traversable by the agent account; not changed.',
     'E_SYSTEMD_PATH': 'Systemd paths must be absolute literals without whitespace or special characters.',
     'E_ENVIRONMENT_FILE': 'Required unit environment file was not accepted by the user service manager.',
     'E_ARCHIVE_GITHEAD': 'Archive gitHead is missing, invalid or differs from the requested commit.',

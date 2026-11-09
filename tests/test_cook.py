@@ -905,6 +905,9 @@ class RealCookTests(unittest.TestCase):
     def test_real_cook_offline_operator_recipe_and_secret_files(self):
         self.real_build(registry=False, operator_inputs=True)
 
+    def test_real_cook_offline_external_mcp_server(self):
+        self.real_build(registry=False, operator_inputs=True, external=True)
+
     def test_real_cook_offline_install_only_then_start_reuses_release(self):
         self.real_build(registry=False, operator_inputs=True, staging=True)
 
@@ -934,7 +937,7 @@ class RealCookTests(unittest.TestCase):
 
     def real_build(self, registry, with_secrets=True, two_dependencies=False, generic_only=False,
                    trusted=False, registry_input=False, operator_inputs=False, staging=False,
-                   home_passthrough=False):
+                   home_passthrough=False, external=False):
         """No fake runtimes/Git/dependency tools, downloads, or network recipes."""
         required = ('CONNECTOME_TEST_COOK_SOURCE', 'CONNECTOME_TEST_BUN', 'CONNECTOME_TEST_COOK_DEPS')
         missing_env = [name for name in required if not os.environ.get(name)]
@@ -1021,7 +1024,7 @@ class RealCookTests(unittest.TestCase):
             self.home_environment_lifecycle(spec, checkout, bun, node)
             return
         if operator_inputs:
-            self.operator_lifecycle(spec, checkout, bun, node, staging=staging)
+            self.operator_lifecycle(spec, checkout, bun, node, staging=staging, external=external)
             return
         spec_path = self.build / 'deployment.json'; spec_path.write_text(json.dumps(spec))
         # All acquisition is file-local. An empty private HOME prevents reuse
@@ -1173,7 +1176,7 @@ class RealCookTests(unittest.TestCase):
                 'home': str(runtime_home), 'cwd': str(dep.state_dir), 'data_dir': str(dep.state_dir)})
         self.assertFalse((self.work / observed.name).exists())
 
-    def operator_lifecycle(self, spec, checkout, bun, node, staging=False):
+    def operator_lifecycle(self, spec, checkout, bun, node, staging=False, external=False):
         from connectome_inputs import collect
         config = spec['config']
         config.pop('agent')
@@ -1186,6 +1189,16 @@ class RealCookTests(unittest.TestCase):
         recipe = self.work / 'operator.json'
         content = (b'{ "name":"example", "agent":{"systemPrompt":"Operator recipe"}, '
                    b'"requirements":{"EXAMPLE_FILE":{"exposeAs":"EXAMPLE_FILE","required":false}} }\r\n')
+        if external:
+            from test_external import system_command
+            command = system_command()
+            if command is None:
+                self.skipTest('real-cook integration: no root-owned system executable with safe ancestors')
+            unsafe = self.work / 'unsafe-server'; unsafe.write_text('#!/bin/sh\n'); unsafe.chmod(0o755)
+            servers = {'alpha': {'command': command, 'source': {'external': True},
+                                 'args': ['--root=' + str(Path(os.path.realpath(command)).parent)]}}
+            content = content.replace(b'"requirements"', b'"mcpServers":' + json.dumps(servers).encode() +
+                                      b', "requirements"')
         recipe.write_bytes(content)
         config['recipe_file'] = {'path': str(recipe), 'sha256': hashlib.sha256(content).hexdigest()}
         home = self.work / 'empty-home'; home.mkdir(mode=0o700)
@@ -1233,6 +1246,36 @@ class RealCookTests(unittest.TestCase):
                 return
             first.activate()
             self.assertEqual((first.state_dir / 'file-seen').read_text(), 'ok')
+            if external:
+                self.assertEqual(first._lock()['external'], [{'name': 'alpha', 'command': command}])
+                self.assertEqual(first._lock()['components'], [])
+                # Cook records any absolute command; the role refuses an
+                # account-owned one after the build, before activation.
+                unsafe_config = deepcopy(config)
+                unsafe_content = content.replace(b'"command": ' + json.dumps(command).encode(),
+                                                 b'"command": ' + json.dumps(str(unsafe)).encode())
+                recipe.write_bytes(unsafe_content)
+                unsafe_config['recipe_file']['sha256'] = hashlib.sha256(unsafe_content).hexdigest()
+                second = Deployment(root, self.work / 'units', unsafe_config, {'runtime': spec['pins']['runtime']},
+                                    cook, systemctl, operator_files=collect(unsafe_config))
+                with self.assertRaises(DeployError) as error:
+                    second.prepare()
+                self.assertEqual(error.exception.code, 'E_EXTERNAL_COMMAND')
+                self.assertEqual(json.loads((second.build / 'connectome.lock').read_text())['external'],
+                                 [{'name': 'alpha', 'command': str(unsafe)}])
+                self.assertFalse((second.build / '.prepared').exists())
+                self.assertEqual(first.current.resolve(), first.build)
+                # connector_state naming an external server never reaches cook.
+                state_config = deepcopy(config)
+                state_config['cook']['connector_state'] = {'alpha': {'DATA_DIR': str(self.work / 'alpha')}}
+                recipe.write_bytes(content)
+                third = Deployment(root, self.work / 'units', state_config, {'runtime': spec['pins']['runtime']},
+                                   cook, systemctl, operator_files=collect(state_config))
+                with self.assertRaises(DeployError) as error:
+                    third.prepare()
+                self.assertEqual(error.exception.code, 'E_ADAPTER_INPUT')
+                self.assertFalse((third.build / 'connectome.lock').exists())
+                return
             self.assertEqual((first.build / 'cook-recipe.json').read_bytes(), content)
             self.assertEqual(first._lock()['recipe']['sha256'], config['recipe_file']['sha256'])
             source_unit = (first.build / 'connectome-example.service').read_text()

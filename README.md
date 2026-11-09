@@ -134,5 +134,8 @@ Existing hand-built agents can opt into a hash-pinned, verbatim controller-local
 [`recipe_file`](docs/lock-contract.md#operator-supplied-recipe-opt-in) without
 regenerating connector/module recipes. Optional
 [`secret_files`](docs/lock-contract.md#file-only-secrets-opt-in) deliver selected
-secret values through private files and EnvironmentFile path variables. Both are
+secret values through private files and EnvironmentFile path variables. A supplied
+recipe may use cook's host-installed [`source: {external: true}`](docs/lock-contract.md#host-installed-external-mcp-servers)
+MCP servers; their commands and path args must be root-owned, non-writable
+(`E_EXTERNAL_COMMAND`) and usable by the agent account (`E_EXTERNAL_ACCESS`). Both are
 off by default; cook's run.sh, health checks and transactional rollback remain.

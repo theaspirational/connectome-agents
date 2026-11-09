@@ -62,6 +62,113 @@ def check_ancestors(path):
             raise AncestorWritable(parent)
 
 
+class ExternalCommandUnsafe(DeployError):
+    """Only the lock-validated server name is public, never the path or reason."""
+    def __init__(self, name, reason, code='E_EXTERNAL_COMMAND'):
+        super().__init__('unsafe external server path: ' + reason, code)
+        self.name = name
+
+    def public(self):
+        return dict(super().public(), external_server=self.name)
+
+
+def path_like_arg(arg):
+    """Cook's external-server rule: a flag's =value, or a bare arg naming a file."""
+    value = arg.partition('=')[2] if arg.startswith('-') else arg
+    if not value or re.match(r'[a-z][a-z0-9+.-]*://', value, re.I):
+        return None
+    if '/' in value or value.startswith(('.', '~')) or re.search(r'\.(?:[cm]?js|ts|py)$', value):
+        return value
+    return None
+
+
+def check_external_command(name, command, arg=False, account=None):
+    """Resolve like realpath, but lstat every visited component and link.
+
+    The path, every link in its chain, every directory traversed and the
+    final target must be root-owned; directories and the target must not be
+    group/other-writable. Symlink modes are meaningless; their parents count.
+    The agent account (owner, else group, else other bits, as the kernel
+    applies them) must be able to read and traverse every directory and read
+    and execute the command; a path argument may be a readable file or a
+    readable, traversable directory.
+    """
+    uid, groups = account or (os.geteuid(), {os.getegid(), *os.getgroups()})
+
+    def allowed(info, bits):
+        shift = 6 if info.st_uid == uid else 3 if info.st_gid in groups else 0
+        return (info.st_mode >> shift) & bits == bits
+
+    def inspect(path, last):
+        try:
+            info = path.lstat()
+        except OSError:
+            raise ExternalCommandUnsafe(name, 'missing or unreadable path') from None
+        if info.st_uid != 0:
+            raise ExternalCommandUnsafe(name, 'not root-owned')
+        if stat.S_ISLNK(info.st_mode):
+            return info
+        directory = stat.S_ISDIR(info.st_mode)
+        if not (stat.S_ISREG(info.st_mode) or (arg and directory) if last else directory):
+            raise ExternalCommandUnsafe(name, 'not a regular file' if last else 'not a directory')
+        if info.st_mode & 0o022:
+            raise ExternalCommandUnsafe(name, 'group/other-writable')
+        if not allowed(info, 0o5 if directory or not arg else 0o4):
+            raise ExternalCommandUnsafe(name, 'not readable/executable by the agent account',
+                                        'E_EXTERNAL_ACCESS')
+        return info
+
+    current = Path('/')
+    inspect(current, False)
+    pending = list(Path(command).parts[1:])
+    links = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            # current is always a fully inspected real directory.
+            current = current.parent
+            continue
+        candidate = current / part
+        info = inspect(candidate, not pending)
+        if stat.S_ISLNK(info.st_mode):
+            links += 1
+            if links > 40:
+                raise ExternalCommandUnsafe(name, 'too many symbolic links')
+            target = Path(os.readlink(candidate))
+            if target.is_absolute():
+                current = Path('/')
+            pending = list(target.parts[1:] if target.is_absolute() else target.parts) + pending
+            if not pending:
+                raise ExternalCommandUnsafe(name, 'not a regular file')
+            continue
+        current = candidate
+    if current == Path('/'):
+        raise ExternalCommandUnsafe(name, 'not a regular file')
+    return current
+
+
+def external_paths(lock, recipe):
+    """(name, path, is_arg) for each recorded command and absolute path-like arg."""
+    servers = recipe.get('mcpServers') if isinstance(recipe, dict) else None
+    result = []
+    for record in lock.get('external', []):
+        server = servers.get(record['name']) if isinstance(servers, dict) else None
+        if not (isinstance(server, dict) and isinstance(server.get('source'), dict) and
+                'external' in server['source'] and server.get('command') == record['command'] and
+                isinstance(server.get('args', []), list) and
+                all(isinstance(arg, str) for arg in server.get('args', []))):
+            raise DeployError('external server differs from the installed recipe', 'E_LOCK_INVALID')
+        args = server.get('args', [])
+        result.append((record['name'], record['command'], False))
+        for value in filter(None, map(path_like_arg, args)):
+            if not value.startswith('/'):
+                raise ExternalCommandUnsafe(record['name'], 'relative path argument')
+            result.append((record['name'], value, True))
+    return result
+
+
 def make_directory(path, mode=0o700):
     """Set exact modes only on directories this call creates, never repair."""
     path = Path(path)
@@ -869,6 +976,15 @@ class Deployment:
 
     def _activation_plan(self):
         lock = self._lock()
+        # Like the selected runtimes, host-installed servers are trusted only
+        # as root-maintained files; cook never fetched, built or pinned them.
+        if lock.get('external'):
+            try:
+                recipe = json.loads(inside(self.build, 'cook-recipe.json').read_text())
+            except (OSError, ValueError):
+                raise DeployError('external servers require the installed recipe', 'E_LOCK_INVALID') from None
+            for name, path, arg in external_paths(lock, recipe):
+                check_external_command(name, path, arg)
         units = self._units(self.build, lock)
         previous = self.current.resolve() if self.current.is_symlink() else None
         previous_lock = self._lock(previous) if previous else None

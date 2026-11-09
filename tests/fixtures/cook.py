@@ -40,4 +40,11 @@ lock = {
     'credentials': sorted(names), 'outputs': [],
     'launch': {'kind': 'script', 'script': 'run.sh'},
 }
+# Like cook: host-installed servers are recorded by name and command only.
+if 'recipe_file' in spec['config']:
+    servers = json.loads(source_recipe.read_text()).get('mcpServers', {})
+    external = [{'name': n, 'command': s['command']} for n, s in sorted(servers.items())
+                if 'external' in s.get('source', {})]
+    if external:
+        lock['external'] = external
 (out / 'connectome.lock').write_text(json.dumps(lock))

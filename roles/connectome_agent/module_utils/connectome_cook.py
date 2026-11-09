@@ -18,7 +18,7 @@ from connectome_lock import read_lock, LockError, text, credential_shaped, repos
 from connectome_errors import SafeError, diagnostic, cook_code_from_stream
 from connectome_archive import FRAMEWORK, ArchiveError, framework_provenance, dependency_provenance, records_metadata
 
-COOK_COMMIT = '28236dd51045c99604ddc7ba6a2eb0c02679fd3d'
+COOK_COMMIT = '061c579a6c3478a013d2e7b8dd5963d2c333f015'
 BASE_ENV = {'PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'}
 
 
@@ -181,6 +181,15 @@ def recipe_from_spec(spec, recipe_bytes=None):
     return recipe, names
 
 
+def external_servers(recipe):
+    """Top-level recipe servers marked source.external, by name."""
+    servers = recipe.get('mcpServers', {}) if isinstance(recipe, dict) else {}
+    need(isinstance(servers, dict), 'recipe mcpServers must be a mapping')
+    return {name: server.get('command') for name, server in servers.items()
+            if isinstance(server, dict) and isinstance(server.get('source'), dict) and
+            'external' in server['source']}
+
+
 def framework_input(config, pin):
     """Compatibility helper; provenance is recorded separately from cook's lock."""
     framework_provenance(config, pin)
@@ -230,6 +239,9 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
          ('framework_archive' in settings or 'host_dependencies' in settings),
          'cook requires host_repo, local dependencies and explicit connector_state')
     need(repository(settings['host_repo']), 'cook.host_repo requires a safe HTTPS, SSH/scp or absolute local repository')
+    external = external_servers(recipe)
+    need(isinstance(settings['connector_state'], dict) and not settings['connector_state'].keys() & external.keys(),
+         'connector_state must not name an external server')
     dependencies = dependency_provenance(config, pins['agent-framework'])
     provenance = None
     if 'framework_archive' in settings:
@@ -277,8 +289,14 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
                 for name, entry in ({} if supplied_recipe else config.get('connectors', {})).items()}
     actual = {(entry.get('url'), entry.get('commit')) for entry in lock['components']}
     if not supplied_recipe:
-        need(actual == expected and all(c['kind'] == 'git' and c['role'] == 'mcp' for c in lock['components']),
+        need(actual == expected and 'external' not in lock and
+             all(c['kind'] == 'git' and c['role'] == 'mcp' for c in lock['components']),
              'cook component provenance differs from enabled inputs')
+    # External servers are not components: no commit is claimed. Bind the
+    # recorded commands exactly to the reviewed top-level recipe, whose args
+    # activation also checks; fleet-child external servers are refused.
+    recorded = {server['name']: server['command'] for server in lock.get('external', [])}
+    need(recorded == external, 'cook external servers differ from the recipe')
     # Validate cook's inventory before adding config-only provenance. Legacy
     # configs never rewrite cook's lock, argv or build identity.
     expected = {d['name']: d for d in dependencies}

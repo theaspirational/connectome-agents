@@ -1,9 +1,9 @@
 # Lock v2 contract and cook boundary
 
 Source inspected offline: [the public cook fork](https://github.com/theaspirational/connectome-cook),
-commit `28236dd51045c99604ddc7ba6a2eb0c02679fd3d` (public fork main,
-tree `188047b296b03341926c22881a45f903861773a4`). In particular: `src/lockfile.ts`, `src/cli.ts`,
-`src/backends/host.ts`, and the engine/layout/unit/dependency documentation.
+commit `061c579a6c3478a013d2e7b8dd5963d2c333f015` (fork main plus the reviewed
+`source.external` change, not yet published; tree `0b51dd5670f1a98d1c5fb15b00fecdf3bf963fdd`). In particular: `src/lockfile.ts`, `src/cli.ts`,
+`src/backends/host.ts`, `src/source-detector.ts`, and the engine/layout/unit/dependency documentation.
 This is a source compatibility target, **not** a claim of a completed live-host
 qualification. The offline real-cook test reports whether prerequisites let it run.
 
@@ -27,6 +27,7 @@ qualification. The offline real-cook test reports whether prerequisites let it r
 | `engines` | emitted with selected engines | Bun/Node path, realPath and observed version |
 | `layout`, `state.path` | emitted with split layout | explicit roots/bindings and persistent state outside build |
 | `hostDependencies` | emitted with local inputs | archive hash/version/size/snapshot and package.json policy delta; adapter adds closed provenance for list/legacy-marked inputs |
+| `external[]` | emitted only when a recipe marks `source: {external: true}`; omitted when none | exactly `{name, command}`: ASCII server name (`[A-Za-z0-9_][A-Za-z0-9_.-]*`), unique, sorted by name as cook writes; literal, lexically normal absolute command. No commit, args or env are claimed or accepted. Not a component. Ownership is checked before activation (see [external MCP servers](#host-installed-external-mcp-servers)) |
 | `incomplete` | emitted on interrupted/failed reconcile | always refused for deployment |
 | `units[]` | **planned** deployment extension, not emitted | optional contained path/SHA-256 records; mutually exclusive with exported unit hint |
 | `health` | **planned** deployment extension, not emitted | optional command argv; otherwise effective agent health |
@@ -295,7 +296,8 @@ see [runtime HOME and cwd](layering.md#external-runtime-state-and-budgets).
 The adapter output must be ROOT/builds/REQUEST. The external state directory's
 parent need not be writable by the agent account. All are outside the
 immutable build. These layout paths must be private, distinct per agent and non-overlapping.
-Declare connector file state explicitly in `connector_state`;
+Declare connector file state explicitly in `connector_state`; it must not name
+an external server (adapter refusal before cook; the reader also refuses such a lock).
 other application paths are not guessed. Cook requires private, non-overlapping
 roots with safe ancestors; consult its layout documentation. Runtime launches,
 child Bun autoload and operator absolute overrides need separate audits. The
@@ -321,6 +323,8 @@ explanation. CLI argument errors also use a fixed envelope without echoing argv.
 | `E_LOCK_INVALID` | Cook lock, dependency inventory or framework provenance failed validation. |
 | `E_LOCK_STATE_PATH` | Returned persistent state/layout differs from the request. |
 | `E_ANCESTOR_WRITABLE` | Existing group/other-writable ancestor; the deployment result names `ancestor_path`. No chmod or writes occur. |
+| `E_EXTERNAL_COMMAND` | An `external[]` command or path argument, a link in its chain or a traversed directory is missing, not root-owned, group/other-writable or not a regular file; names `external_server` only. Nothing is repaired or activated. |
+| `E_EXTERNAL_ACCESS` | The agent account cannot read/execute an external command or path argument, or read/traverse a directory above it; names `external_server` only. Grant access explicitly; nothing is changed. |
 | `E_SYSTEMD_PATH` | Use literal absolute paths without whitespace, specifiers, globs or escapes. |
 | `E_ENVIRONMENT_FILE` | Manager did not accept the required non-optional environment file. |
 | `E_UNIT_ACTIVE` | Install-only would replace an active/transitioning unit; names `unit` and `scope`. Stop it explicitly first. |
@@ -555,6 +559,45 @@ use cook's generated run.sh**. No alternate start command or extra unit directiv
 are introduced. Absent these new inputs, recipe rendering, adapter/deployment
 argv, units and lock bytes are compared directly against baseline `06af58c` in
 the offline compatibility test.
+
+### Host-installed (external) MCP servers
+
+The supplied recipe may mark an MCP server `source: {"external": true}`: a
+server already installed on the target at a literal absolute
+`command`. Cook never fetches, builds, copies or rewrites it and records only
+`external: [{name, command}]` in the lock. The role adds:
+
+- **Recipe binding.** After cook, the recorded `{name: command}` set must equal
+  the supplied recipe's top-level external servers exactly. Git/npm
+  `components[]` are unaffected (external servers are not components). External
+  servers declared only in fleet child recipes are refused: their args are not in
+  the installed recipe. A generated (non-`recipe_file`) recipe never yields
+  `external`; such a lock is refused as a component-provenance mismatch. At
+  activation each recorded server must still match `BUILD/cook-recipe.json`
+  (`E_LOCK_INVALID` otherwise).
+- **`connector_state`** may not name an external server; cook's split layout
+  cannot bind its state. Declare its state paths in the recipe env instead.
+- **Ownership before activation.** For the current build, before any unit,
+  environment or `current` change (at prepare and again at every activate), the
+  command is resolved component by component with `lstat`: `/`, every traversed
+  directory, every symlink in the chain and the final target must be owned by
+  uid 0; directories and the target must not be group/other-writable; the target
+  must be a regular file. Otherwise `E_EXTERNAL_COMMAND` (naming only
+  `external_server`) is raised.
+- **Agent access.** The deploying (agent) account must be able to read and
+  execute the command and read and traverse every directory on the way,
+  using the bits the kernel applies (owner if it owns it, else group if it is a
+  member, else other). A `root:<other group> 0750` directory therefore fails with
+  `E_EXTERNAL_ACCESS`.
+- **Path arguments.** Every path-like arg of the server in the installed recipe
+  (cook's rule: a bare arg containing `/`, starting with `.` or `~`, or ending in
+  `.js`/`.ts`/`.py`, or the `=value` of a flag; URLs excluded) must be absolute
+  and passes the same root-owned ancestry and agent-access checks; its target
+  may be a readable regular file or a readable, traversable directory. Args
+  naming not-yet-existing paths are therefore refused.
+
+Nothing is chowned or chmodded. This trusts the host's root-maintained
+installation; it is not a content pin or a review of the server.
 
 ## File-only secrets (opt-in)
 
