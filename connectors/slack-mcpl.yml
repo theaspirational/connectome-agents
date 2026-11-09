@@ -1,0 +1,16 @@
+# Candidate upstream metadata; verify offline-unavailable refs before use.
+slack-mcpl:
+  repo: https://github.com/anima-research/slack-mcpl.git
+  pin_ref: connectors.slack-mcpl
+  enabled: true
+  build:
+  - - bun
+    - install
+    - --frozen-lockfile
+  - - bun
+    - run
+    - build
+  settings: {}
+  required_secrets:
+  - SLACK_BOT_TOKEN
+  - SLACK_APP_TOKEN

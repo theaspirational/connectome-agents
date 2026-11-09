@@ -1,0 +1,15 @@
+---
+# All deployment paths must remain within this non-symlinked base.
+connectome_base: "{{ ansible_env.HOME }}/.local/share/connectome"
+connectome_root: "{{ connectome_base }}/{{ connectome_effective.name }}"
+connectome_unit_dir: "{{ ansible_env.HOME }}/.config/systemd/user"
+connectome_private: {}
+connectome_group: {}
+connectome_agent: {}
+connectome_versions_file: "{{ role_path }}/../../versions.yml"
+# Adapter command argv; placeholders: {recipe}, {build_dir}, {state_dir}.
+# Install an adapter backed by the pinned cook; see docs/lock-contract.md.
+connectome_cook_command: []
+connectome_systemctl: [systemctl, --user]
+connectome_secret_lookup: connectome_file
+connectome_secret_lookup_options: {}

@@ -1,0 +1,69 @@
+---
+- name: Read public agent defaults
+  ansible.builtin.include_vars:
+    file: "{{ role_path }}/../../defaults/agent.yml"
+    name: connectome_defaults_data
+
+- name: Read public connector descriptors
+  ansible.builtin.include_vars:
+    dir: "{{ role_path }}/../../connectors"
+    extensions: [yml]
+    name: connectome_catalog_data
+
+- name: Read pinned versions
+  ansible.builtin.include_vars:
+    file: "{{ connectome_versions_file }}"
+    name: connectome_versions_data
+
+- name: Merge the four layers once and remove disabled entries
+  ansible.builtin.set_fact:
+    connectome_effective: >-
+      {{ [connectome_defaults_data | connectome_public_catalog(connectome_catalog_data),
+          connectome_private, connectome_group, connectome_agent] | connectome_layers }}
+
+- name: Materialize a fresh cook build or reuse the validated request
+  connectome_release:
+    operation: prepare
+    base: "{{ connectome_base }}"
+    root: "{{ connectome_root }}"
+    unit_dir: "{{ connectome_unit_dir }}"
+    config: "{{ connectome_effective }}"
+    versions: "{{ connectome_versions_data }}"
+    cook_command: "{{ connectome_cook_command }}"
+    systemctl: "{{ connectome_systemctl }}"
+  register: connectome_prepared
+
+- name: Resolve secrets and activate with guaranteed fact cleanup
+  block:
+    - name: Start a fresh secret result for this deployment
+      ansible.builtin.set_fact:
+        connectome_resolved_secrets: {}
+      no_log: true
+
+    - name: Resolve only declared secret names through the selected provider
+      ansible.builtin.set_fact:
+        connectome_resolved_secrets: >-
+          {{ dict(connectome_resolved_secrets.items() | list +
+                  [(item, lookup(connectome_secret_lookup, item,
+                                 **connectome_secret_lookup_options))]) }}
+      loop: "{{ connectome_prepared.secret_names }}"
+      when: not ansible_check_mode
+      no_log: true
+
+    - name: Activate units, switch current, check health and roll back on failure
+      connectome_release:
+        operation: activate
+        base: "{{ connectome_base }}"
+        root: "{{ connectome_root }}"
+        unit_dir: "{{ connectome_unit_dir }}"
+        config: "{{ connectome_effective }}"
+        versions: "{{ connectome_versions_data }}"
+        cook_command: "{{ connectome_cook_command }}"
+        systemctl: "{{ connectome_systemctl }}"
+        secrets: "{{ connectome_resolved_secrets }}"
+      no_log: true
+  always:
+    - name: Forget controller secret facts
+      ansible.builtin.set_fact:
+        connectome_resolved_secrets: {}
+      no_log: true

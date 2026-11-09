@@ -1,0 +1,11 @@
+name: example
+budgets:
+  max_steps: 100
+  max_cost: 5.0
+modules:
+  conversation:
+    enabled: true
+    settings: {}
+  memory:
+    enabled: true
+    settings: {}

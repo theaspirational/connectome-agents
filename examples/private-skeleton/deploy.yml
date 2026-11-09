@@ -1,0 +1,9 @@
+---
+- name: Deploy the neutral example
+  hosts: all
+  gather_facts: true
+  vars:
+    connectome_agent: "{{ lookup('file', playbook_dir + '/agents/example/agent.yml') | from_yaml }}"
+    connectome_private: "{{ lookup('file', playbook_dir + '/overrides/agent.yml') | from_yaml }}"
+  roles:
+    - role: public/roles/connectome_agent

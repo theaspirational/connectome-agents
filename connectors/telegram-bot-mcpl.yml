@@ -1,0 +1,15 @@
+# Candidate upstream metadata; verify offline-unavailable refs before use.
+telegram-bot-mcpl:
+  repo: https://github.com/theaspirational/telegram-bot-mcpl.git
+  pin_ref: connectors.telegram-bot-mcpl
+  enabled: true
+  build:
+  - - bun
+    - install
+    - --frozen-lockfile
+  - - bun
+    - run
+    - build
+  settings: {}
+  required_secrets:
+  - TELEGRAM_BOT_TOKEN

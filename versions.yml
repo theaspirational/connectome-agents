@@ -1,0 +1,14 @@
+# bump one per commit
+# Default-branch HEADs supplied by the operator (2026-11-09).
+# Immutable pins, NOT verified-compatible releases. No network verification here.
+# terminal-sessions-mcp is unresolved: deployment fails closed if enabled.
+runtime:
+  connectome-host: cef933981dc0699fc00e5189b129d854ff8d43f6
+  agent-framework: aa134e75fc19bc8cb3b73cb1ec53465dd9cf5c91
+  cook: 916cad09afb392a0981f208aaac5d123543af33f
+connectors:
+  slack-mcpl: df784a37f1a34074dea4139c587b37321f2afe05
+  telegram-bot-mcpl: 0cdbdd45daa9caaaab6c4dabf231a215f802e48f
+  zulip_mcp: cd4686e45d780a1b85848c7e3df0282798618700
+  github-mcpl: 781fe03a4aea79b1877ff083648b9d3dfb329f02
+  terminal-sessions-mcp: '0000000000000000000000000000000000000000'

@@ -1,0 +1,15 @@
+# Candidate upstream metadata; verify offline-unavailable refs before use.
+zulip_mcp:
+  repo: https://github.com/antra-tess/zulip_mcp.git
+  pin_ref: connectors.zulip_mcp
+  enabled: true
+  build:
+  - - bun
+    - install
+    - --frozen-lockfile
+  - - bun
+    - run
+    - build
+  settings: {}
+  required_secrets:
+  - ZULIP_API_KEY

@@ -1,0 +1,15 @@
+# Candidate upstream metadata; verify offline-unavailable refs before use.
+terminal-sessions-mcp:
+  repo: https://github.com/anima-research/terminal-sessions-mcp.git
+  pin_ref: connectors.terminal-sessions-mcp
+  enabled: true
+  build:
+  - - bun
+    - install
+    - --frozen-lockfile
+  - - bun
+    - run
+    - build
+  settings: {}
+  required_secrets:
+  - SESSION_SERVER_TOKEN

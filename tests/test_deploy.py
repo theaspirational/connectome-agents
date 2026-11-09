@@ -1,0 +1,643 @@
+import copy
+import hashlib
+import os
+import json
+import importlib.util
+from pathlib import Path
+import stat
+import sys
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'roles/connectome_agent/module_utils'))
+from connectome_config import merge_layers, public_catalog
+from connectome_deploy import Deployment, DeployError
+
+
+def read(path):
+    return yaml.safe_load((ROOT / path).read_text())
+
+
+def example():
+    catalog = {}
+    for path in (ROOT / 'connectors').glob('*.yml'):
+        catalog.update(yaml.safe_load(path.read_text()))
+    public = public_catalog(read('defaults/agent.yml'), catalog)
+    return merge_layers([public, read('examples/private-skeleton/overrides/agent.yml'), {},
+                         read('examples/private-skeleton/agents/example/agent.yml')])
+
+
+class MockProvider:
+    def __init__(self, path):
+        self.path, self.requested = path, []
+
+    def get(self, names):
+        self.requested.extend(names)
+        values = json.loads(self.path.read_text())
+        return {name: values[name] for name in names}
+
+
+class DeployTests(unittest.TestCase):
+    def setUp(self):
+        (ROOT / '.cache').mkdir(exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(dir=ROOT / '.cache')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / 'agent'
+        self.units = Path(self.tmp.name) / 'units'
+        self.config = example()
+        self.versions = read('versions.yml')
+        self.cook = [sys.executable, str(ROOT / 'tests/fixtures/cook.py'),
+                     '{recipe}', '{build_dir}', '{state_dir}']
+        self.systemctl = [sys.executable, str(ROOT / 'tests/fixtures/systemctl.py'), str(self.root)]
+        self.provider_path = Path(self.tmp.name) / 'provider.json'
+        self.provider_path.write_text(json.dumps({'EXAMPLE_SECRET': 'synthetic-value',
+                                                 'UNUSED_SECRET': 'never-requested'}))
+        self.provider = MockProvider(self.provider_path)
+
+    def deployment(self, config=None, check=False, versions=None):
+        return Deployment(self.root, self.units, config or self.config,
+                          versions or self.versions, self.cook, self.systemctl, check)
+
+    def apply(self, deployment):
+        plan = deployment.prepare()
+        return deployment.activate(self.provider.get(plan['secret_names']))
+
+    def test_switch_rollback_idempotency_and_exact_secrets(self):
+        self.config['required_secrets'] = ['EXAMPLE_SECRET']
+        first = self.deployment()
+        self.assertTrue(self.apply(first)['changed'])
+        self.assertEqual((self.root / 'current').resolve(), first.build)
+        env = first.build / 'secrets.env'
+        self.assertEqual(stat.S_IMODE(env.stat().st_mode), 0o600)
+        self.assertEqual(env.read_text(), 'EXAMPLE_SECRET="synthetic-value"\n')
+        before = {p: p.stat().st_mtime_ns for p in (env, first.build / 'connectome.lock')}
+        calls = (self.root / 'systemctl-calls').read_text().splitlines()
+        self.assertFalse(self.apply(first)['changed'])
+        self.assertEqual(before, {p: p.stat().st_mtime_ns for p in before})
+        after = (self.root / 'systemctl-calls').read_text().splitlines()[len(calls):]
+        self.assertTrue(all(json.loads(line)[0] == 'is-active' for line in after))
+        self.assertEqual(len((self.root / 'cook-calls').read_text().splitlines()), 1)
+        second_config = copy.deepcopy(self.config)
+        second_config['budgets']['max_cost'] = 3
+        second = self.deployment(second_config)
+        self.assertTrue(self.apply(second)['changed'])
+        self.assertEqual((self.root / 'current').resolve(), second.build)
+        self.assertNotEqual(first.build, second.build)
+        bad_config = copy.deepcopy(second_config)
+        bad_config['budgets']['max_cost'] = 4
+        bad = self.deployment(bad_config)
+        bad.prepare()
+        (self.root / 'fail-health').write_text(str(bad.build))
+        with self.assertRaisesRegex(DeployError, 'previous deployment restored'):
+            bad.activate(self.provider.get(bad.names))
+        self.assertEqual((self.root / 'current').resolve(), second.build)
+        self.assertEqual((self.units / 'connectome-example.service').resolve().parent, second.build)
+        self.assertEqual(self.provider.requested, ['EXAMPLE_SECRET'] * 4)
+        self.assertTrue(first.build.exists())
+        self.assertTrue((self.root / 'state').is_dir())
+
+    def test_secret_rotation_restarts_without_rebuilding(self):
+        self.config['required_secrets'] = ['EXAMPLE_SECRET']
+        dep = self.deployment()
+        self.apply(dep)
+        self.provider_path.write_text(json.dumps({'EXAMPLE_SECRET': 'rotated-value'}))
+        self.assertTrue(self.apply(dep)['changed'])
+        self.assertFalse(self.apply(dep)['changed'])
+        self.assertIn('rotated-value', (dep.build / 'secrets.env').read_text())
+        self.assertEqual(len((self.root / 'cook-calls').read_text().splitlines()), 1)
+
+    def test_failed_cook_preserves_active_and_retry_is_fresh(self):
+        first = self.deployment()
+        self.apply(first)
+        config = copy.deepcopy(self.config)
+        config['budgets']['max_steps'] = 7
+        second = self.deployment(config)
+        (self.root / 'cook-fail-once').touch()
+        with self.assertRaises(DeployError):
+            second.prepare()
+        self.assertTrue((second.build / 'partial').exists())
+        entries = json.loads(second.manifest_path.read_text())['entries']
+        self.assertIn({'path': str(second.build), 'kind': 'directory'}, entries)
+        self.assertFalse((second.build / '.prepared').exists())
+        self.assertEqual((self.root / 'current').resolve(), first.build)
+        self.assertTrue(self.apply(self.deployment(config))['changed'])
+        self.assertFalse((second.build / 'partial').exists())
+
+    def test_unknown_build_directory_is_refused_unchanged(self):
+        dep = self.deployment()
+        dep.build.mkdir(parents=True)
+        (dep.build / 'never-installed.service').write_text('not owned by deployment')
+        # Neither a missing marker nor a plausible marker grants ownership.
+        for prepared in (False, True):
+            if prepared:
+                (dep.build / '.prepared').write_text(dep.request_id)
+            for check in (False, True):
+                before = self.snapshot()
+                candidate = self.deployment(check=check)
+                for operation in (candidate.prepare, lambda: candidate.activate({})):
+                    with self.assertRaisesRegex(DeployError, 'unmanaged build directory'):
+                        operation()
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_contained_builds_alias_refused_before_cleanup(self):
+        dep = self.deployment()
+        dep.build.mkdir(parents=True)
+        (dep.build / 'never-installed.service').write_text('not owned by deployment')
+        original = self.root / 'retained'
+        dep.builds.rename(original)
+        dep.builds.symlink_to(original, target_is_directory=True)
+        before = self.snapshot()
+        # Check both an already-constructed deployment and a new instance.
+        for candidate in (dep, self.deployment(), self.deployment(check=True)):
+            with self.assertRaisesRegex(DeployError, 'symlinked base'):
+                candidate.prepare()
+            self.assertEqual(self.snapshot(), before)
+
+    def test_owned_builds_alias_refused_before_cleanup(self):
+        dep = self.deployment()
+        self.root.mkdir()
+        (self.root / 'cook-fail-once').touch()
+        with self.assertRaises(DeployError):
+            dep.prepare()
+        original = self.root / 'retained'
+        dep.builds.rename(original)
+        dep.builds.symlink_to(original, target_is_directory=True)
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'symlinked base'):
+            dep.prepare()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unmanaged_unit_is_not_overwritten(self):
+        self.units.mkdir()
+        unit = self.units / 'connectome-example.service'
+        dep = self.deployment()
+        dep.prepare()
+        unit.write_text('unmanaged')
+        with self.assertRaisesRegex(DeployError, 'unmanaged'):
+            dep.activate({})
+        self.assertEqual(unit.read_text(), 'unmanaged')
+        self.assertFalse((self.root / 'current').exists())
+
+    def test_invalid_names_fail_before_any_filesystem_mutation(self):
+        bad_names = ['../escaped', '/absolute', '.', '..', '', 'Upper', 'x' * 64,
+                     'has_space', 'with/slash', 'with\\backslash', 'line\n']
+        for section in ('agent', 'connector'):
+            for name in bad_names:
+                with self.subTest(section=section, name=name):
+                    config = copy.deepcopy(self.config)
+                    if section == 'agent':
+                        config['name'] = name
+                    else:
+                        config['connectors'][name] = {'pin_ref': 'connectors.slack'}
+                    with self.assertRaisesRegex(DeployError, 'identifier'):
+                        self.deployment(config)
+                    self.assertFalse(self.root.exists())
+                    self.assertFalse(self.units.exists())
+
+    def test_identifier_boundaries_allowed(self):
+        for name in ('a', '0', 'a' + '-' * 62):
+            config = copy.deepcopy(self.config)
+            config['name'] = name
+            self.deployment(config, check=True)
+        self.assertFalse(self.root.exists())
+
+    def test_module_rejects_before_root_mkdir_or_lock(self):
+        # Exercise the actual Ansible boundary, not just the shared constructor.
+        for connector in (False, True):
+            config = copy.deepcopy(self.config)
+            if connector:
+                config['connectors']['../escaped'] = {}
+            else:
+                config['name'] = '../escaped'
+            base = Path(self.tmp.name) / 'base'
+            escaped = base / config['name']
+            module = Mock(params=dict(operation='prepare', root=str(escaped), base=str(base),
+                                      unit_dir=str(self.units), config=config, versions=self.versions,
+                                      cook_command=self.cook, secrets={}), check_mode=False)
+            module.fail_json.side_effect = DeployError('boundary rejected')
+            modules = {
+                'ansible.module_utils.basic': SimpleNamespace(AnsibleModule=Mock(return_value=module)),
+                'ansible.module_utils.connectome_deploy': sys.modules['connectome_deploy'],
+            }
+            spec = importlib.util.spec_from_file_location(
+                'release_boundary', ROOT / 'roles/connectome_agent/library/connectome_release.py')
+            boundary = importlib.util.module_from_spec(spec)
+            with patch.dict(sys.modules, modules):
+                spec.loader.exec_module(boundary)
+                with self.assertRaisesRegex(DeployError, 'boundary rejected'):
+                    boundary.main()
+            self.assertFalse(base.exists())
+            self.assertFalse((Path(self.tmp.name) / 'escaped').exists())
+            module.exit_json.assert_not_called()
+
+    def test_explicit_base_contains_root(self):
+        base = Path(self.tmp.name) / 'base'
+        with self.assertRaisesRegex(DeployError, 'escapes'):
+            Deployment(base / '../escaped', self.units, self.config, self.versions,
+                       self.cook, base=base)
+        self.assertFalse(base.exists())
+
+    def test_symlinked_bases_and_derived_escapes_refused(self):
+        outside = Path(self.tmp.name) / 'outside'
+        outside.mkdir()
+        self.root.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(DeployError, 'symlinked base'):
+            self.deployment()
+        # A symlinked ancestor is refused too, even if the agent root is absent.
+        with self.assertRaisesRegex(DeployError, 'symlinked base'):
+            Deployment(self.root / 'child', self.units, self.config, self.versions, self.cook)
+        self.root.unlink()
+        self.root.mkdir()
+        for name in ('builds', 'state', 'current', '.deploy-lock'):
+            with self.subTest(path=name):
+                path = self.root / name
+                path.symlink_to(outside, target_is_directory=True)
+                with self.assertRaisesRegex(DeployError, 'escapes'):
+                    self.deployment()
+                path.unlink()
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_late_symlink_escape_refused_before_prepare(self):
+        dep = self.deployment()
+        self.root.mkdir()
+        outside = Path(self.tmp.name) / 'outside'
+        outside.mkdir()
+        (self.root / 'builds').symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(DeployError, 'escapes'):
+            dep.prepare()
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_retired_unmanaged_unit_is_not_disabled_or_deleted_on_rename(self):
+        first = self.deployment()
+        self.apply(first)
+        old_unit = self.units / 'connectome-example.service'
+        config = copy.deepcopy(self.config)
+        config['name'] = 'renamed'
+        second = self.deployment(config)
+        second.prepare()
+        old_unit.unlink()
+        old_unit.write_text('unmanaged replacement')
+        calls = (self.root / 'systemctl-calls').read_text()
+        dropin = self.units / 'connectome-example.service.d/90-connectome-env.conf'
+        before = dropin.read_text()
+        with self.assertRaisesRegex(DeployError, 'unmanaged'):
+            second.activate({})
+        self.assertEqual(old_unit.read_text(), 'unmanaged replacement')
+        self.assertEqual(dropin.read_text(), before)
+        self.assertEqual((self.root / 'systemctl-calls').read_text(), calls)
+        self.assertEqual((self.root / 'current').resolve(), first.build)
+        self.assertFalse((second.build / 'secrets.env').exists())
+        self.assertFalse((self.units / 'connectome-renamed.service').exists())
+
+    def test_managed_retired_unit_is_removed_on_rename(self):
+        self.apply(self.deployment())
+        config = copy.deepcopy(self.config)
+        config['name'] = 'renamed'
+        self.apply(self.deployment(config))
+        self.assertFalse((self.units / 'connectome-example.service').exists())
+        self.assertFalse((self.units / 'connectome-example.service.d').exists())
+        self.assertTrue((self.units / 'connectome-renamed.service').is_symlink())
+
+    def test_symlinked_dropin_escape_refused(self):
+        dep = self.deployment()
+        dep.prepare()
+        self.units.mkdir()
+        outside = Path(self.tmp.name) / 'outside'
+        outside.mkdir()
+        (self.units / 'connectome-example.service.d').symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(DeployError, 'symlinked drop-in directory'):
+            dep.activate({})
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.root / 'current').exists())
+
+    def snapshot(self):
+        # Include links verbatim, file bytes and directory modes; no mutations.
+        return {str(path.relative_to(self.tmp.name)): (
+            ('link', os.readlink(path)) if path.is_symlink() else
+            ('directory', stat.S_IMODE(path.stat().st_mode)) if path.is_dir() else
+            ('file', path.read_bytes(), stat.S_IMODE(path.stat().st_mode)))
+            for path in Path(self.tmp.name).rglob('*')}
+
+    def test_retired_link_retargeted_to_never_installed_build_file_refused(self):
+        first = self.deployment()
+        self.apply(first)
+        never_installed = first.build / 'never-installed.service'
+        never_installed.write_text('[Service]\nExecStart=/bin/true\n')
+        unit = self.units / 'connectome-example.service'
+        config = copy.deepcopy(self.config)
+        config['name'] = 'renamed'
+        second = self.deployment(config)
+        second.prepare()
+        unit.unlink()
+        unit.symlink_to(never_installed)
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'ownership mismatch'):
+            second.activate({})
+        self.assertEqual(self.snapshot(), before)
+
+    def test_contained_dropin_directory_alias_over_other_unit_refused(self):
+        dep = self.deployment()
+        dep.prepare()
+        self.units.mkdir()
+        other = self.units / 'other.service.d'
+        other.mkdir()
+        (other / '90-connectome-env.conf').write_text('unmanaged env drop-in')
+        (self.units / 'connectome-example.service.d').symlink_to(other, target_is_directory=True)
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'symlinked drop-in directory'):
+            dep.activate({})
+        self.assertEqual(self.snapshot(), before)
+
+    def test_manifest_records_exact_installed_paths_and_survives_rollback(self):
+        dep = self.deployment()
+        self.apply(dep)
+        manifest = dep.state / 'ownership.json'
+        self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o600)
+        data = json.loads(manifest.read_text())
+        entries = {Path(entry['path']): entry for entry in data['entries']}
+        unit = 'connectome-example.service'
+        self.assertEqual(set(entries), {
+            dep.build, dep.current, dep.build / unit, self.units / unit,
+            self.units / (unit + '.d') / '90-connectome-env.conf',
+            self.units / 'default.target.wants' / unit})
+        for path, entry in entries.items():
+            if entry['kind'] == 'directory':
+                self.assertTrue(path.is_dir())
+                self.assertFalse(path.is_symlink())
+            elif entry['kind'] == 'link':
+                self.assertEqual(os.readlink(path), entry['target'])
+            else:
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), entry['sha256'])
+        before = manifest.read_bytes(), manifest.stat().st_mtime_ns
+        self.assertFalse(self.apply(self.deployment())['changed'])
+        self.assertEqual((manifest.read_bytes(), manifest.stat().st_mtime_ns), before)
+        bad_config = copy.deepcopy(self.config)
+        bad_config['name'] = 'renamed'
+        bad = self.deployment(bad_config)
+        bad.prepare()
+        (self.root / 'fail-health').write_text(str(bad.build))
+        with self.assertRaisesRegex(DeployError, 'restored'):
+            bad.activate({})
+        # A new instance loads and validates the persisted post-rollback state.
+        self.assertFalse(self.apply(self.deployment())['changed'])
+        self.assertEqual(dep.current.resolve(), dep.build)
+
+    def test_preexisting_units_links_dropins_and_enable_links_are_not_adopted(self):
+        dep = self.deployment()
+        dep.prepare()
+        self.units.mkdir()
+        paths = [self.units / 'connectome-example.service',
+                 self.units / 'connectome-example.service.d/90-connectome-env.conf',
+                 self.units / 'default.target.wants/connectome-example.service',
+                 dep.build / 'connectome-example.service']
+        for path in paths:
+            for kind in ('file', 'link'):
+                with self.subTest(path=path.name, kind=kind):
+                    path.parent.mkdir(exist_ok=True)
+                    if kind == 'file':
+                        path.write_text('not installed by this role')
+                    else:
+                        path.symlink_to(dep.build / 'launch.sh')
+                    before = self.snapshot()
+                    with self.assertRaisesRegex(DeployError, 'unmanaged'):
+                        dep.activate({})
+                    self.assertEqual(self.snapshot(), before)
+                    path.unlink()
+
+    def test_manifest_drift_never_repaired_or_disabled_even_in_check_mode(self):
+        dep = self.deployment()
+        self.apply(dep)
+        paths = [self.units / 'connectome-example.service.d/90-connectome-env.conf',
+                 self.units / 'default.target.wants/connectome-example.service',
+                 dep.build / 'connectome-example.service', dep.current]
+        for path in paths:
+            old_link = os.readlink(path) if path.is_symlink() else None
+            old_content = None if old_link else path.read_bytes()
+            for kind in ('modified', 'missing'):
+                with self.subTest(path=path.name, kind=kind):
+                    path.unlink()
+                    if kind == 'modified':
+                        path.write_text('modified')
+                    before = self.snapshot()
+                    for check in (False, True):
+                        with self.assertRaisesRegex(DeployError, 'ownership mismatch'):
+                            self.deployment(check=check).activate({})
+                        self.assertEqual(self.snapshot(), before)
+                    if path.exists():
+                        path.unlink()
+                    if old_link:
+                        path.symlink_to(old_link)
+                    else:
+                        path.write_bytes(old_content)
+
+    def test_symlinked_unit_and_enable_directories_refused(self):
+        dep = self.deployment()
+        dep.prepare()
+        other = Path(self.tmp.name) / 'other'
+        other.mkdir()
+        self.units.symlink_to(other, target_is_directory=True)
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'symlinked base'):
+            dep.activate({})
+        self.assertEqual(self.snapshot(), before)
+        self.units.unlink()
+        self.units.mkdir()
+        (self.units / 'default.target.wants').symlink_to(other, target_is_directory=True)
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'symlinked artifact parent'):
+            dep.activate({})
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unowned_alias_and_fixed_temporary_name_are_untouched(self):
+        dep = self.deployment()
+        self.apply(dep)
+        alias = self.units / 'external-alias.service'
+        alias.symlink_to(dep.build / 'connectome-example.service')
+        temporary = self.units / 'connectome-example.service.next'
+        temporary.write_text('not our temporary file')
+        config = copy.deepcopy(self.config)
+        config['name'] = 'renamed'
+        self.apply(self.deployment(config))
+        self.assertEqual(os.readlink(alias), str(dep.build / 'connectome-example.service'))
+        self.assertEqual(temporary.read_text(), 'not our temporary file')
+
+    def test_planned_units_digest_and_health_contract(self):
+        dep = self.deployment()
+        dep.prepare()
+        import hashlib
+        source = dep.build / 'example.service'
+        source.write_text('[Service]\nExecStart=/bin/true\n')
+        lockfile = dep.build / 'connectome.lock'
+        data = json.loads(lockfile.read_text())
+        data['units'] = [{'path': 'example.service',
+                          'sha256': hashlib.sha256(source.read_bytes()).hexdigest()}]
+        data['health'] = {'command': [sys.executable, '-c', 'pass']}
+        lockfile.write_text(json.dumps(data))
+        self.assertTrue(dep.activate({})['changed'])
+        installed = dep.build / 'managed-units/example.service'
+        self.assertEqual((self.units / 'example.service').resolve(), installed)
+        self.assertEqual(installed.read_bytes(), source.read_bytes())
+        entries = json.loads(dep.manifest_path.read_text())['entries']
+        self.assertIn({'path': str(installed), 'kind': 'file',
+                       'sha256': hashlib.sha256(source.read_bytes()).hexdigest()}, entries)
+        source.write_text('drift')
+        with self.assertRaisesRegex(DeployError, 'digest'):
+            dep.activate({})
+
+    def test_invalid_parent_files_and_corrupt_manifest_refused_before_mutation(self):
+        dep = self.deployment()
+        dep.prepare()
+        self.units.mkdir()
+        for parent in (self.units / 'connectome-example.service.d',
+                       self.units / 'default.target.wants'):
+            parent.write_text('not a directory')
+            before = self.snapshot()
+            with self.assertRaisesRegex(DeployError, 'non-directory artifact parent'):
+                dep.activate({})
+            self.assertEqual(self.snapshot(), before)
+            parent.unlink()
+        self.apply(dep)
+        original = dep.manifest_path.read_bytes()
+        for content in ('not-json', '[]', '{"version":1,"entries":[{}]}'):
+            dep.manifest_path.write_text(content)
+            before = self.snapshot()
+            for operation in (lambda: dep.activate({}), dep.prepare):
+                with self.assertRaisesRegex(DeployError, 'invalid ownership manifest'):
+                    operation()
+                self.assertEqual(self.snapshot(), before)
+        dep.manifest_path.write_bytes(original)
+
+    def test_prepare_cannot_delete_retained_manifest_owned_unit_files(self):
+        first = self.deployment()
+        self.apply(first)
+        config = copy.deepcopy(self.config)
+        config['name'] = 'renamed'
+        self.apply(self.deployment(config))
+        (first.build / '.prepared').unlink()
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'manifest-owned unit files'):
+            first.prepare()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_planned_install_links_and_unsupported_directives(self):
+        dep = self.deployment()
+        dep.prepare()
+        source = dep.build / 'example.service'
+        body = ('[Service]\nExecStart=/bin/true\n[Install]\n'
+                'WantedBy=unused.target\nWantedBy=\nWantedBy=default.target\n'
+                'RequiredBy=other.target\nAlias=example-alias.service\n')
+        source.write_text(body)
+        lockfile = dep.build / 'connectome.lock'
+        data = json.loads(lockfile.read_text())
+        data['units'] = [{'path': source.name, 'sha256': hashlib.sha256(body.encode()).hexdigest()}]
+        lockfile.write_text(json.dumps(data))
+        dep.activate({})
+        installed = dep.build / 'managed-units/example.service'
+        for relative in ('default.target.wants/example.service',
+                         'other.target.requires/example.service', 'example-alias.service'):
+            self.assertEqual((self.units / relative).resolve(), installed)
+        self.assertFalse((self.units / 'unused.target.wants').exists())
+        source.write_text(body + 'Also=other.service\n')
+        data['units'][0]['sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+        lockfile.write_text(json.dumps(data))
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'unsupported unit Install directive'):
+            dep.activate({})
+        self.assertEqual(self.snapshot(), before)
+
+    def test_optional_health_command_rolls_back(self):
+        first = self.deployment()
+        self.apply(first)
+        bad = copy.deepcopy(self.config)
+        bad['health'] = {'command': [sys.executable, '-c', 'raise SystemExit(1)']}
+        with self.assertRaisesRegex(DeployError, 'restored'):
+            self.apply(self.deployment(bad))
+        self.assertEqual((self.root / 'current').resolve(), first.build)
+
+    def test_failed_first_activation_leaves_no_current_or_units(self):
+        dep = self.deployment()
+        dep.prepare()
+        (self.root / 'fail-health').write_text(str(dep.build))
+        with self.assertRaises(DeployError):
+            dep.activate({})
+        self.assertFalse((self.root / 'current').exists())
+        self.assertFalse((self.units / 'connectome-example.service').exists())
+
+    def test_check_mode_has_no_writes_or_provider_calls(self):
+        dep = self.deployment(check=True)
+        self.assertTrue(dep.prepare()['changed'])
+        self.assertTrue(dep.activate({})['changed'])
+        self.assertFalse(self.root.exists())
+        self.assertFalse(self.units.exists())
+        self.assertEqual(self.provider.requested, [])
+
+    def test_check_mode_existing_is_unchanged(self):
+        self.apply(self.deployment())
+        dep = self.deployment(check=True)
+        self.assertFalse(dep.prepare()['changed'])
+        self.assertFalse(dep.activate({})['changed'])
+
+    def test_enabled_unpinned_connector_fails_closed(self):
+        config = copy.deepcopy(self.config)
+        config['connectors']['terminal-sessions-mcp'] = {
+            'pin_ref': 'connectors.terminal-sessions-mcp'}
+        with self.assertRaisesRegex(DeployError, 'unresolved'):
+            self.deployment(config)
+        self.assertFalse(self.root.exists())
+
+    def test_no_secret_values_in_spec_or_lock(self):
+        self.config['required_secrets'] = ['EXAMPLE_SECRET']
+        dep = self.deployment()
+        self.apply(dep)
+        for name in ('deployment.json', 'connectome.lock', '.prepared'):
+            self.assertNotIn('synthetic-value', (dep.build / name).read_text())
+        with self.assertRaises(DeployError):
+            dep.activate({'EXAMPLE_SECRET': 'test', 'EXTRA': 'test'})
+        with self.assertRaises(DeployError):
+            dep.activate({'EXAMPLE_SECRET': 'line\nbreak'})
+
+    def test_unknown_lock_and_secret_value_records_refused(self):
+        dep = self.deployment()
+        dep.prepare()
+        lockfile = dep.build / 'connectome.lock'
+        data = json.loads(lockfile.read_text())
+        data['version'] = 1
+        lockfile.write_text(json.dumps(data))
+        with self.assertRaises(DeployError):
+            dep.activate({})
+        data['version'] = 2
+        data['requirements'] = [{'name': 'x', 'envName': 'X', 'origin': 'test', 'value': 'bad'}]
+        lockfile.write_text(json.dumps(data))
+        with self.assertRaises(DeployError):
+            dep.activate({})
+
+    def test_artifact_escape_refused(self):
+        dep = self.deployment()
+        dep.prepare()
+        lockfile = dep.build / 'connectome.lock'
+        data = json.loads(lockfile.read_text())
+        data['launch']['script'] = '../escape.sh'
+        lockfile.write_text(json.dumps(data))
+        with self.assertRaisesRegex(DeployError, 'escapes'):
+            dep.activate({})
+
+    def test_rollback_across_runtime_pin_change(self):
+        first = self.deployment()
+        self.apply(first)
+        pins = copy.deepcopy(self.versions)
+        pins['runtime']['connectome-host'] = '1' * 40
+        bad = self.deployment(versions=pins)
+        bad.prepare()
+        (self.root / 'fail-health').write_text(str(bad.build))
+        with self.assertRaisesRegex(DeployError, 'restored'):
+            bad.activate({})
+        self.assertEqual((self.root / 'current').resolve(), first.build)
+
+
+if __name__ == '__main__':
+    unittest.main()

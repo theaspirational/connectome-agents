@@ -1,0 +1,15 @@
+# Candidate upstream metadata; verify offline-unavailable refs before use.
+github-mcpl:
+  repo: https://github.com/anima-research/github-mcpl.git
+  pin_ref: connectors.github-mcpl
+  enabled: true
+  build:
+  - - bun
+    - install
+    - --frozen-lockfile
+  - - bun
+    - run
+    - build
+  settings: {}
+  required_secrets:
+  - GITHUB_TOKEN
