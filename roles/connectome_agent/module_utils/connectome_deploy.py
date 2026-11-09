@@ -30,6 +30,18 @@ class DeployError(SafeError):
     pass
 
 
+class UnitActive(DeployError):
+    """Unit names and scopes have passed the closed input/unit-name schema."""
+    def __init__(self, unit, scope='user', code='E_UNIT_ACTIVE'):
+        super().__init__('unit is active: ' + unit, code)
+        self.unit, self.scope = unit, scope
+
+    def public(self):
+        result = dict(super().public(), unit=self.unit, scope=self.scope)
+        result['msg'] += ' (' + self.scope + ': ' + self.unit + ')'
+        return result
+
+
 class AncestorWritable(DeployError):
     """Only a locally inspected directory path, never tool output, is public."""
     def __init__(self, path):
@@ -203,6 +215,7 @@ class Deployment:
         self.root = inside(self.base, Path(os.path.abspath(Path(root).expanduser())))
         self.unit_dir = base_path(unit_dir)
         self.config = config
+        self.activation = config.get('activation', 'start')
         self.operator_files = operator_files
         self.pins = resolve_pins(config, versions)
         self.cook_command = cook_command
@@ -210,7 +223,11 @@ class Deployment:
         self.check = check
         self.rendered_units = {}
         self.names = secret_names(config)
-        self.spec = {'config': config, 'pins': self.pins}
+        # Runtime activation policy is not cook input or release identity. An
+        # explicit start/empty list must also match legacy request/lock bytes.
+        build_config = {key: value for key, value in config.items()
+                        if key not in ('activation', 'exclusive_with')}
+        self.spec = {'config': build_config, 'pins': self.pins}
         # Deployment request identity differs from cook's emitted build identity.
         self.request_id = hashlib.sha256(canonical({'spec': self.spec, 'cook': cook_command}).encode()).hexdigest()
         self.builds = inside(self.root, 'builds')
@@ -305,6 +322,10 @@ class Deployment:
     def plan(self):
         result = {'state_dir': str(self.state_dir), 'secrets_file': str(self.secrets_file),
                   'budgets': self.config.get('budgets', {})}
+        if self.activation == 'install_only':
+            result['activation'] = self.activation
+        if self.config.get('exclusive_with'):
+            result['exclusive_with'] = self.config['exclusive_with']
         if 'recipe_file' in self.config:
             result['recipe_file'] = dict(self.config['recipe_file'])
         if self.config.get('secret_files'):
@@ -332,6 +353,69 @@ class Deployment:
 
     def lock_path(self):
         return inside(self.root, '.deploy-lock')
+
+    def _exclusive_status(self, refuse=False):
+        result = []
+        for record in self.config.get('exclusive_with', []):
+            command = [arg for arg in self.systemctl if arg not in ('--user', '--system')]
+            try:
+                state = subprocess.run(command + ['--' + record['scope'], 'is-active', record['unit']],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+            except OSError:
+                state = None
+            value = state.stdout.decode('ascii', errors='replace').strip() if state else 'unavailable'
+            if (not state or value not in ('active', 'activating', 'reloading', 'deactivating',
+                                          'inactive', 'failed', 'unknown') or state.returncode not in (0, 3, 4)):
+                if refuse:
+                    raise DeployError('cannot inspect exclusive unit') from None
+                value = 'unavailable'
+            if refuse and value not in ('inactive', 'failed', 'unknown'):
+                raise UnitActive(record['unit'], record['scope'], 'E_UNIT_EXCLUSIVE')
+            result.append(dict(record, state=value))
+        return result
+
+    def _refuse_active(self, names):
+        for name in sorted(names):
+            self._unit_path(name)
+            try:
+                result = subprocess.run(self.systemctl + ['show', '-p', 'ActiveState', '--value', name],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+            except OSError:
+                raise DeployError('cannot inspect unit state') from None
+            if result.returncode:
+                raise DeployError('cannot inspect unit state')
+            if result.stdout.strip() not in (b'inactive', b'failed'):
+                raise UnitActive(name)
+
+    def preflight_activation(self):
+        """Read-only guard, including before Ansible creates root/lock files."""
+        if self.check:
+            return
+        if self.activation == 'start':
+            self._exclusive_status(refuse=True)
+            return
+        names = {'connectome-' + self.config.get('name', 'example') + '.service'}
+        builds = {self.current.resolve()} if self.current.is_symlink() else set()
+        if (self.build / '.prepared').is_file():
+            builds.add(self.build)
+        for build in builds:
+            names.update(self._units(build, self._lock(build)))
+        self._refuse_active(names)
+
+    def _staged(self):
+        path = self.state / 'activation'
+        self._safe_parent(path)
+        if path.is_symlink() or (path.exists() and
+                (not path.is_file() or path.read_text() != 'install_only\n')):
+            raise DeployError('invalid activation bookkeeping')
+        return path.exists()
+
+    def _status(self, result):
+        if self.activation == 'install_only' and not self.check:
+            result.update(activation='install_only', unit_state='inactive')
+            if self.config.get('exclusive_with'):
+                result['exclusive_with'] = self._exclusive_status()
+        return result
 
     def _lock(self, build=None):
         build = build or self.build
@@ -388,6 +472,7 @@ class Deployment:
 
     def prepare(self):
         self.validate_paths()
+        self.preflight_activation()
         self._check_secrets_file()
         self._load_ownership()
         self._check_build_ownership()
@@ -510,6 +595,19 @@ class Deployment:
             raise DeployError('required unit environment file not accepted', 'E_ENVIRONMENT_FILE')
 
     def _health(self, units, lock, build):
+        if self.activation == 'install_only':
+            self._lock(build)
+            if not self.current.is_symlink() or self.current.resolve() != build:
+                raise DeployError('current does not point at installed release')
+            for name in units:
+                if not self._unit_path(name).is_file():
+                    raise DeployError('installed unit file missing')
+                self._check_environment_file(name, build)
+            self._refuse_active(units)
+            analyze = shutil.which('systemd-analyze')
+            if analyze and units:
+                run([analyze, '--user', 'verify'] + [str(self._unit_path(name)) for name in units])
+            return
         for name in units:
             run(self.systemctl + ['is-active', '--quiet', name])
             if secret_names(self._config(build)):
@@ -716,7 +814,8 @@ class Deployment:
     def _artifacts(self, units, build):
         result = {}
         for name, source in units.items():
-            additions = self._enable_links(name, source)
+            enable_links = self._enable_links(name, source)
+            additions = enable_links if self.activation == 'start' else {}
             if source in self.rendered_units:
                 body = self.rendered_units[source]
                 additions[source] = (self._file_record(body), body)
@@ -741,13 +840,16 @@ class Deployment:
                 raise DeployError('refusing unmanaged artifact; no matching ownership manifest entry')
 
     def _install(self, units, old_units, build):
+        if self.activation == 'start':
+            self._exclusive_status(refuse=True)
         artifacts = self._artifacts(units, build)
         self._preflight(artifacts)
         for name in old_units.keys() - units.keys():
             if self._unit_path(name) in self.owned:
                 # Disable by deleting only our recorded enable links below;
                 # systemctl disable may delete additional, unowned aliases.
-                run(self.systemctl + ['stop', name])
+                if self.activation == 'start':
+                    run(self.systemctl + ['stop', name])
         # Remove only exact manifest-owned unit-dir artifacts, including enable
         # links. Generated unit files in old builds remain tracked and retained.
         for path in list(self.owned):
@@ -760,8 +862,10 @@ class Deployment:
         for path, (record, content) in artifacts.items():
             self._put(path, record, content)
         run(self.systemctl + ['daemon-reload'])
-        for name in units:
-            run(self.systemctl + ['restart', name])
+        if self.activation == 'start':
+            self._exclusive_status(refuse=True)
+            for name in units:
+                run(self.systemctl + ['restart', name])
 
     def _activation_plan(self):
         lock = self._lock()
@@ -769,6 +873,8 @@ class Deployment:
         previous = self.current.resolve() if self.current.is_symlink() else None
         previous_lock = self._lock(previous) if previous else None
         previous_units = self._units(previous, previous_lock) if previous else {}
+        if self.activation == 'install_only' and not self.check:
+            self._refuse_active(units.keys() | previous_units.keys())
         artifacts = self._artifacts(units, self.build)
         # Include current and generated units before env/pointer/service changes.
         self._preflight(artifacts | {
@@ -777,6 +883,7 @@ class Deployment:
 
     def activate(self, secrets=None):
         self.validate_paths()
+        self.preflight_activation()
         self._check_secrets_file()
         if secrets is None:
             secrets = {} if self.check else self._read_secrets()
@@ -808,14 +915,16 @@ class Deployment:
         same_units = all(path in self.owned and self.owned[path] == record and self._matches(path, record)
                          for path, (record, _) in artifacts.items())
         retired = any(path.is_relative_to(self.unit_dir) and path not in artifacts for path in self.owned)
+        same_activation = self._staged() == (self.activation == 'install_only')
         if self.check:
-            return {'changed': previous != self.build or not same_units or retired}
+            return {'changed': previous != self.build or not same_units or retired or not same_activation}
         self._ensure_state()
-        if previous == self.build and same_env and same_units and not retired and file_values == file_snapshot:
+        if (previous == self.build and same_env and same_units and not retired and
+                file_values == file_snapshot and same_activation):
             if file_names:
                 self._set_secret_files(file_values, file_names)
             self._health(units, lock, self.build)
-            return {'changed': False}
+            return self._status({'changed': False})
         old_env = env_path.read_text() if env_path.exists() else None
         atomic_write(env_path, env)
         try:
@@ -824,6 +933,10 @@ class Deployment:
             self._put(self.current, self._link_record(self.build))
             self._install(units, previous_units, self.build)
             self._health(units, lock, self.build)
+            if self.activation == 'install_only':
+                atomic_write(self.state / 'activation', 'install_only\n')
+            else:
+                (self.state / 'activation').unlink(missing_ok=True)
         except Exception as error:
             try:
                 if file_names:
@@ -841,4 +954,4 @@ class Deployment:
                 raise DeployError('activation failed; rollback recovery also failed') from None
             raise DeployError('activation failed; previous deployment restored',
                               error.code if isinstance(error, DeployError) else 'E_DEPLOY_FAILED') from None
-        return {'changed': True, 'build_dir': str(self.build), 'build_id': lock['build']['id']}
+        return self._status({'changed': True, 'build_dir': str(self.build), 'build_id': lock['build']['id']})

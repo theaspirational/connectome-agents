@@ -14,6 +14,22 @@ def need(condition, message='invalid operator input'):
 
 
 def validate(config):
+    need(isinstance(config.get('activation', 'start'), str) and
+         config.get('activation', 'start') in ('start', 'install_only'),
+         'activation must be start or install_only')
+    exclusive = config.get('exclusive_with', [])
+    need(isinstance(exclusive, list), 'exclusive_with must be a list')
+    seen = set()
+    for record in exclusive:
+        need(isinstance(record, dict) and set(record) == {'scope', 'unit'},
+             'closed exclusive_with record required')
+        need(isinstance(record['scope'], str) and record['scope'] in ('system', 'user') and
+             isinstance(record['unit'], str) and
+             re.fullmatch(r'[A-Za-z0-9_@.-]+\.service', record['unit']) and
+             not record['unit'].startswith(('.', '-')), 'invalid exclusive unit')
+        key = (record['scope'], record['unit'])
+        need(key not in seen, 'duplicate exclusive unit')
+        seen.add(key)
     if 'recipe_file' in config:
         record = config['recipe_file']
         need(isinstance(record, dict) and set(record) == {'path', 'sha256'}, 'closed recipe_file record required')

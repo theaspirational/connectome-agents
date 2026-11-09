@@ -31,6 +31,7 @@ def main():
             result = execute()
         else:
             deployment.validate_paths()
+            deployment.preflight_activation()
             make_directory(deployment.root)
             # Serialize mutations of this agent's user units and current pointer.
             with open(deployment.lock_path(), 'a') as stream:

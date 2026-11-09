@@ -140,6 +140,65 @@ that adapter validation or runtime health will succeed.
 
 ## Operations
 
+### Activation and migration staging
+
+Two optional **per-agent** policy fields are closed schemas:
+
+```yaml
+activation: install_only  # start (default) | install_only
+exclusive_with:           # default: []; exactly scope + unit per entry
+  - scope: system         # system | user
+    unit: old.service     # literal NAME.service, no paths or patterns
+```
+
+Omitted fields and explicit `activation: start` / `exclusive_with: []` preserve
+the existing render, adapter argv, lock bytes and role task sequence. Policy is
+excluded from cook input and the release request identity. Changing only policy
+does not rebuild: a manifest-owned, matching `.prepared` request and validated
+lock are reused (including verification of installed operator recipe bytes).
+
+`install_only` builds/verifies the release, renders and installs unit files and
+their environment drop-ins, writes `secrets.env` and declared secret files, and
+atomically switches `current`. It installs the unit-name link, **not** `[Install]`
+enablement/alias/target links. It never calls enable, start, restart, stop or
+disable, including on failure rollback. Previously owned enablement links are
+removed only after the associated units have passed the inactivity guard.
+Before any deployment mutation (including the Ansible root/serialization lock),
+the target and any previous units must be inactive; active or transitioning
+units produce typed `E_UNIT_ACTIVE` with `unit` and `scope`. A renamed agent
+cannot silently retire a running previous unit. Inspection failure fails closed.
+
+Static health checks validate the installed lock, `current` target, unit-file
+presence, and the manager's exact required `EnvironmentFiles` path via
+`systemctl --user show`, after daemon-reload. When `systemd-analyze` is installed,
+`systemd-analyze --user verify` must pass. Runtime health commands are **not** run.
+The activation result reports `activation: install_only`, `unit_state: inactive`,
+and each configured `exclusive_with` record with its observed `state`.
+The check plan identifies the activation policy but does not query systemd or
+promise runtime health. A user manager is still required for real staging.
+
+`exclusive_with` applies only to starting, not staging. Start checks each listed
+unit with `systemctl --system is-active NAME.service` or
+`systemctl --user is-active NAME.service`; reading system scope needs no privilege.
+An active or activating unit produces typed `E_UNIT_EXCLUSIVE`, naming its
+validated `unit` and `scope`, before enabling/starting. Inactive/failed/unknown
+units permit start; transitions such as reloading/deactivating are refused
+conservatively. In install-only mode these units are reported, even if active,
+and never cause a conflict refusal. Unavailable/malformed inspection is reported
+as `unavailable` during staging, but is an error rather than permission to start.
+No listed unit is stopped by this policy.
+
+For a migration, stage with `install_only` while the old **different** system
+unit runs. Stop that old unit explicitly, then apply the same private inputs
+with `activation: start`: the role reuses the installed release, installs its
+owned enablement links and starts it using the existing restart operation.
+`ROOT/state/activation` records a successful staging, so promotion also works
+for units without an `[Install]` section. This is deployment bookkeeping, not
+runtime state or a cook-lock format change. Keep activation policy consistent
+across the role's prepare/activate tasks. As with the existing threat model,
+do not race external unit starts or other same-user writers against deployment;
+the per-agent lock serializes role operations, not external systemd clients.
+
 The adapter receives stable state storage outside all builds. Keep old builds
 until the deployment succeeds; garbage collection is intentionally manual.
 No database migration or state rollback is attempted. Rollback restores the
@@ -156,6 +215,10 @@ retained manifest-owned build; prepare reuses its validated `.prepared` marker,
 and activation restores its units/current pointer, restarts and health-checks it.
 There is no cook rebuild, state copy, migration or data rollback. Current secret
 values are resolved normally, so this is code/config rollback, not secret rollback.
+Select `activation: install_only` to roll back the pointer, units and environment
+without starting anything; all affected units must first be inactive. Failure
+recovery in install-only mode follows the same no-start rule and uses static
+health checks for the restored release.
 Keep the previous private inputs and build; an unknown/unowned/modified build is
 still refused. If the old build/marker is missing, check predicts a new build:
 stop rather than claim this is rollback. A new build-ID selector is not provided.

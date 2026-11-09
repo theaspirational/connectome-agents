@@ -317,6 +317,8 @@ explanation. CLI argument errors also use a fixed envelope without echoing argv.
 | `E_ANCESTOR_WRITABLE` | Existing group/other-writable ancestor; the deployment result names `ancestor_path`. No chmod or writes occur. |
 | `E_SYSTEMD_PATH` | Use literal absolute paths without whitespace, specifiers, globs or escapes. |
 | `E_ENVIRONMENT_FILE` | Manager did not accept the required non-optional environment file. |
+| `E_UNIT_ACTIVE` | Install-only would replace an active/transitioning unit; names `unit` and `scope`. Stop it explicitly first. |
+| `E_UNIT_EXCLUSIVE` | Start conflicts with a listed unit; names `unit` and `scope`. Stop the old instance explicitly first. |
 | `E_SECRETS_MODE` | Require owned directory 0700/file 0600 without symlinks; never repaired automatically. |
 | `E_BUDGETS_UNSUPPORTED` | Remove nonempty budgets explicitly; no enforcement is implied. |
 | `E_COOK_FAILED` | Child command failed; raw output remains redacted. |

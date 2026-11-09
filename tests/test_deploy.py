@@ -82,6 +82,287 @@ class DeployTests(unittest.TestCase):
                 p.read_bytes() if p.is_file() else None)
                 for p in [path, *path.rglob('*')]}
 
+    def lifecycle_calls(self):
+        paths = [self.root / 'systemctl-calls', Path(self.tmp.name) / 'preflight-systemctl-calls']
+        return [json.loads(line) for path in paths if path.exists()
+                for line in path.read_text().splitlines()]
+
+    def track_units(self, states=None):
+        (Path(self.tmp.name) / 'track-unit-state').touch()
+        (Path(self.tmp.name) / 'unit-states.json').write_text(json.dumps(states or {}))
+
+    def assert_no_activation(self):
+        self.assertFalse(any(call[0] in ('enable', 'start', 'restart', 'stop', 'disable')
+                             for call in self.lifecycle_calls()), self.lifecycle_calls())
+        self.assertFalse((self.units / 'default.target.wants').exists())
+
+    def test_install_only_static_health_and_status(self):
+        self.track_units()
+        self.config.update(activation='install_only', required_secrets=['EXAMPLE_SECRET'],
+                           health={'command': ['/not/a/runtime-health-command']},
+                           secret_files=[{'secret': 'EXAMPLE_SECRET', 'env': 'TOKEN_FILE'}])
+        # Direct and file delivery deliberately use distinct environment names.
+        dep = self.deployment()
+        result = self.apply(dep)
+        self.assertEqual(result['activation'], 'install_only')
+        self.assertEqual(result['unit_state'], 'inactive')
+        self.assertEqual(dep.current.resolve(), dep.build)
+        self.assertTrue((self.units / 'connectome-example.service').is_file())
+        self.assertIn('EXAMPLE_SECRET="synthetic-value"', (dep.build / 'secrets.env').read_text())
+        self.assertEqual((dep.state / 'secret-files/TOKEN_FILE').read_text(), 'synthetic-value')
+        self.assert_no_activation()
+        self.assertTrue(any(call[:4] == ['show', '-p', 'EnvironmentFiles', '--value']
+                            for call in self.lifecycle_calls()))
+        self.assertFalse(self.apply(self.deployment())['changed'])
+        self.assert_no_activation()
+        self.assertEqual(dep.plan()['activation'], 'install_only')
+
+    def test_install_only_then_start_reuses_release_and_lock(self):
+        self.track_units()
+        self.config['activation'] = 'install_only'
+        staged = self.deployment()
+        self.apply(staged)
+        lock = (staged.build / 'connectome.lock').read_bytes()
+        cook_calls = (self.root / 'cook-calls').read_bytes()
+        config = dict(self.config, activation='start')
+        start = self.deployment(config)
+        self.assertEqual(start.build, staged.build)
+        self.assertFalse(start.prepare()['changed'])
+        self.assertTrue(start.activate({})['changed'])
+        self.assertEqual((start.build / 'connectome.lock').read_bytes(), lock)
+        self.assertEqual((self.root / 'cook-calls').read_bytes(), cook_calls)
+        self.assertTrue((self.units / 'default.target.wants/connectome-example.service').is_symlink())
+        self.assertIn(['restart', 'connectome-example.service'], self.lifecycle_calls())
+        self.assertFalse(self.apply(self.deployment(config))['changed'])
+
+    def test_install_only_then_start_without_install_section(self):
+        self.track_units()
+        self.config['activation'] = 'install_only'
+        dep = self.deployment()
+        dep.prepare()
+        source = dep.build / 'other.service'
+        source.write_text('[Service]\nExecStart=/bin/true\n')
+        lock = dep.build / 'connectome.lock'
+        data = json.loads(lock.read_text())
+        data['units'] = [{'path': source.name, 'sha256': hashlib.sha256(source.read_bytes()).hexdigest()}]
+        lock.write_text(json.dumps(data))
+        dep.activate({})
+        started = self.deployment(dict(self.config, activation='start'))
+        self.assertFalse(started.prepare()['changed'])
+        self.assertTrue(started.activate({})['changed'])
+        self.assertIn(['restart', 'other.service'], self.lifecycle_calls())
+        self.assertEqual(len((self.root / 'cook-calls').read_text().splitlines()), 1)
+
+    def test_install_only_active_refused_before_any_changes(self):
+        self.config['activation'] = 'install_only'
+        dep = self.deployment()
+        for state in (b'active', b'activating', b'reloading', b'deactivating'):
+            before = self.snapshot()
+            with patch('connectome_deploy.subprocess.run', return_value=SimpleNamespace(
+                    returncode=0, stdout=state)):
+                for operation in (dep.preflight_activation, dep.prepare, lambda: dep.activate({})):
+                    with self.assertRaises(DeployError) as error:
+                        operation()
+                    self.assertEqual(error.exception.public()['error_code'], 'E_UNIT_ACTIVE')
+                    self.assertEqual(error.exception.public()['unit'], 'connectome-example.service')
+            self.assertEqual(self.snapshot(), before)
+        # Also protect a previous differently named unit before building its replacement.
+        self.apply(self.deployment(dict(self.config, activation='start')))
+        self.track_units({'user:connectome-example.service': 'active'})
+        renamed = self.deployment(dict(self.config, name='renamed'))
+        with self.assertRaises(DeployError) as error:
+            renamed.prepare()
+        self.assertEqual(error.exception.code, 'E_UNIT_ACTIVE')
+        self.assertFalse(renamed.build.exists())
+
+    def test_install_only_refuses_late_activation_before_env_or_pointer_changes(self):
+        self.config['activation'] = 'install_only'
+        dep = self.deployment()
+        dep.prepare()
+        self.track_units({'user:connectome-example.service': 'active'})
+        with self.assertRaises(DeployError) as error:
+            dep.activate({})
+        self.assertEqual(error.exception.code, 'E_UNIT_ACTIVE')
+        self.assertFalse(dep.current.exists())
+        self.assertFalse((dep.build / 'secrets.env').exists())
+        self.assert_no_activation()
+
+    def test_install_only_rollback_and_operator_rollback_never_start(self):
+        self.track_units()
+        (Path(self.tmp.name) / 'forbid-unit-activation').touch()
+        self.config['activation'] = 'install_only'
+        first = self.deployment()
+        self.apply(first)
+        second = self.deployment(dict(self.config, name='renamed'))
+        second.prepare()
+        (self.root / 'reject-env').write_text(str(second.build))
+        with self.assertRaises(DeployError) as error:
+            second.activate({})
+        self.assertEqual(error.exception.code, 'E_ENVIRONMENT_FILE')
+        self.assertEqual(first.current.resolve(), first.build)
+        self.assert_no_activation()
+        (self.root / 'reject-env').unlink()
+        self.apply(second)
+        before = (self.root / 'cook-calls').read_bytes()
+        self.apply(self.deployment())  # Re-select exact first request.
+        self.assertEqual(first.current.resolve(), first.build)
+        self.assertEqual((self.root / 'cook-calls').read_bytes(), before)
+        self.assert_no_activation()
+
+    def test_install_only_first_failure_never_starts(self):
+        self.track_units()
+        (Path(self.tmp.name) / 'forbid-unit-activation').touch()
+        self.config['activation'] = 'install_only'
+        dep = self.deployment()
+        dep.prepare()
+        (self.root / 'reject-env').write_text(str(dep.build))
+        with self.assertRaises(DeployError):
+            dep.activate({})
+        self.assertFalse(dep.current.exists())
+        self.assertFalse((self.units / 'connectome-example.service').exists())
+        self.assert_no_activation()
+
+    def test_install_only_runs_static_verify_when_available(self):
+        self.track_units()
+        self.config['activation'] = 'install_only'
+        import connectome_deploy
+        original = connectome_deploy.run
+        def verify(argv, **kwargs):
+            if argv[0] == '/test/systemd-analyze':
+                self.assertEqual(argv[1:3], ['--user', 'verify'])
+                self.assertTrue(Path(argv[3]).is_file())
+                return
+            return original(argv, **kwargs)
+        with patch('connectome_deploy.shutil.which', return_value='/test/systemd-analyze'), \
+                patch('connectome_deploy.run', side_effect=verify) as calls:
+            self.apply(self.deployment())
+        self.assertTrue(any(call.args[0][0] == '/test/systemd-analyze' for call in calls.call_args_list))
+        # Verification failure restores the previous pointer without runtime health.
+        bad = self.deployment(dict(self.config, description='bad-verify'))
+        bad.prepare()
+        first = bad.current.resolve()
+        def reject(argv, **kwargs):
+            if argv[0] == '/test/systemd-analyze' and bad.current.resolve() == bad.build:
+                raise DeployError('static verify failed')
+            return verify(argv, **kwargs)
+        with patch('connectome_deploy.shutil.which', return_value='/test/systemd-analyze'), \
+                patch('connectome_deploy.run', side_effect=reject), self.assertRaises(DeployError):
+            bad.activate({})
+        self.assertEqual(bad.current.resolve(), first)
+        self.assert_no_activation()
+        with patch('connectome_deploy.shutil.which', return_value=None):
+            self.assertFalse(self.apply(self.deployment())['changed'])
+
+    def test_exclusive_units_refuse_start_in_both_scopes(self):
+        for scope in ('system', 'user'):
+            for state in ('active', 'activating'):
+                with self.subTest(scope=scope, state=state):
+                    self.track_units({scope + ':old.service': state})
+                    config = dict(self.config, exclusive_with=[{'scope': scope, 'unit': 'old.service'}])
+                    dep = self.deployment(config)
+                    with self.assertRaises(DeployError) as error:
+                        self.apply(dep)
+                    public = error.exception.public()
+                    self.assertEqual(public['error_code'], 'E_UNIT_EXCLUSIVE')
+                    self.assertEqual(public['unit'], 'old.service')
+                    self.assertEqual(public['scope'], scope)
+                    self.assertIn('old.service', public['msg'])
+                    self.assertIn(['--' + scope, 'is-active', 'old.service'], self.lifecycle_calls())
+                    self.assertFalse(dep.build.exists())
+                    self.assert_no_activation()
+        self.track_units({'system:old.service': 'inactive'})
+        self.assertTrue(self.apply(self.deployment(config))['changed'])
+
+    def test_exclusive_units_report_only_during_staging(self):
+        self.track_units({'system:old.service': 'active', 'user:old.service': 'activating'})
+        entries = [{'scope': scope, 'unit': 'old.service'} for scope in ('system', 'user')]
+        self.config.update(activation='install_only', exclusive_with=entries)
+        result = self.apply(self.deployment())
+        self.assertEqual(result['exclusive_with'], [dict(entries[0], state='active'),
+                                                  dict(entries[1], state='activating')])
+        self.assertEqual(result['unit_state'], 'inactive')
+        self.assert_no_activation()
+        self.track_units({'system:old.service': 'inactive', 'user:old.service': 'inactive'})
+        result = self.apply(self.deployment())
+        self.assertEqual([entry['state'] for entry in result['exclusive_with']], ['inactive', 'inactive'])
+        start = self.deployment(dict(self.config, activation='start'))
+        self.assertTrue(self.apply(start)['changed'])
+        self.assertEqual(len((self.root / 'cook-calls').read_text().splitlines()), 1)
+
+    def test_closed_activation_and_exclusive_schema(self):
+        for field, values in (
+                ('activation', [None, False, [], {}, 'restart', 'install-only']),
+                ('exclusive_with', [None, {}, ['old.service'], [{'scope': 'global', 'unit': 'old.service'}],
+                    [{'scope': 'system', 'unit': '../old.service'}], [{'scope': 'user', 'unit': '-old.service'}],
+                    [{'scope': 'user', 'unit': 'old.timer'}], [{'scope': 'user', 'unit': 'old.service', 'extra': True}],
+                    [{'scope': 'user', 'unit': 'old.service'}] * 2])):
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaises(DeployError):
+                    self.deployment(dict(self.config, **{field: value}))
+        self.assertFalse(self.root.exists())
+
+    def test_install_only_check_never_queries_or_writes(self):
+        self.config.update(activation='install_only', exclusive_with=[{'scope': 'system', 'unit': 'old.service'}])
+        dep = self.deployment(check=True)
+        before = self.snapshot()
+        with patch('connectome_deploy.subprocess.run') as run:
+            self.assertTrue(dep.prepare()['changed'])
+            self.assertTrue(dep.activate({})['changed'])
+        run.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_module_active_guard_precedes_root_and_serialization_lock(self):
+        self.config['activation'] = 'install_only'
+        module = Mock(params=dict(operation='prepare', root=str(self.root), unit_dir=str(self.units),
+                                  config=self.config, versions=self.versions, cook_command=self.cook,
+                                  systemctl=self.systemctl, secrets={}), check_mode=False)
+        module.fail_json.side_effect = DeployError('boundary rejected')
+        modules = {
+            'ansible.module_utils.basic': SimpleNamespace(AnsibleModule=Mock(return_value=module)),
+            'ansible.module_utils.connectome_deploy': sys.modules['connectome_deploy'],
+            'ansible.module_utils.connectome_errors': sys.modules['connectome_errors'],
+        }
+        spec = importlib.util.spec_from_file_location(
+            'active_boundary', ROOT / 'roles/connectome_agent/library/connectome_release.py')
+        boundary = importlib.util.module_from_spec(spec)
+        before = self.snapshot()
+        with patch.dict(sys.modules, modules):
+            spec.loader.exec_module(boundary)
+            with patch('connectome_deploy.subprocess.run', return_value=SimpleNamespace(
+                    returncode=0, stdout=b'active')), self.assertRaisesRegex(DeployError, 'boundary rejected'):
+                boundary.main()
+        self.assertEqual(module.fail_json.call_args.kwargs['error_code'], 'E_UNIT_ACTIVE')
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(self.root.exists())
+
+    def test_exclusive_refusal_rechecked_before_activation(self):
+        self.track_units()
+        self.config['exclusive_with'] = [{'scope': 'system', 'unit': 'old.service'}]
+        dep = self.deployment()
+        dep.prepare()
+        self.track_units({'system:old.service': 'activating'})
+        with self.assertRaises(DeployError) as error:
+            dep.activate({})
+        self.assertEqual(error.exception.public()['unit'], 'old.service')
+        self.assertEqual(error.exception.code, 'E_UNIT_EXCLUSIVE')
+        self.assertFalse(dep.current.exists())
+        self.assertFalse((dep.build / 'secrets.env').exists())
+        self.assert_no_activation()
+
+    def test_exclusive_inspection_failure_is_informational_only_when_staging(self):
+        self.config.update(activation='install_only', exclusive_with=[{'scope': 'system', 'unit': 'old.service'}])
+        dep = self.deployment()
+        for result in (SimpleNamespace(returncode=1, stdout=b''),
+                       SimpleNamespace(returncode=0, stdout=b'not-a-state')):
+            with patch('connectome_deploy.subprocess.run', return_value=result):
+                self.assertEqual(dep._exclusive_status()[0]['state'], 'unavailable')
+                with self.assertRaises(DeployError):
+                    dep._exclusive_status(refuse=True)
+        with patch('connectome_deploy.subprocess.run', side_effect=OSError):
+            self.assertEqual(dep._exclusive_status()[0]['state'], 'unavailable')
+            with self.assertRaises(DeployError):
+                dep._exclusive_status(refuse=True)
+
     def test_rendered_systemd_paths_are_bare_literals(self):
         dep = self.deployment()
         self.apply(dep)

@@ -861,6 +861,9 @@ class RealCookTests(unittest.TestCase):
     def test_real_cook_offline_operator_recipe_and_secret_files(self):
         self.real_build(registry=False, operator_inputs=True)
 
+    def test_real_cook_offline_install_only_then_start_reuses_release(self):
+        self.real_build(registry=False, operator_inputs=True, staging=True)
+
     def test_real_cook_offline_local_host_build(self):
         self.real_build(registry=False)
 
@@ -883,7 +886,7 @@ class RealCookTests(unittest.TestCase):
         self.real_build(registry=False, two_dependencies=True, trusted=True)
 
     def real_build(self, registry, with_secrets=True, two_dependencies=False, generic_only=False,
-                   trusted=False, registry_input=False, operator_inputs=False):
+                   trusted=False, registry_input=False, operator_inputs=False, staging=False):
         """No fake runtimes/Git/dependency tools, downloads, or network recipes."""
         required = ('CONNECTOME_TEST_COOK_SOURCE', 'CONNECTOME_TEST_BUN', 'CONNECTOME_TEST_COOK_DEPS')
         missing_env = [name for name in required if not os.environ.get(name)]
@@ -958,7 +961,7 @@ class RealCookTests(unittest.TestCase):
                 'archive': artifact['path'], 'sha256': artifact['sha256'], 'version': '1.0.0',
                 'kind': 'git_commit', 'commit': framework_pin})
         if operator_inputs:
-            self.operator_lifecycle(spec, checkout, bun, node)
+            self.operator_lifecycle(spec, checkout, bun, node, staging=staging)
             return
         spec_path = self.build / 'deployment.json'; spec_path.write_text(json.dumps(spec))
         # All acquisition is file-local. An empty private HOME prevents reuse
@@ -1052,7 +1055,7 @@ class RealCookTests(unittest.TestCase):
             # Old gitHead-only builds did not have this role-owned sidecar.
             self.assertEqual(deployment._lock(self.build)['build'], record['build'])
 
-    def operator_lifecycle(self, spec, checkout, bun, node):
+    def operator_lifecycle(self, spec, checkout, bun, node, staging=False):
         from connectome_inputs import collect
         config = spec['config']
         config.pop('agent')
@@ -1079,10 +1082,37 @@ class RealCookTests(unittest.TestCase):
                 '--spec', '{recipe}', '--out', '{build_dir}', '--state', '{state_dir}']
         root = self.build.parent.parent
         systemctl = [sys.executable, str(ROOT / 'tests/fixtures/systemctl.py'), str(root)]
+        if staging:
+            config['activation'] = 'install_only'
+            (root.parent / 'track-unit-state').touch()
+            (root.parent / 'forbid-unit-activation').touch()
         with patch.dict(os.environ, {'HOME': str(home), 'GIT_ALLOW_PROTOCOL': 'file'}):
             first = Deployment(root, self.work / 'units', config, {'runtime': spec['pins']['runtime']},
                                cook, systemctl, operator_files=collect(config))
             prepared = first.prepare()
+            if staging:
+                result = first.activate()
+                self.assertEqual(result['activation'], 'install_only')
+                self.assertEqual(result['unit_state'], 'inactive')
+                self.assertFalse((first.state_dir / 'file-seen').exists())
+                self.assertFalse((first.unit_dir / 'default.target.wants').exists())
+                calls = [json.loads(line) for line in (root / 'systemctl-calls').read_text().splitlines()]
+                self.assertFalse(any(call[0] in ('enable', 'start', 'restart', 'stop') for call in calls))
+                recorded = {name: ((first.build / name).read_bytes(), (first.build / name).stat().st_mtime_ns)
+                            for name in ('.prepared', 'deployment.json', 'connectome.lock')}
+                config['activation'] = 'start'
+                promoted = Deployment(root, self.work / 'units', config, {'runtime': spec['pins']['runtime']},
+                                      cook, systemctl, operator_files=collect(config))
+                self.assertEqual(promoted.build, first.build)
+                self.assertFalse(promoted.prepare()['changed'])
+                (root.parent / 'forbid-unit-activation').unlink()
+                self.assertTrue(promoted.activate()['changed'])
+                self.assertTrue((promoted.unit_dir / 'default.target.wants/connectome-example.service').is_symlink())
+                self.assertEqual((promoted.state_dir / 'file-seen').read_text(), 'ok')
+                for name, before in recorded.items():
+                    self.assertEqual(((promoted.build / name).read_bytes(),
+                                      (promoted.build / name).stat().st_mtime_ns), before)
+                return
             first.activate()
             self.assertEqual((first.state_dir / 'file-seen').read_text(), 'ok')
             self.assertEqual((first.build / 'cook-recipe.json').read_bytes(), content)

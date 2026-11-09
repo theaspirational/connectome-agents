@@ -12,7 +12,7 @@ import test_deploy
 import test_cook
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE = '06af58c'
+BASELINE = '64d0e3a'
 
 # Both processes use identical paths, inputs, fixtures and environment. Only the
 # module source changes. Capture the real adapter argv before its child runs.
@@ -25,6 +25,8 @@ import connectome_cook as adapter
 import connectome_deploy as deploy
 work = Path(sys.argv[1])
 config = json.loads((work / 'config.json').read_text())
+if len(sys.argv) > 2:
+    config.update(activation='start', exclusive_with=[])
 versions = json.loads((work / 'versions.json').read_text())
 cook = json.loads((work / 'cook.json').read_text())
 manager = json.loads((work / 'manager.json').read_text())
@@ -94,9 +96,15 @@ class CompatibilityTests(unittest.TestCase):
                                 ('manager', manager), ('adapter-spec', spec)]:
                 (work / (name + '.json')).write_text(json.dumps(value))
             snapshots = []
-            for modules in (baseline, ROOT / 'roles/connectome_agent/module_utils'):
+            for modules, explicit in ((baseline, False), (ROOT / 'roles/connectome_agent/module_utils', False),
+                                      (ROOT / 'roles/connectome_agent/module_utils', True)):
                 env = dict(os.environ, PYTHONPATH=str(modules))
-                snapshots.append(subprocess.check_output([sys.executable, '-c', DRIVER, str(work)], env=env, cwd=ROOT))
+                snapshots.append(subprocess.check_output([sys.executable, '-c', DRIVER, str(work)] +
+                                 (['explicit'] if explicit else []), env=env, cwd=ROOT))
                 for name in ('agent', 'units', 'runtime-state', 'adapter'):
                     shutil.rmtree(work / name)
             self.assertEqual(snapshots[0], snapshots[1])
+            self.assertEqual(snapshots[0], snapshots[2])
+            self.assertEqual((ROOT / 'roles/connectome_agent/tasks/main.yml').read_bytes(),
+                             subprocess.check_output(['git', 'show', BASELINE +
+                                 ':roles/connectome_agent/tasks/main.yml'], cwd=ROOT))

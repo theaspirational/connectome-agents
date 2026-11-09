@@ -65,6 +65,11 @@ must be trusted. There is no fd/openat race-hardening claim. See the
 4. Run the private playbook as the service account, not as a privileged account.
    Its user service manager must be available (session/lingering is an operator
    prerequisite). Each agent needs its own root and unique unit names.
+   Optional agent-level `activation: install_only` stages an inactive release
+   without enabling or starting it; `activation: start` (default) promotes it
+   without rebuilding. Use `exclusive_with: [{scope: system, unit: old.service}]`
+   to prevent start while a migration's old instance is running. See
+   [activation and migration staging](docs/layering.md#activation-and-migration-staging).
    `connectome_root` must resolve within `connectome_base` (default: the account's
    `.local/share/connectome`). Override both when relocating deployments. Bases
    and their ancestors must not be symlinks. Existing ancestors of root,
