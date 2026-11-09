@@ -63,16 +63,17 @@ def repository(value):
             # Accessing port also rejects malformed/non-numeric port syntax.
             port = url.port
             return bool(url.hostname and url.path and url.password is None
+                        and (url.scheme != 'ssh' or not unquote(url.hostname).startswith('-'))
                         and (port is None or 0 < port <= 65535)
                         and (url.username is None or (url.scheme == 'ssh' and re.fullmatch(
-                            r'[A-Za-z0-9._-]+', unquote(url.username)))))
+                            r'[A-Za-z0-9._][A-Za-z0-9._-]*', unquote(url.username)))))
     except ValueError:
         return False
     # scp syntax has no URI scheme. Refuse known transport/helper prefixes
     # rather than reinterpreting a disallowed URI as an scp hostname.
     if re.match(r'(?:https?|ssh|git|file|ftp|ext):', decoded, re.I):
         return False
-    return re.fullmatch(r'(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*:(?!:).+', decoded) is not None and '://' not in decoded
+    return re.fullmatch(r'(?:[A-Za-z0-9._][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*:(?!:).+', decoded) is not None and '://' not in decoded
 
 
 def names_only(value):

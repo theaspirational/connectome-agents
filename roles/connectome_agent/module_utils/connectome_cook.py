@@ -30,9 +30,16 @@ def need(condition, message):
         raise AdapterError(message)
 
 
-def command(argv, cwd=None, env=None, capture=False):
-    need(isinstance(argv, list) and argv and all(text(arg) and not credential_shaped(arg) for arg in argv),
+def validate_arguments(argv, flag_indices=()):
+    # Only trusted flag positions are exempt; a value equal to a flag is not.
+    need(isinstance(argv, list) and argv and all(
+        text(arg) and not credential_shaped(arg) and (not arg.startswith('-') or index in flag_indices)
+        for index, arg in enumerate(argv)),
          'command arguments contain invalid or credential-shaped values')
+
+
+def command(argv, cwd=None, env=None, capture=False, flag_indices=()):
+    validate_arguments(argv, flag_indices)
     result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, check=False)
@@ -59,12 +66,14 @@ def verify_cook(entrypoint, pin, env):
     need(entrypoint.is_absolute() and entrypoint.is_file(), 'absolute cook entrypoint required')
     root = entrypoint.parent.parent
     need(entrypoint.resolve() == root.resolve() / 'bin/cook', 'use the reviewed source bin/cook entrypoint')
-    def git(*args):
-        return command(['git', '-C', str(root), *args], env=env, capture=True).decode().strip()
+    def git(*args, flag_indices=()):
+        return command(['git', '-C', str(root), *args], env=env, capture=True,
+                       flag_indices=(1,) + tuple(index + 3 for index in flag_indices)).decode().strip()
     need(git('rev-parse', 'HEAD') == pin, 'cook checkout differs from requested pin')
     need(git('rev-parse', 'HEAD^{tree}') == git('rev-parse', COOK_COMMIT + '^{tree}'),
          'unsupported cook source tree')
-    need(not git('status', '--porcelain', '--untracked-files=normal'), 'cook source checkout must be clean')
+    need(not git('status', '--porcelain', '--untracked-files=normal', flag_indices=(1, 2)),
+         'cook source checkout must be clean')
 
 
 def build_commands(entry):
@@ -194,16 +203,22 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
               'connectorState': settings['connector_state']}
     layout_path = build / 'cook-layout.json'
     layout_path.write_text(json.dumps(layout, sort_keys=True, indent=2) + '\n')
-    argv = [runtime, entrypoint, 'install', str(recipe_path), '--out', str(build),
-            '--no-prompts', '--yes', '--strict', '--ch-repo', settings['host_repo'],
-            '--ch-ref', pins['connectome-host'], '--bun-path', bun_path, '--node-path', node_path,
-            '--layout', str(layout_path), '--host-dependency', dependency,
-            '--user-unit', 'connectome-' + config['name'] + '.service']
+    argv = [runtime, entrypoint, 'install', str(recipe_path)]
+    flag_indices = []
+    for flag, value in (
+            ('--out', str(build)), ('--no-prompts', None), ('--yes', None), ('--strict', None),
+            ('--ch-repo', settings['host_repo']), ('--ch-ref', pins['connectome-host']),
+            ('--bun-path', bun_path), ('--node-path', node_path), ('--layout', str(layout_path)),
+            ('--host-dependency', dependency), ('--user-unit', 'connectome-' + config['name'] + '.service')):
+        flag_indices.append(len(argv))
+        argv.append(flag)
+        if value is not None:
+            argv.append(value)
     # Validate all input before even the verification Git subprocesses spawn.
-    need(all(text(arg) and not credential_shaped(arg) for arg in argv), 'invalid cook arguments')
+    validate_arguments(argv, flag_indices)
     env = clean_environment()
     verify_cook(entrypoint, pins['cook'], env)
-    command(argv, cwd=build, env=env)
+    command(argv, cwd=build, env=env, flag_indices=flag_indices)
     lock = read_lock(build / 'connectome.lock', host_pin=pins['connectome-host'], required_names=names)
     need(lock.get('layout') == layout and lock.get('state') == {'path': str(state)},
          'cook lock did not preserve the requested persistent layout')

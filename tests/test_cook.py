@@ -326,6 +326,8 @@ class AdapterTests(ScratchTest):
     def test_repository_allowlist_and_argument_defense(self):
         for value in ('https://example.invalid/repo.git', 'ssh://git' + '@' + 'example.invalid/repo.git',
                       'git' + '@' + 'example.invalid:repo.git',
+                      'git-user' + '@' + 'host-name:repo.git',
+                      'ssh://git-user' + '@' + 'host-name/repo.git',
                       'git' + '@' + 'example.invalid:/absolute/repo.git', 'example.invalid:repo.git', '/tmp/local repo'):
             with self.subTest(source=value):
                 adapter.source({'repo': value}, 'e' * 40, '/connectors/extra')
@@ -340,6 +342,52 @@ class AdapterTests(ScratchTest):
             for value in ('invalid\nargument', 'gh' + 's_' + 'A' * 32):
                 with self.assertRaises(adapter.AdapterError):
                     adapter.command(['tool', value])
+            run.assert_not_called()
+
+    def test_unsafe_ssh_and_scp_authorities_rejected_before_any_subprocess(self):
+        unsafe = ['-git', '-oProxyCommand=x', '%2dgit']
+        for char in (' ', '\t', '\n', '\r', '\x00', '\x7f', '\x85', '\u00a0', '%20', '%09', '%0a', '%7f'):
+            unsafe.append('git' + char + 'extra')
+        for authority in unsafe:
+            for repo in (authority + '@' + 'host:repo.git', 'git' + '@' + authority + ':repo.git',
+                         authority + ':repo.git', 'ssh://' + authority + '@' + 'host/repo.git',
+                         'ssh://git' + '@' + authority + '/repo.git', 'ssh://' + authority + '/repo.git'):
+                for field in ('host', 'connector'):
+                    spec = self.spec()
+                    if field == 'host':
+                        spec['config']['cook']['host_repo'] = repo
+                    else:
+                        spec['config']['connectors']['extra']['repo'] = repo
+                    with self.subTest(field=field, repo=repo), \
+                            patch.object(adapter, 'verify_cook', side_effect=AssertionError('verification reached')) as verify, \
+                            patch.object(adapter.subprocess, 'run') as run:
+                        self.assertFalse(adapter.repository(repo))
+                        with self.assertRaises(adapter.AdapterError):
+                            self.invoke(spec)
+                        verify.assert_not_called()
+                        run.assert_not_called()
+
+    def test_option_like_argv_values_rejected_before_spawn(self):
+        with patch.object(adapter.subprocess, 'run') as run:
+            for argv, flags in ((['-tool'], ()), (['tool', '-value'], ()), (['tool', '-'], ()),
+                                (['tool', '--flag', '--flag'], (1,)),
+                                (['tool', '--flag', '-oProxyCommand=x'], (1,)),
+                                (['tool', '--flag', '--'], (1,))):
+                with self.subTest(argv=argv), self.assertRaises(adapter.AdapterError):
+                    adapter.command(argv, flag_indices=flags)
+            run.assert_not_called()
+            run.return_value = subprocess.CompletedProcess([], 0)
+            adapter.command(['tool', '--flag', 'value'], flag_indices=(1,))
+            run.assert_called_once()
+
+    def test_option_like_cook_value_rejected_before_verification(self):
+        spec = self.spec()
+        spec['config']['cook']['host_repo'] = '--yes'
+        with patch.object(adapter, 'repository', return_value=True), \
+                patch.object(adapter, 'verify_cook') as verify, patch.object(adapter, 'command') as run:
+            with self.assertRaises(adapter.AdapterError):
+                self.invoke(spec)
+            verify.assert_not_called()
             run.assert_not_called()
 
     def test_argv_provenance_fields_rejected_before_any_subprocess(self):
@@ -390,8 +438,9 @@ class AdapterTests(ScratchTest):
         spec = self.spec()
         spec_path = self.build / 'deployment.json'; spec_path.write_text(json.dumps(spec))
         calls = []
-        def materialize(argv, cwd, env):
+        def materialize(argv, cwd, env, flag_indices):
             # UNIT double only. RealCookTests below never replaces a tool.
+            adapter.validate_arguments(argv, flag_indices)
             calls.append(argv)
             self.assertEqual(cwd, self.build)
             self.assertNotIn('EXAMPLE_SECRET', env)
