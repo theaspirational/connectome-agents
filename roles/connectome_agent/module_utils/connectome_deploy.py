@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import stat
@@ -93,6 +94,8 @@ def secret_names(config):
         names.update(entry.get('required_secrets', []))
     if any(not isinstance(name, str) or not re.fullmatch(r'[A-Z_][A-Z0-9_]*', name) for name in names):
         raise DeployError('invalid secret name')
+    if names & {'DATA_DIR', 'WORKSPACE_DIR'}:
+        raise DeployError('secret names overlap runtime state environment')
     return sorted(names)
 
 
@@ -137,7 +140,21 @@ class Deployment:
         self.builds = inside(self.root, 'builds')
         self.build = inside(self.builds, self.request_id)
         self.current = inside(self.root, 'current')
+        # Deployment bookkeeping is not agent/runtime state.
         self.state = inside(self.root, 'state')
+        value = config.get('state_dir')
+        if (not isinstance(value, str) or not Path(value).is_absolute() or
+                value != os.path.abspath(value) or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+            raise DeployError('state_dir must be a canonical absolute path outside the deployment root')
+        self.state_dir = Path(os.path.abspath(value))
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        value = config.get('secrets_file', str(home / '.config/connectome-secrets' /
+                                               (config.get('name', 'example') + '.json')))
+        if (not isinstance(value, str) or not Path(value).is_absolute() or
+                value != os.path.abspath(value) or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+            raise DeployError('secrets_file must be a canonical absolute path')
+        self.secrets_file = Path(os.path.abspath(value))
+        self._validate_state()
         self.manifest_path = self.state / 'ownership.json'
         self.lock_path()
 
@@ -154,7 +171,54 @@ class Deployment:
         for path in (self.root, self.builds, self.build, self.state):
             base_path(path)
             self._safe_parent(path / '.path-check')
+        self._validate_state()
         self.lock_path()
+
+    def _validate_state(self):
+        # Reject both lexical and resolved overlaps, including links into builds.
+        for path in (self.state_dir, self.state_dir.resolve()):
+            if path.is_relative_to(self.root) or self.root.is_relative_to(path):
+                raise DeployError('state_dir must be outside and separate from the deployment root/builds')
+        if self.unit_dir.is_relative_to(self.state_dir) or self.state_dir.is_relative_to(self.unit_dir):
+            raise DeployError('state_dir must be separate from unit_dir')
+        base_path(self.state_dir)
+        self._safe_parent(self.state_dir / '.path-check')
+        if self.state_dir.exists():
+            info = self.state_dir.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or
+                    info.st_uid != os.geteuid()):
+                raise DeployError('state_dir must be a real directory, mode 0700, owned by the agent account; not repaired')
+
+    def _ensure_state(self):
+        self._validate_state()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._validate_state()
+
+    def _check_secrets_file(self):
+        path = self.secrets_file
+        try:
+            valid = path.resolve() == path and path.parent.resolve() == path.parent
+            directory, info = path.parent.lstat(), path.lstat()
+            valid = (valid and stat.S_ISDIR(directory.st_mode) and
+                     stat.S_IMODE(directory.st_mode) == 0o700 and
+                     directory.st_uid == os.geteuid() and stat.S_ISREG(info.st_mode) and
+                     stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.geteuid())
+        except OSError:
+            valid = False
+        if not valid:
+            raise DeployError('secrets file check failed: require non-symlink directory 0700 and regular file 0600, both owned by the agent account (see plan secrets_file); not repaired')
+
+    def _read_secrets(self):
+        self._check_secrets_file()
+        try:
+            values = json.loads(self.secrets_file.read_text())
+            return {name: values[name] for name in self.names}
+        except (OSError, ValueError, KeyError, TypeError):
+            raise DeployError('agent secrets file lookup failed (values redacted)') from None
+
+    def plan(self):
+        return {'state_dir': str(self.state_dir), 'secrets_file': str(self.secrets_file),
+                'budgets': self.config.get('budgets', {})}
 
     def lock_path(self):
         return inside(self.root, '.deploy-lock')
@@ -169,22 +233,31 @@ class Deployment:
         except LockError as error:
             raise DeployError(str(error)) from None
         state = data.get('state')
+        if not state:
+            raise DeployError('cook lock must declare configured external state_dir')
         if state:
-            path = inside(self.root, state['path'])
-            if path.resolve().is_relative_to(build.resolve()):
-                raise DeployError('state must be outside immutable build')
+            path = Path(state['path'])
+            expected = self.state_dir if build == self.build else Path(self._config(build)['state_dir'])
+            if not path.is_absolute() or state['path'] != str(expected):
+                raise DeployError('cook state does not match configured state_dir')
+            base_path(path)  # Previous/rollback locks must not alias state either.
+            if path.resolve().is_relative_to(self.root.resolve()):
+                raise DeployError('state must be outside deployment root/builds')
         return data
 
     def prepare(self):
         self.validate_paths()
+        self._check_secrets_file()
         self._load_ownership()
         self._check_build_ownership()
+        if not self.check:
+            self._ensure_state()
         marker = inside(self.build, '.prepared')
         if marker.is_file() and marker.read_text() == self.request_id:
             self._activation_plan()
-            return {'changed': False, 'build_dir': str(self.build), 'secret_names': self.names}
+            return {'changed': False, 'build_dir': str(self.build), 'secret_names': self.names, 'plan': self.plan()}
         if self.check:
-            return {'changed': True, 'build_dir': str(self.build), 'secret_names': self.names}
+            return {'changed': True, 'build_dir': str(self.build), 'secret_names': self.names, 'plan': self.plan()}
         if not self.cook_command:
             raise DeployError('configure a pinned cook adapter command')
         if self.current.is_symlink() and self.current.resolve() == self.build:
@@ -196,20 +269,22 @@ class Deployment:
             # contained a plausible .prepared marker. Only our own incomplete,
             # inactive request directory may be recursively discarded.
             shutil.rmtree(self.build)
-        self.build.mkdir(parents=True, mode=0o700)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.builds.mkdir(exist_ok=True, mode=0o700)
+        self.build.mkdir(mode=0o700)
         self.state.mkdir(exist_ok=True, mode=0o700)
         self.owned[self.build] = {'kind': 'directory'}
         self._save_ownership()  # persist ownership before invoking cook
         recipe = inside(self.build, 'deployment.json')
         atomic_write(recipe, canonical(self.spec))
         substitutions = {'recipe': str(recipe),
-                         'build_dir': str(self.build), 'state_dir': str(self.state)}
+                         'build_dir': str(self.build), 'state_dir': str(self.state_dir)}
         run([arg.format_map(substitutions) for arg in self.cook_command], cwd=self.build)
         # Surface safe ownership diagnostics before Ansible's no_log secret
         # activation task, and before creating env/current/service state.
         self._activation_plan()
         atomic_write(inside(self.build, '.prepared'), self.request_id)
-        return {'changed': True, 'build_dir': str(self.build), 'secret_names': self.names}
+        return {'changed': True, 'build_dir': str(self.build), 'secret_names': self.names, 'plan': self.plan()}
 
     def _config(self, build):
         config = json.loads(inside(build, 'deployment.json').read_text())['config']
@@ -229,7 +304,7 @@ class Deployment:
             identifier(name)
             unit = inside(build, 'connectome-' + name + '.service')
             body = ('[Unit]\nDescription=Connectome agent\n[Service]\nType=simple\n'
-                    'WorkingDirectory=' + self._systemd_quote(str(build)) + '\nExecStart=' +
+                    'WorkingDirectory=' + self._systemd_quote(self._config(build)['state_dir']) + '\nExecStart=' +
                     self._systemd_quote(str(script)) + '\nRestart=on-failure\n[Install]\nWantedBy=default.target\n')
             self.rendered_units[unit] = body
             return {unit.name: unit}
@@ -410,7 +485,9 @@ class Deployment:
                 body = self.rendered_units[source]
                 additions[source] = (self._file_record(body), body)
             additions[self._unit_path(name)] = (self._link_record(source), None)
-            body = ('[Service]\nEnvironmentFile=' +
+            body = ('[Service]\nEnvironment=' +
+                    self._systemd_quote('DATA_DIR=' + self._config(build)['state_dir']) +
+                    '\nEnvironmentFile=' +
                     self._systemd_quote(str(inside(build, 'secrets.env'))) + '\n')
             additions[self._dropin(name)] = (self._file_record(body), body)
             for path, artifact in additions.items():
@@ -460,8 +537,11 @@ class Deployment:
             self.current: (self._link_record(self.build), None)})
         return lock, units, previous, previous_lock, previous_units, artifacts
 
-    def activate(self, secrets):
+    def activate(self, secrets=None):
         self.validate_paths()
+        self._check_secrets_file()
+        if secrets is None:
+            secrets = {} if self.check else self._read_secrets()
         self.rendered_units = {}
         self._load_ownership()
         self._check_build_ownership()
@@ -484,6 +564,7 @@ class Deployment:
         retired = any(path.is_relative_to(self.unit_dir) and path not in artifacts for path in self.owned)
         if self.check:
             return {'changed': previous != self.build or not same_units or retired}
+        self._ensure_state()
         if previous == self.build and same_env and same_units and not retired:
             self._health(units, lock, self.build)
             return {'changed': False}

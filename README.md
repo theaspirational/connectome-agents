@@ -30,8 +30,9 @@ and installed unit files, drop-ins and links by exact path and target/content ha
 Unrecorded unit destinations and `current` are not adopted or overwritten; recorded
 files/links must still match before replacement or retirement. Incomplete, inactive
 owned build directories may be recursively cleaned, including untracked contents;
-this is not protection for arbitrary files placed inside them. Persistent state,
-secret env files and cook outputs are not individually ownership-protected. See
+this is not protection for arbitrary files placed inside them. Runtime state is external and never rewritten, moved or deleted by the role;
+trusted cook/runtime code can modify it. Secret env files and cook outputs are
+not individually ownership-protected. See
 the contract for the exact boundary; pointing into `builds/` is not ownership.
 
 Concurrent modification by an attacker with the **same uid**, including swapping
@@ -46,8 +47,16 @@ must be trusted. There is no fd/openat race-hardening claim. See the
 2. Install Python 3.9+ on the target and ansible-core on the controller. Tests
    and the publication checker need the already-installed PyYAML. No collections
    are vendored.
-3. Supply `connectome_cook_command` as an argv list for the bundled pinned cook adapter,
-   and select a secret lookup provider. Never put secret values in role vars.
+3. Supply `connectome_cook_command` as an argv list for the bundled pinned cook adapter.
+   Set agent-level `state_dir` to an absolute external directory (no HOME assumption),
+   and provision the agent account's `~/.config/connectome-secrets/NAME.json`
+   (directory 0700, file 0600, both owned by that account, no symlinks).
+   Agent-level `secrets_file` is an explicit absolute-path override, shown in
+   the check plan. Never put secret values in role vars.
+   **Step/cost budgets are unsupported by the inspected host schema.** They
+   appear in `--check` plans but the production adapter refuses nonempty budgets;
+   explicitly set `budgets: null` in the highest layer to deploy without them.
+   No budget enforcement is implemented here.
 4. Run the private playbook as the service account, not as a privileged account.
    Its user service manager must be available (session/lingering is an operator
    prerequisite). Each agent needs its own root and unique unit names.

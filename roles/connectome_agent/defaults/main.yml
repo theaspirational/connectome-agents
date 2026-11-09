@@ -1,5 +1,5 @@
 ---
-# All deployment paths must remain within this non-symlinked base.
+# Deployment artifacts remain within this non-symlinked base (not runtime state).
 connectome_base: "{{ ansible_env.HOME }}/.local/share/connectome"
 connectome_root: "{{ connectome_base }}/{{ connectome_effective.name }}"
 connectome_unit_dir: "{{ ansible_env.HOME }}/.config/systemd/user"
@@ -11,5 +11,7 @@ connectome_versions_file: "{{ role_path }}/../../versions.yml"
 # Configure scripts/cook-adapter.py and explicit engines; see docs/lock-contract.md.
 connectome_cook_command: []
 connectome_systemctl: [systemctl, --user]
+# connectome_file selects target-side JSON; other names select controller plugins.
+# Override the target path with agent-level secrets_file, not lookup options.
 connectome_secret_lookup: connectome_file
 connectome_secret_lookup_options: {}

@@ -50,6 +50,12 @@ class DeployTests(unittest.TestCase):
         self.root = Path(self.tmp.name) / 'agent'
         self.units = Path(self.tmp.name) / 'units'
         self.config = example()
+        self.config['state_dir'] = str(Path(self.tmp.name) / 'runtime-state')
+        secrets_dir = Path(self.tmp.name) / 'connectome-secrets'
+        secrets_dir.mkdir(mode=0o700)
+        self.config['secrets_file'] = str(secrets_dir / 'example.json')
+        Path(self.config['secrets_file']).write_text('{}')
+        Path(self.config['secrets_file']).chmod(0o600)
         self.versions = read('versions.yml')
         self.cook = [sys.executable, str(ROOT / 'tests/fixtures/cook.py'),
                      '{recipe}', '{build_dir}', '{state_dir}']
@@ -66,6 +72,229 @@ class DeployTests(unittest.TestCase):
     def apply(self, deployment):
         plan = deployment.prepare()
         return deployment.activate(self.provider.get(plan['secret_names']))
+
+    def state_snapshot(self, path):
+        # State ownership/modes, bytes, inode and mtimes must not change.
+        return {str(p.relative_to(path)): (p.lstat().st_ino, p.lstat().st_uid,
+                p.lstat().st_mode, p.lstat().st_mtime_ns,
+                p.read_bytes() if p.is_file() else None)
+                for p in [path, *path.rglob('*')]}
+
+    def test_rebuild_and_rollback_leave_external_state_untouched(self):
+        state = Path(self.config['state_dir'])
+        state.mkdir(mode=0o700)
+        (state / 'sessions').mkdir(mode=0o700)
+        (state / 'sessions/live.json').write_text('existing live state')
+        before = self.state_snapshot(state)
+        first = self.deployment()
+        self.apply(first)
+        self.assertEqual(self.state_snapshot(state), before)
+        config = copy.deepcopy(self.config)
+        config['budgets']['max_steps'] = 7
+        second = self.deployment(config)
+        (self.root / 'cook-fail-once').touch()
+        with self.assertRaises(DeployError):
+            second.prepare()
+        second.prepare()  # recursively discard/rebuild only the incomplete build
+        self.assertEqual(self.state_snapshot(state), before)
+        (self.root / 'fail-health').write_text(str(second.build))
+        with self.assertRaisesRegex(DeployError, 'restored'):
+            second.activate({})
+        self.assertEqual(self.state_snapshot(state), before)
+        self.assertEqual(first.current.resolve(), first.build)
+        self.assertEqual(json.loads((second.build / 'connectome.lock').read_text())['state'],
+                         {'path': str(state)})
+        dropin = self.units / 'connectome-example.service.d/90-connectome-env.conf'
+        self.assertIn('DATA_DIR=' + str(state), dropin.read_text())
+        self.assertIn(str(state), (first.build / 'connectome-example.service').read_text())
+
+    def test_state_is_created_private_and_not_owned_as_an_artifact(self):
+        dep = self.deployment()
+        self.apply(dep)
+        self.assertEqual(stat.S_IMODE(dep.state_dir.stat().st_mode), 0o700)
+        self.assertEqual(dep.state_dir.stat().st_uid, os.geteuid())
+        self.assertNotIn(str(dep.state_dir), dep.manifest_path.read_text())
+        self.assertFalse(dep.state_dir.is_relative_to(dep.root))
+
+    def test_real_shaped_split_layout_lock_accepts_only_exact_external_state(self):
+        dep = self.deployment()
+        dep.prepare()
+        # Match cook's emitted v2 shape: absolute launcher, exported userUnit,
+        # explicit split layout and external state.path (no planned units field).
+        record = json.loads((ROOT / 'tests/fixtures/locks/v2.json').read_text())
+        record['build']['dir'] = str(dep.build)
+        record['connectomeHost']['commit'] = self.versions['runtime']['connectome-host']
+        record['connectomeHost']['path'] = str(dep.build / 'app')
+        record['recipe']['path'] = record['recipePath'] = str(dep.build / 'deployment.json')
+        unit = dep.build / 'exported.service'
+        unit.write_text('[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n')
+        record['launch'] = {'kind': 'script', 'script': str(dep.build / 'run.sh'),
+                            'userUnit': str(unit)}
+        record['state'] = {'path': str(dep.state_dir)}
+        record['layout'] = {'schema': 'connectome.host-layout/v1',
+                            'runtime': str(dep.build), 'state': str(dep.state_dir),
+                            'config': str(dep.root / 'cook-config' / dep.request_id),
+                            'credentials': str(dep.root / 'cook-credentials' / dep.request_id),
+                            'workspace': str(dep.root / 'workspace'), 'connectorState': {}}
+        lockfile = dep.build / 'connectome.lock'
+        for value in (str(dep.state_dir) + '/.', str(dep.state_dir.parent / 'other'),
+                      str(dep.build / 'data')):
+            record['state']['path'] = value
+            lockfile.write_text(json.dumps(record))
+            before = self.snapshot()
+            with self.assertRaisesRegex(DeployError, 'configured state_dir'):
+                dep.activate({})
+            self.assertEqual(self.snapshot(), before)
+        record['state']['path'] = str(dep.state_dir)
+        record['launch']['script'] = str(dep.state_dir / 'outside.sh')
+        lockfile.write_text(json.dumps(record))
+        with self.assertRaisesRegex(DeployError, 'escapes'):
+            dep.activate({})
+        record['launch']['script'] = str(dep.build / 'run.sh')
+        lockfile.write_text(json.dumps(record))
+        self.assertTrue(dep.activate({})['changed'])
+        self.assertEqual(dep.current.resolve(), dep.build)
+        self.assertEqual((self.units / 'exported.service').resolve(),
+                         dep.build / 'managed-units/exported.service')
+
+    def test_operator_reapply_previous_recorded_request_without_rebuild_or_state_changes(self):
+        first = self.deployment()
+        self.apply(first)
+        (first.state_dir / 'live.json').write_text('live data')
+        before_state = self.state_snapshot(first.state_dir)
+        config = copy.deepcopy(self.config)
+        config['budgets']['max_steps'] = 7
+        second = self.deployment(config)
+        self.apply(second)
+        before_cook = (self.root / 'cook-calls').read_text()
+        before_calls = (self.root / 'systemctl-calls').read_text().splitlines()
+        # Operator restores the exact prior private inputs, not a guessed cook ID.
+        restored = self.deployment(copy.deepcopy(self.config))
+        self.assertFalse(restored.prepare()['changed'])
+        self.assertTrue(restored.activate({})['changed'])
+        self.assertEqual(restored.current.resolve(), first.build)
+        self.assertTrue(second.build.exists())
+        self.assertEqual((self.root / 'cook-calls').read_text(), before_cook)
+        self.assertEqual(self.state_snapshot(first.state_dir), before_state)
+        calls = [json.loads(line) for line in (self.root / 'systemctl-calls').read_text().splitlines()[len(before_calls):]]
+        self.assertIn(['restart', 'connectome-example.service'], calls)
+        self.assertIn(['is-active', '--quiet', 'connectome-example.service'], calls)
+
+    def test_reused_build_recreates_missing_state_directory_only(self):
+        dep = self.deployment()
+        self.apply(dep)
+        dep.state_dir.rmdir()  # simulate externally missing empty state
+        self.assertFalse(dep.prepare()['changed'])
+        self.assertEqual(stat.S_IMODE(dep.state_dir.stat().st_mode), 0o700)
+        self.assertEqual(len((self.root / 'cook-calls').read_text().splitlines()), 1)
+
+    def test_late_state_symlink_and_wrong_lock_state_fail_closed(self):
+        dep = self.deployment()
+        dep.prepare()
+        dep.state_dir.rmdir()
+        dep.state_dir.symlink_to(dep.build)
+        before = self.snapshot()
+        for operation in (dep.prepare, lambda: dep.activate({})):
+            with self.assertRaisesRegex(DeployError, 'state_dir'):
+                operation()
+            self.assertEqual(self.snapshot(), before)
+        dep.state_dir.unlink()
+        lockfile = dep.build / 'connectome.lock'
+        lock = json.loads(lockfile.read_text())
+        lock['state']['path'] = str(dep.build / 'data')
+        lockfile.write_text(json.dumps(lock))
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'configured state_dir'):
+            dep.activate({})
+        self.assertEqual(self.snapshot(), before)
+
+    def test_invalid_state_paths_and_permissions_fail_without_repair(self):
+        for value in (None, 'relative', str(self.root), str(self.root / 'builds/live'),
+                      str(self.root / 'current/data'), str(self.root.parent)):
+            config = copy.deepcopy(self.config)
+            config['state_dir'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(DeployError, 'state_dir'):
+                self.deployment(config)
+        target = self.root / 'builds/live'
+        target.mkdir(parents=True)
+        state = Path(self.config['state_dir'])
+        state.symlink_to(target)
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, 'state_dir'):
+            self.deployment()
+        self.assertEqual(self.snapshot(), before)
+        state.unlink()
+        state.mkdir(mode=0o755)
+        before = self.snapshot()
+        with self.assertRaisesRegex(DeployError, '0700'):
+            self.deployment()
+        self.assertEqual(self.snapshot(), before)
+        state.chmod(0o700)
+        with patch('connectome_deploy.os.geteuid', return_value=os.geteuid() + 1), \
+                patch('connectome_deploy.pwd.getpwuid', return_value=SimpleNamespace(pw_dir='/example')):
+            with self.assertRaisesRegex(DeployError, 'owned by the agent'):
+                self.deployment()
+
+    def test_secrets_default_uses_agent_account_home_not_environment(self):
+        config = copy.deepcopy(self.config)
+        del config['secrets_file']
+        with patch('connectome_deploy.pwd.getpwuid', return_value=SimpleNamespace(pw_dir='/example-home')), \
+                patch.dict(os.environ, {'HOME': '/unrelated'}):
+            dep = self.deployment(config, check=True)
+        self.assertEqual(str(dep.secrets_file), '/example-home/.config/connectome-secrets/example.json')
+
+    def test_target_file_lookup_exact_names_and_check_plan(self):
+        self.config['required_secrets'] = ['EXAMPLE_SECRET']
+        path = Path(self.config['secrets_file'])
+        path.write_text(json.dumps({'EXAMPLE_SECRET': 'synthetic-value', 'UNUSED': 'ignored'}))
+        dep = self.deployment(check=True)
+        before = self.snapshot()
+        with patch.object(dep, '_read_secrets', side_effect=AssertionError('no lookup in check')):
+            plan = dep.prepare()['plan']
+            dep.activate()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(plan, {'state_dir': self.config['state_dir'],
+                               'secrets_file': str(path), 'budgets': {'max_steps': 50, 'max_cost': 2.0}})
+        dep = self.deployment()
+        dep.prepare()
+        dep.activate()
+        self.assertEqual((dep.build / 'secrets.env').read_text(), 'EXAMPLE_SECRET="synthetic-value"\n')
+        path.write_text('{}')
+        with self.assertRaisesRegex(DeployError, 'lookup failed'):
+            dep.activate()
+
+    def test_secrets_permissions_owner_and_symlinks_fail_closed_before_start(self):
+        dep = self.deployment()
+        dep.prepare()
+        path = dep.secrets_file
+        for kind in ('directory-mode', 'file-mode', 'file-link', 'directory-link', 'missing', 'owner'):
+            with self.subTest(kind=kind):
+                if kind == 'directory-mode': path.parent.chmod(0o755)
+                if kind == 'file-mode': path.chmod(0o644)
+                if kind == 'file-link':
+                    path.rename(path.with_suffix('.saved'))
+                    path.symlink_to(path.with_suffix('.saved'))
+                if kind == 'directory-link':
+                    path.parent.rename(path.parent.with_suffix('.saved'))
+                    path.parent.symlink_to(path.parent.with_suffix('.saved'))
+                if kind == 'missing': path.rename(path.with_suffix('.saved'))
+                before = self.snapshot()
+                uid = os.geteuid() + 1 if kind == 'owner' else os.geteuid()
+                with patch('connectome_deploy.os.geteuid', return_value=uid), \
+                        patch.object(dep, '_validate_state'):
+                    for operation in (dep.prepare, lambda: dep.activate({})):
+                        with self.assertRaisesRegex(DeployError, 'secrets file check failed'):
+                            operation()
+                self.assertEqual(self.snapshot(), before)
+                if kind == 'directory-mode': path.parent.chmod(0o700)
+                if kind == 'file-mode': path.chmod(0o600)
+                if kind == 'file-link': path.unlink()
+                if kind == 'directory-link':
+                    path.parent.unlink()
+                    path.parent.with_suffix('.saved').rename(path.parent)
+                if kind in ('file-link', 'missing'): path.with_suffix('.saved').rename(path)
+        self.assertFalse(dep.current.exists())
+        self.assertFalse((self.root / 'systemctl-calls').exists())
 
     def test_switch_rollback_idempotency_and_exact_secrets(self):
         self.config['required_secrets'] = ['EXAMPLE_SECRET']

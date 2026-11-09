@@ -1,4 +1,7 @@
 name: example
+# Set a real external path on the agent host; never under the deployment root.
+state_dir: /absolute/persistent/example/data
+# Optional secrets_file overrides the target account default (see layering docs).
 budgets:
   max_cost: 2.0
 connectors:

@@ -88,20 +88,55 @@ Do not put actual values or secret-store paths in the public catalog.
 
 ## Secret providers
 
-`connectome_secret_lookup` is an Ansible lookup plugin name;
-`connectome_secret_lookup_options` supplies its keyword arguments. Production
-can use an installed Vault lookup (for example
-`community.hashi_vault.hashi_vault`) or a private wrapper accepting a secret
-**name**. Supply any private store addressing and auth outside the submodule.
-This repository does not install a Vault collection or store credentials.
+By default `connectome_secret_lookup: connectome_file` selects **target-side**
+JSON loading, not an Ansible controller lookup. Its path is the agent account's
+passwd home plus `.config/connectome-secrets/NAME.json` (not controller HOME or
+XDG overrides). Agent-level `secrets_file: /absolute/private/example.json` overrides
+it. The plan shows the effective path; `connectome_secret_lookup_options.path`
+is not the override for this mode.
 
-The bundled `connectome_file` test lookup accepts `path` to a private JSON object
-of name-to-string values. It opens only that controller file and returns only
-requested names. Keep it outside version control with restrictive permissions.
-The role resolves only explicit `required_secrets` from the effective agent,
-connectors and modules after the lock confirms their names. It never enumerates
-a secret store. All lookup/activation tasks are `no_log`; values never enter
-cook argv, the normalized spec, a lock, or the Ansible result.
+Before prepare and again before activation, the role requires a real directory
+0700 and regular file 0600, both owned by the effective agent uid; symlinked
+files/directories/ancestors, missing paths and mismatches fail closed with a clear
+message. It never fixes permissions/ownership or creates this file. Provision it
+privately, outside version control, even for an agent with no declared secrets
+(an empty JSON object suffices). Check mode validates metadata, but does not read
+values. Target-side lookup returns only declared `required_secrets`; extra keys
+are ignored, missing/non-string declared values fail. It runs after cook lock
+validation, and values never enter cook, the spec, lock or result.
+
+For an existing external provider, `connectome_secret_lookup` may instead name
+an installed controller lookup plugin; `connectome_secret_lookup_options` supplies
+its keyword arguments. This repository installs no collections. Only declared
+names are requested, under `no_log`, and facts are cleaned afterward. The target
+secrets-file metadata convention still applies before starting. The standalone
+bundled controller lookup remains a legacy helper; the role's default bypasses it.
+
+## External runtime state and budgets
+
+Supply agent-level `state_dir: /absolute/persistent/example/data`. There is no
+HOME-derived default: a StateDirectory-style path is valid too. It must be outside
+and non-overlapping with the deployment root, including `builds/` and `current/`.
+Symlink paths/ancestors (including links into builds) are refused. The role creates
+a missing directory as the agent uid, mode 0700. An existing directory must already
+have that mode/owner; it is never repaired, moved, copied, rewritten or deleted.
+The role's bookkeeping stays at ROOT/state/ownership.json, **not** in `state_dir`.
+Back up and select existing live state explicitly; no automatic migration occurs.
+Cook binds DATA_DIR and host CWD through its split layout; no guessed host flags
+or recipe fields are used. Use distinct non-overlapping state/layout paths per
+agent. Rebuild cleanup is restricted to owned build directories; rollback only
+restores code/units/env, never data. Runtime/schema migrations remain operator risk.
+
+Effective `budgets` from all four layers are shown in the nonsecret `--check`
+plan, alongside `state_dir` and `secrets_file`. Host `src/recipe.ts` at the pinned
+`cef933981dc0699fc00e5189b129d854ff8d43f6` has no step/cost-limit fields (nor does
+the inspected local host); cook `28236dd5` exposes none. The adapter refuses any
+nonempty budgets with `not supported by host recipe schema at <host-pin>` before
+spawning tools. No fields are invented and no enforcement is implemented here.
+Public defaults retain example budgets for merge/plan visibility; deploying with
+this host requires an explicit highest-layer `budgets: null` tombstone. An empty
+mapping alone does not clear lower-layer values. Check is a plan, not a promise
+that adapter validation or runtime health will succeed.
 
 ## Operations
 
@@ -112,7 +147,20 @@ previous unit links, env-file reference and `current` pointer, restarts previous
 units and checks their health. A first-deployment failure stops/disables the new
 units and removes `current`. A failed recovery is reported, not claimed healthy.
 
-Check mode validates pins and available locks, predicts build/pointer changes,
+### Operator rollback to a recorded request
+
+Restore the **exact previous private layers, versions file and immutable adapter
+argv**, keeping the same deployment root, state_dir and unit_dir. Run the normal
+private deployment playbook (use `--check` first). Its request ID identifies the
+retained manifest-owned build; prepare reuses its validated `.prepared` marker,
+and activation restores its units/current pointer, restarts and health-checks it.
+There is no cook rebuild, state copy, migration or data rollback. Current secret
+values are resolved normally, so this is code/config rollback, not secret rollback.
+Keep the previous private inputs and build; an unknown/unowned/modified build is
+still refused. If the old build/marker is missing, check predicts a new build:
+stop rather than claim this is rollback. A new build-ID selector is not provided.
+
+Check mode validates pins, state/secrets metadata and available locks, predicts build/pointer changes,
 and does not run cook, systemctl or secret lookups or write files. It cannot
 predict secret rotation or runtime health without executing private lookups and
 checks. The role serializes each mutation with a per-agent file lock. Separate

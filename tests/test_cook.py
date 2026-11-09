@@ -58,7 +58,9 @@ class ScratchTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=ROOT / '.cache')
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name)
-        self.build = self.work / 'build'
+        self.build = self.work / 'deployment/builds/request'
+        self.build.parent.parent.mkdir(mode=0o700)
+        self.build.parent.mkdir(mode=0o700)
         self.build.mkdir(mode=0o700)
 
 
@@ -256,7 +258,7 @@ class LockTests(ScratchTest):
 
 class AdapterTests(ScratchTest):
     def spec(self):
-        return {'config': {'name': 'example', 'agent': {'systemPrompt': 'Example'},
+        return {'config': {'name': 'example', 'state_dir': str(self.work / 'state'), 'agent': {'systemPrompt': 'Example'},
                 'modules': {'lessons': {'settings': {}}}, 'connectors': {'extra': {
                     'repo': 'https://example.invalid/extra.git', 'pin_ref': 'connectors.extra',
                     'build': [['printf', '%s', 'a; b'], ['make', 'build']],
@@ -268,6 +270,20 @@ class AdapterTests(ScratchTest):
                          'connector_state': {}}},
                 'pins': {'runtime': {'cook': adapter.COOK_COMMIT, 'connectome-host': 'c' * 40,
                                     'agent-framework': 'd' * 40}, 'connectors': {'extra': 'e' * 40}}}
+
+    def test_nonempty_budgets_fail_closed_at_host_schema_boundary(self):
+        for budgets in ({'max_steps': 50}, {'max_cost': 2.0}, {'max_cost': 0}):
+            spec = self.spec()
+            spec['config']['budgets'] = budgets
+            with self.subTest(budgets=budgets), patch.object(adapter, 'command') as run:
+                with self.assertRaisesRegex(adapter.AdapterError,
+                        'not supported by host recipe schema at ' + 'c' * 40):
+                    self.invoke(spec)
+                run.assert_not_called()
+        spec = self.spec()
+        spec['config']['budgets'] = {}
+        recipe, _ = adapter.recipe_from_spec(spec)
+        self.assertNotIn('budgets', recipe)
 
     def test_translate_normalized_spec_and_quote_build_argv(self):
         spec = self.spec(); before = deepcopy(spec)
@@ -448,6 +464,9 @@ class AdapterTests(ScratchTest):
             self.assertNotIn('BUN_OPTIONS', env)
             self.assertNotIn('synthetic-answer', json.dumps(argv))
             layout = json.loads((self.build / 'cook-layout.json').read_text())
+            self.assertEqual(layout['state'], spec['config']['state_dir'])
+            self.assertEqual(layout['config'], str(self.work / 'deployment/cook-config/request'))
+            self.assertEqual(layout['workspace'], str(self.work / 'deployment/workspace'))
             record = fixture(); record['build']['dir'] = str(self.build)
             record['launch']['script'] = str(self.build / 'run.sh')
             unit = self.build / 'connectome-example.service'
@@ -487,7 +506,9 @@ class RealCookTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix='connectome-real-')
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name).resolve()
-        self.build = self.work / 'build'
+        self.build = self.work / 'deployment/builds/request'
+        self.build.parent.parent.mkdir(mode=0o700)
+        self.build.parent.mkdir(mode=0o700)
         self.build.mkdir(mode=0o700)
 
     def test_real_cook_offline_local_host_build(self):
@@ -531,7 +552,7 @@ class RealCookTests(unittest.TestCase):
         host_pin = repository(host, {'package.json': json.dumps({'name': 'example-host', 'version': '1.0.0',
                      'type': 'module', 'engines': {'bun': '>=1.0.0', 'node': '>=20.0.0'},
                      'dependencies': {adapter.FRAMEWORK: '^1.0.0'}}), 'src/index.ts': 'console.log("example");\n'})
-        spec = {'config': {'name': 'example', 'agent': {'systemPrompt': 'Offline example'},
+        spec = {'config': {'name': 'example', 'state_dir': str(self.work / 'state'), 'agent': {'systemPrompt': 'Offline example'},
                           'required_secrets': ['EXAMPLE_SECRET'], 'connectors': {}, 'modules': {},
                           'cook': {'host_repo': str(host), 'framework_archive': artifact, 'connector_state': {}}},
                 'pins': {'runtime': {'cook': adapter.COOK_COMMIT, 'connectome-host': host_pin,
@@ -552,5 +573,8 @@ class RealCookTests(unittest.TestCase):
         self.assertEqual(record['state']['path'], str(self.work / 'state'))
         self.assertEqual(record['requirements'][0]['envName'], 'EXAMPLE_SECRET')
         self.assertTrue((self.build / 'run.sh').is_file())
+        self.assertIn("export DATA_DIR='" + str(self.work / 'state') + "'",
+                      (self.build / 'run.sh').read_text())
+        self.assertIn(str(self.work / 'state'), (self.build / 'connectome-example.service').read_text())
         self.assertEqual(record['units'][0]['path'], 'connectome-example.service')
         self.assertNotIn('synthetic-answer', (self.build / 'connectome.lock').read_text())

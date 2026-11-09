@@ -47,7 +47,7 @@
                   [(item, lookup(connectome_secret_lookup, item,
                                  **connectome_secret_lookup_options))]) }}
       loop: "{{ connectome_prepared.secret_names }}"
-      when: not ansible_check_mode
+      when: not ansible_check_mode and connectome_secret_lookup != 'connectome_file'
       no_log: true
 
     - name: Activate units, switch current, check health and roll back on failure
@@ -60,10 +60,15 @@
         versions: "{{ connectome_versions_data }}"
         cook_command: "{{ connectome_cook_command }}"
         systemctl: "{{ connectome_systemctl }}"
-        secrets: "{{ connectome_resolved_secrets }}"
+        secrets: "{{ connectome_resolved_secrets if connectome_secret_lookup != 'connectome_file' else omit }}"
       no_log: true
   always:
     - name: Forget controller secret facts
       ansible.builtin.set_fact:
         connectome_resolved_secrets: {}
       no_log: true
+
+- name: Show nonsecret deployment plan
+  ansible.builtin.debug:
+    var: connectome_prepared.plan
+  when: ansible_check_mode

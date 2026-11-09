@@ -111,7 +111,8 @@ materialization path. `pin_ref` must be `connectors.NAME`. Module `settings` map
 to native host module settings (empty settings enable the module); source-backed
 modules/extensions are refused rather than silently ignored. No catalog scan,
 disabled import, fleet walk, inferred launch command, credential file or sidecar
-is added. Budgets remain role request metadata, not a claimed upstream mapping.
+is added. Nonempty step/cost budgets are refused because this host recipe schema
+has no corresponding fields; see [state and budgets](layering.md#external-runtime-state-and-budgets).
 
 The actual invocation is `RUNTIME ENTRYPOINT install RECIPE --out BUILD
 --no-prompts --yes --strict --ch-repo REPO --ch-ref HOST_SHA --bun-path BUN
@@ -130,10 +131,19 @@ called until the role validates the returned lock. The adapter refuses unexpecte
 nonempty generated `.env`, so cook's sourcing cannot override runtime secret
 delivery. Operators must also keep literals out of prompts/settings/provenance.
 
-Split layout binds host state/CWD to `{state_dir}` and workspace to its sibling
-`workspace/`; per-request config and reserved empty credentials roots live under
-sibling `cook-config/REQUEST` and `cook-credentials/REQUEST`. All are outside the
-immutable build. Declare connector file state explicitly in `connector_state`;
+Agent-level `state_dir` is required, canonical and absolute, outside the deployment
+root/builds, with no symlink aliases. It need not be under HOME. Existing state
+must be mode 0700 owned by the agent account; the role creates only a missing
+directory and never repairs, moves, deletes or writes its contents. Its separate
+bookkeeping remains ROOT/state/ownership.json. Rebuild and rollback never touch
+runtime data. Trusted cook/runtime code can still modify state.
+
+Split layout binds host state/CWD to `{state_dir}` and workspace to ROOT/workspace; per-request config and reserved empty credentials
+roots live under ROOT/cook-config/REQUEST and ROOT/cook-credentials/REQUEST.
+The adapter output must be ROOT/builds/REQUEST. The external state directory's
+parent need not be writable by the agent account. All are outside the
+immutable build. These layout paths must be private, distinct per agent and non-overlapping.
+Declare connector file state explicitly in `connector_state`;
 other application paths are not guessed. Cook requires private, non-overlapping
 roots with safe ancestors; consult its layout documentation. Runtime launches,
 child Bun autoload and operator absolute overrides need separate audits. The
@@ -175,7 +185,11 @@ The explicit `required_secrets` name set is verified against the union of lock
 Cook's conservative credentials superset must **not** cause lookup of every
 alternative name. Missing declared names fail before activation. Declare any
 runtime-level secret in the agent's `required_secrets`, not just connectors.
-The provider result must have exactly this set, no extra keys.
+The provider result must have exactly this set, no extra keys. Default delivery
+reads only these names on the target from the agent account's
+`~/.config/connectome-secrets/NAME.json`; an agent-level absolute `secrets_file`
+override is shown in check plans. Before start, directory 0700/file 0600, uid and
+non-symlink checks fail closed without repair. See [secret providers](layering.md#secret-providers).
 
 Each build's `secrets.env` is atomically written mode 0600 within private build
 storage. Values are double-quoted, with quote/backslash escaping; multiline,
@@ -244,7 +258,7 @@ owned incomplete build may be recursively deleted, including untracked files
 added there; active builds and builds containing manifest-owned unit files are
 not rebuilt. Within owned builds, cook outputs, `deployment.json`, `.prepared`
 and `secrets.env` have no per-file ownership protection. The serialization lock
-and persistent state (apart from manifest validation) are not tracked artifacts;
+and external runtime state are not tracked artifacts;
 trusted cook/runtime code may modify state. Existing real unit/drop-in/enablement
 parent directories can be reused and removed when empty after retirement, even
 if the role did not create them. The manifest itself is validated as a regular

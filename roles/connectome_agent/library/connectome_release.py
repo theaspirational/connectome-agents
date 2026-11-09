@@ -15,7 +15,7 @@ def main():
         'versions': {'type': 'dict', 'required': True},
         'cook_command': {'type': 'list', 'elements': 'str', 'required': True},
         'systemctl': {'type': 'list', 'elements': 'str', 'default': ['systemctl', '--user']},
-        'secrets': {'type': 'dict', 'default': {}, 'no_log': True},
+        'secrets': {'type': 'dict', 'no_log': True},
     }, supports_check_mode=True)
     params = dict(module.params)
     operation = params.pop('operation')

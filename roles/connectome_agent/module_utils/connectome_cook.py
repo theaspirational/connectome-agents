@@ -104,6 +104,9 @@ def recipe_from_spec(spec):
     for name, entry in config.get('connectors', {}).items():
         need(entry.get('pin_ref') == 'connectors.' + name, 'connector pin_ref must name its resolved connector')
     need(resolve_pins(config, versions) == pins, 'normalized pins required')
+    if config.get('budgets'):
+        raise AdapterError('step/cost budgets not supported by host recipe schema at ' +
+                           pins['runtime']['connectome-host'] + '; remove budgets explicitly')
     agent = config.get('agent')
     need(isinstance(agent, dict) and isinstance(agent.get('systemPrompt'), str) and agent['systemPrompt'],
          'agent.systemPrompt is required by cook')
@@ -179,12 +182,16 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
          'adapter paths must be absolute without symlink aliases')
     need(build.is_dir() and set(build.iterdir()) == {spec_path} and spec_path.name == 'deployment.json',
          'cook requires a fresh build containing only deployment.json')
-    need(not state.is_relative_to(build) and not build.is_relative_to(state), 'state must be separate from build')
+    need(build.parent.name == 'builds', 'adapter output must be ROOT/builds/REQUEST')
+    root = build.parent.parent
+    need(not state.is_relative_to(root) and not root.is_relative_to(state),
+         'state must be separate from deployment root/builds')
     need(all(Path(p).is_absolute() and os.access(p, os.X_OK) for p in (runtime, bun_path, node_path)),
          'absolute executable runtime, Bun and Node paths required')
     spec = json.loads(spec_path.read_text())
     recipe, names = recipe_from_spec(spec)
     config, pins = spec['config'], spec['pins']['runtime']
+    need(config.get('state_dir') == str(state), 'adapter state must match configured state_dir')
     settings = config.get('cook', {})
     need(isinstance(settings, dict), 'cook settings must be a mapping')
     need(set(settings) == {'host_repo', 'framework_archive', 'connector_state'},
@@ -194,12 +201,13 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     recipe_path = build / 'cook-recipe.json'
     recipe_path.write_text(json.dumps(recipe, sort_keys=True, indent=2) + '\n')
     # Config/credentials are per-request, state/workspace persist. All roots
-    # are siblings/non-overlapping as required by cook's split layout.
+    # are non-overlapping as required by cook's split layout. Do not assume
+    # the parent of an arbitrary external state_dir is writable by this uid.
     request = build.name
     layout = {'schema': 'connectome.host-layout/v1', 'runtime': str(build),
-              'config': str(state.parent / 'cook-config' / request),
-              'credentials': str(state.parent / 'cook-credentials' / request),
-              'state': str(state), 'workspace': str(state.parent / 'workspace'),
+              'config': str(root / 'cook-config' / request),
+              'credentials': str(root / 'cook-credentials' / request),
+              'state': str(state), 'workspace': str(root / 'workspace'),
               'connectorState': settings['connector_state']}
     layout_path = build / 'cook-layout.json'
     layout_path.write_text(json.dumps(layout, sort_keys=True, indent=2) + '\n')
