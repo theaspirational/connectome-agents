@@ -286,6 +286,12 @@ runtime data. Trusted cook/runtime code can still modify state.
 
 Split layout binds host state/CWD to `{state_dir}` and workspace to ROOT/workspace; per-request config and reserved empty credentials
 roots live under ROOT/cook-config/REQUEST and ROOT/cook-credentials/REQUEST.
+The reviewed `run.sh` explicitly changes to `layout.state` before exec, regardless
+of its initial cwd. Thus cwd-relative `mcpl-servers.json` and agent overlay files
+resolve in `state_dir`. HOME supplied by a separate private runtime
+`EnvironmentFile=` passes through unchanged: no unit or launcher HOME assignment
+is emitted. This does not make HOME a supported cook requirement/secret name;
+see [runtime HOME and cwd](layering.md#external-runtime-state-and-budgets).
 The adapter output must be ROOT/builds/REQUEST. The external state directory's
 parent need not be writable by the agent account. All are outside the
 immutable build. These layout paths must be private, distinct per agent and non-overlapping.
@@ -359,6 +365,12 @@ worktree hierarchy: cook rejects unsafe ancestors of split-layout roots.
 Missing prerequisites produce an explicit unittest skip reason. Available
 prerequisites followed by a failed build are a failure, not a skip. Schema/adapter
 unit scratch remains under the ignored worktree `.cache/`.
+The private-HOME integration case checks the installed cook unit and all test
+drop-ins for HOME assignments, then executes the real exported launcher with a
+synthetic private EnvironmentFile's HOME (including a space). Its tiny local host
+records the observed HOME, cwd and DATA_DIR; both the normal unit cwd and a
+different initial cwd must yield `layout.state`. EnvironmentFile delivery is
+simulated, not qualified against a live user manager. Cook source is not patched.
 Deployment lifecycle fixtures use private `TMPDIR` (default: the account home),
 not group-writable worktree ancestors. Real-cook checkout, empty HOME and
 split-layout roots also use `TMPDIR`; all temporary fixtures are cleaned up.

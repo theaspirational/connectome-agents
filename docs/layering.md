@@ -123,7 +123,26 @@ have that mode/owner; it is never repaired, moved, copied, rewritten or deleted.
 The role's bookkeeping stays at ROOT/state/ownership.json, **not** in `state_dir`.
 Back up and select existing live state explicitly; no automatic migration occurs.
 Cook binds DATA_DIR and host CWD through its split layout; no guessed host flags
-or recipe fields are used. Use distinct non-overlapping state/layout paths per
+or recipe fields are used. The rendered unit starts in `state_dir`, and cook's
+`run.sh` itself changes to `layout.state` (the same `state_dir`) before executing
+the host. Changing only systemd's `WorkingDirectory=` does not change the host's
+effective cwd. Host cwd-relative files, including `mcpl-servers.json` and the
+agent overlay, therefore resolve under `state_dir`, not the deployment root or
+HOME. Back up/audit those files there when migrating; the role does not discover
+or relocate them. There is no per-agent `working_directory` option.
+
+HOME is independent of cwd and DATA_DIR. An operator-provisioned private systemd
+`EnvironmentFile=` can set HOME for the runtime process; neither the reviewed
+cook unit/launcher nor the role's environment drop-in assigns HOME. For example,
+an additional private drop-in can reference a private mode-0600 file containing
+`HOME="/absolute/persistent/example/home"`. Keep that drop-in separate from the
+role-owned `90-connectome-env.conf` and its generated `secrets.env`. HOME remains
+an adapter infrastructure variable: do **not** declare it in `required_secrets`
+or `secret_files`. Its build-time value is not a runtime HOME setting. The
+offline real-cook test simulates EnvironmentFile delivery and observes HOME,
+cwd and DATA_DIR inside the launched process; it is not a live-systemd test.
+
+Use distinct non-overlapping state/layout paths per
 agent. Rebuild cleanup is restricted to owned build directories; rollback only
 restores code/units/env, never data. Runtime/schema migrations remain operator risk.
 

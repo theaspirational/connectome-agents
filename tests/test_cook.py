@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -864,6 +865,9 @@ class RealCookTests(unittest.TestCase):
     def test_real_cook_offline_install_only_then_start_reuses_release(self):
         self.real_build(registry=False, operator_inputs=True, staging=True)
 
+    def test_real_cook_offline_private_home_pass_through_and_host_cwd(self):
+        self.real_build(registry=False, with_secrets=False, home_passthrough=True)
+
     def test_real_cook_offline_local_host_build(self):
         self.real_build(registry=False)
 
@@ -886,7 +890,8 @@ class RealCookTests(unittest.TestCase):
         self.real_build(registry=False, two_dependencies=True, trusted=True)
 
     def real_build(self, registry, with_secrets=True, two_dependencies=False, generic_only=False,
-                   trusted=False, registry_input=False, operator_inputs=False, staging=False):
+                   trusted=False, registry_input=False, operator_inputs=False, staging=False,
+                   home_passthrough=False):
         """No fake runtimes/Git/dependency tools, downloads, or network recipes."""
         required = ('CONNECTOME_TEST_COOK_SOURCE', 'CONNECTOME_TEST_BUN', 'CONNECTOME_TEST_COOK_DEPS')
         missing_env = [name for name in required if not os.environ.get(name)]
@@ -932,15 +937,24 @@ class RealCookTests(unittest.TestCase):
             extra = framework_archive(self.work / 'context.tgz', None, name=name,
                 scripts={'postinstall': 'touch ' + str(self.work / 'lifecycle-ran')})
             dependencies[name] = '^1.0.0'
+        if home_passthrough:
+            host_source = ('import {writeFileSync} from "node:fs";\n'
+                           'writeFileSync("environment-observed.json", JSON.stringify({\n'
+                           '  home: process.env.HOME, cwd: process.cwd(), data_dir: process.env.DATA_DIR\n'
+                           '}));\n')
+        elif operator_inputs:
+            host_source = ('import {readFileSync, writeFileSync} from "node:fs";\n'
+                           'const value = readFileSync(process.env.EXAMPLE_FILE!, "utf8");\n'
+                           'if (!value || process.env.EXAMPLE_SECRET) process.exit(8);\n'
+                           'writeFileSync(process.env.DATA_DIR + "/file-seen", "ok");\n')
+        else:
+            host_source = 'console.log("example");\n'
         host = self.work / 'host'
         host_pin = repository(host, {'package.json': json.dumps({'name': 'example-host', 'version': '1.0.0',
                      'type': 'module', 'engines': {'bun': '>=1.0.0', 'node': '>=20.0.0'},
                      'dependencies': dependencies,
-                     **({'trustedDependencies': ["@animalabs/context-manager"]} if trusted else {})}), 'src/index.ts': ('import {readFileSync, writeFileSync} from "node:fs";\n'
-                         'const value = readFileSync(process.env.EXAMPLE_FILE!, "utf8");\n'
-                         'if (!value || process.env.EXAMPLE_SECRET) process.exit(8);\n'
-                         'writeFileSync(process.env.DATA_DIR + "/file-seen", "ok");\n'
-                         if operator_inputs else 'console.log("example");\n')})
+                     **({'trustedDependencies': ["@animalabs/context-manager"]} if trusted else {})}),
+                     'src/index.ts': host_source})
         spec = {'config': {'name': 'example', 'state_dir': str(self.work / 'state'),
                           'secrets_file': str(self.work / 'secrets/example.json'),
                           'agent': {'systemPrompt': 'Offline example'},
@@ -960,6 +974,9 @@ class RealCookTests(unittest.TestCase):
             spec['config']['cook']['host_dependencies'].insert(0, {'name': adapter.FRAMEWORK,
                 'archive': artifact['path'], 'sha256': artifact['sha256'], 'version': '1.0.0',
                 'kind': 'git_commit', 'commit': framework_pin})
+        if home_passthrough:
+            self.home_environment_lifecycle(spec, checkout, bun, node)
+            return
         if operator_inputs:
             self.operator_lifecycle(spec, checkout, bun, node, staging=staging)
             return
@@ -1054,6 +1071,64 @@ class RealCookTests(unittest.TestCase):
         else:
             # Old gitHead-only builds did not have this role-owned sidecar.
             self.assertEqual(deployment._lock(self.build)['build'], record['build'])
+
+    def home_environment_lifecycle(self, spec, checkout, bun, node):
+        """Simulate manager EnvironmentFile delivery, then execute real run.sh.
+
+        This is not a live-systemd qualification. HOME is operator infrastructure
+        in a separate private file, not a cook requirement or a secret value.
+        """
+        config = spec['config']
+        secrets = Path(config['secrets_file'])
+        secrets.parent.mkdir(mode=0o700)
+        secrets.write_text('{}')
+        secrets.chmod(0o600)
+        build_home = self.work / 'build-home'; build_home.mkdir(mode=0o700)
+        runtime_home = self.work / 'runtime home'; runtime_home.mkdir(mode=0o700)
+        private_env = self.work / 'private-home.env'
+        private_env.write_text('HOME="' + str(runtime_home) + '"\n')
+        private_env.chmod(0o600)
+        cook = [sys.executable, str(ROOT / 'scripts/cook-adapter.py'),
+                '--runtime', str(Path(bun).absolute()), '--entrypoint', str(checkout / 'bin/cook'),
+                '--bun-path', str(Path(bun).absolute()), '--node-path', str(Path(node).absolute()),
+                '--spec', '{recipe}', '--out', '{build_dir}', '--state', '{state_dir}']
+        root = self.build.parent.parent
+        systemctl = [sys.executable, str(ROOT / 'tests/fixtures/systemctl.py'), str(root)]
+        with patch.dict(os.environ, {'HOME': str(build_home), 'GIT_ALLOW_PROTOCOL': 'file'}):
+            dep = Deployment(root, self.work / 'units', config, {'runtime': spec['pins']['runtime']},
+                             cook, systemctl)
+            dep.prepare()
+            dep.activate({})
+        unit = dep.unit_dir / 'connectome-example.service'
+        private_dropin = unit.parent / (unit.name + '.d') / '95-private-home.conf'
+        private_dropin.write_text('[Service]\nEnvironmentFile=' + str(private_env) + '\n')
+        private_dropin.chmod(0o600)
+        bodies = [unit.read_text(), *(path.read_text() for path in sorted(private_dropin.parent.glob('*.conf')))]
+        # Fail on any explicit HOME assignment, not only the common unquoted
+        # spelling. Check cook's export and every installed role/private drop-in.
+        for body in bodies:
+            for line in body.splitlines():
+                if line.startswith('Environment='):
+                    self.assertFalse(any(word.partition('=')[0] == 'HOME'
+                                         for word in shlex.split(line.partition('=')[2])))
+        self.assertIn('WorkingDirectory=' + str(dep.state_dir) + '\n', bodies[0])
+        self.assertIn('EnvironmentFile=' + str(private_env) + '\n', bodies[-1])
+        environment = {key: os.environ[key] for key in ('PATH',) if key in os.environ}
+        # Parse only the single quoted assignment used by this synthetic file;
+        # this deliberately is not a general systemd EnvironmentFile parser.
+        name, value = shlex.split(private_env.read_text())[0].split('=', 1)
+        environment[name] = value
+        launcher = next(line.partition('=')[2] for line in bodies[0].splitlines()
+                        if line.startswith('ExecStart='))
+        observed = dep.state_dir / 'environment-observed.json'
+        # Even a different initial cwd cannot override run.sh's cd layout.state.
+        for initial_cwd in (dep.state_dir, self.work):
+            observed.unlink(missing_ok=True)
+            subprocess.run(shlex.split(launcher), cwd=initial_cwd, env=environment,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=30)
+            self.assertEqual(json.loads(observed.read_text()), {
+                'home': str(runtime_home), 'cwd': str(dep.state_dir), 'data_dir': str(dep.state_dir)})
+        self.assertFalse((self.work / observed.name).exists())
 
     def operator_lifecycle(self, spec, checkout, bun, node, staging=False):
         from connectome_inputs import collect
