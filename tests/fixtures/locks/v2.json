@@ -1,0 +1,46 @@
+{
+  "version": 2,
+  "backend": "host",
+  "cook": {
+    "version": "0.0.1"
+  },
+  "recipe": {
+    "path": "/tmp/connectome-example/recipe.json",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "recipePath": "/tmp/connectome-example/recipe.json",
+  "createdAt": "2026-11-09T00:00:00.000Z",
+  "build": {
+    "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "dir": "/tmp/connectome-example/build"
+  },
+  "connectomeHost": {
+    "url": "https://example.invalid/host.git",
+    "ref": "cccccccccccccccccccccccccccccccccccccccc",
+    "commit": "cccccccccccccccccccccccccccccccccccccccc",
+    "path": "/tmp/connectome-example/build/app"
+  },
+  "components": [],
+  "localExtensions": [],
+  "requirements": [
+    {
+      "name": "EXAMPLE_SECRET",
+      "envName": "EXAMPLE_SECRET",
+      "origin": "unresolved"
+    }
+  ],
+  "credentials": [
+    "EXAMPLE_SECRET"
+  ],
+  "outputs": [
+    {
+      "path": "run.sh",
+      "mode": 448,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "launch": {
+    "kind": "script",
+    "script": "/tmp/connectome-example/build/run.sh"
+  }
+}

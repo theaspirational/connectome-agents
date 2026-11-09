@@ -25,9 +25,9 @@ for section in ('connectors', 'modules'):
         names.update(entry.get('required_secrets', []))
 lock = {
     'version': 2, 'backend': 'host',
-    'cook': {'version': 'test-only'},
+    'cook': {'version': '0.0.0-test-only'},
     'recipe': {'path': str(recipe), 'sha256': hashlib.sha256(recipe.read_bytes()).hexdigest()},
-    'recipePath': str(recipe), 'createdAt': 'test-only',
+    'recipePath': str(recipe), 'createdAt': '2026-11-09T00:00:00.000Z',
     'build': {'id': hashlib.sha256(recipe.read_bytes()).hexdigest(), 'dir': str(out)},
     'connectomeHost': {'url': 'https://example.invalid/runtime.git',
                        'ref': spec['pins']['runtime']['connectome-host'],

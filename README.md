@@ -4,17 +4,20 @@ Reusable, public Ansible role for cook materialization and transactional systemd
 **user** deployment. Agent configuration, inventories and secret values belong
 in a separate private repository. The only example agent is `example`.
 
-## Stage 1 status
+## Stage 2 status
 
 - Four-layer recursive merge with null deletion and disabled-entry removal.
 - Immutable request directories, validated host lock v2, exact-name secret lookup,
   private env files, user units, atomic `current` switch, health and rollback.
-- Offline tests use a mock secret provider, stub cook and fake systemctl.
+- Offline lifecycle tests use a mock secret provider and fake systemctl.
+  Adapter unit tests and a prerequisite-gated real-cook local build are separate.
 - Pins are supplied upstream HEADs, **not compatibility-tested releases**.
   The terminal connector has no trusted pin; enabling it fails closed.
-- A private cook adapter is required: the deployment input is a normalized spec,
-  not a stock cook recipe. There is no claim that the pinned main-branch cook
-  emits PR #14's v2 lock. See the [contract](docs/lock-contract.md) before use.
+- A bundled production adapter translates the normalized spec to the reviewed
+  cook fork's host CLI and validates its real v2 lock. Configure executable paths,
+  native launch settings and a pinned framework archive explicitly. See the
+  [contract](docs/lock-contract.md); absent offline prerequisites skip the real
+  build test, not a claim of compatibility qualification.
 
 ## Threat model
 
@@ -43,7 +46,7 @@ must be trusted. There is no fd/openat race-hardening claim. See the
 2. Install Python 3.9+ on the target and ansible-core on the controller. Tests
    and the publication checker need the already-installed PyYAML. No collections
    are vendored.
-3. Supply `connectome_cook_command` as an argv list for a pinned cook adapter,
+3. Supply `connectome_cook_command` as an argv list for the bundled pinned cook adapter,
    and select a secret lookup provider. Never put secret values in role vars.
 4. Run the private playbook as the service account, not as a privileged account.
    Its user service manager must be available (session/lingering is an operator

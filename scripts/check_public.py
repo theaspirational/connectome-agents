@@ -17,7 +17,7 @@ EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[A-Za-z0-9](?:[A-Za-z0-
 ALLOWED_REPOS = {
     'anima-research': {'connectome-host', 'agent-framework', 'connectome-cook',
                        'slack-mcpl', 'github-mcpl', 'terminal-sessions-mcp'},
-    'theaspirational': {'telegram-bot-mcpl'},
+    'theaspirational': {'telegram-bot-mcpl', 'connectome-cook'},
     'antra-tess': {'zulip_mcp'},
 }
 

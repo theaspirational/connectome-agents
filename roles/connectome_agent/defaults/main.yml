@@ -8,7 +8,7 @@ connectome_group: {}
 connectome_agent: {}
 connectome_versions_file: "{{ role_path }}/../../versions.yml"
 # Adapter command argv; placeholders: {recipe}, {build_dir}, {state_dir}.
-# Install an adapter backed by the pinned cook; see docs/lock-contract.md.
+# Configure scripts/cook-adapter.py and explicit engines; see docs/lock-contract.md.
 connectome_cook_command: []
 connectome_systemctl: [systemctl, --user]
 connectome_secret_lookup: connectome_file

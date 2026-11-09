@@ -1,54 +1,68 @@
 # Lock v2 contract and cook boundary
 
-Source inspected offline: `anima-research/connectome-cook` PR #14,
-`src/lockfile.ts` and `src/lockfile-v2.test.ts` at commit abbreviation `67112f6c`,
-and the lifecycle RFC at `fb14e2be`. No upstream compatibility build was run.
-The pinned default-branch cook is not asserted to contain that PR.
+Source inspected offline: [the public cook fork](https://github.com/theaspirational/connectome-cook),
+commit `7955a3132cb54ee975e5a672578cf8922abc6e22` (the supplied fork main
+has the same tree). In particular: `src/lockfile.ts`, `src/cli.ts`,
+`src/backends/host.ts`, and the engine/layout/unit/dependency documentation.
+This is a source compatibility target, **not** a claim of a completed live-host
+qualification. The offline real-cook test reports whether prerequisites let it run.
 
-## What this layer consumes
+## What cook emits and this layer consumes
 
-| Field | Status in inspected #14 | Consumer contract |
+| Field | Emission at inspected commit | Consumer contract |
 | --- | --- | --- |
-| `version` | emitted | exactly `2`; v1 and unknown versions refused |
+| `version` | emitted | exactly integer `2`; v1 and unknown versions refused |
 | `backend` | emitted | exactly `host` |
-| `build.id` | emitted | 64 lowercase hex, cook's input-derived identity |
-| `build.dir` | emitted | absolute materialization directory, must equal the requested fresh directory |
-| `connectomeHost.commit` | emitted on host | equals requested full host pin |
-| `requirements[]` | emitted | records with exactly string `name`, `envName`, `origin`; never `value` |
-| `credentials[]` | emitted | string names only; conservative superset including non-secret/alternative names |
-| `launch` | emitted | `{kind: "script", script: "..."}`; script must exist within build directory |
-| `units[]` | **planned**, not emitted | optional `{path, sha256}`; relative/contained `.service` paths and matching SHA-256; otherwise render a generic unit for `launch.script` |
-| `health` | **planned**, not emitted | optional `{command: [executable, arg, ...]}` after `systemctl --user is-active`; fallback to effective agent `health` |
-| `state.path` | optional type, **planned emission** | persistent location within the agent root, outside `build.dir`; absent in #14 tests; adapter receives an explicit state directory |
+| `cook` | `{version}` | package version; optional commit type exists but writer does not emit it |
+| `recipe`, `recipePath`, `createdAt` | emitted | root path and exact-source SHA-256, original recipe path, timestamp |
+| `build.id`, `build.dir` | emitted | 64 lowercase hex identity; absolute directory must equal requested fresh build |
+| `connectomeHost` | emitted | URL/ref/path/actual full commit; commit must equal requested host pin |
+| `components[]` | emitted | discriminated Git/npm provenance; adapter accepts only requested pinned Git MCP sources |
+| `requirements[]` | emitted | exactly string `name`, `envName`, `origin`; no resolved answers or `value` |
+| `credentials[]` | emitted | names only; conservative superset including provider alternatives and file-field names |
+| `outputs[]` | emitted | path/mode, optional SHA-256; sensitive outputs have no hash; matched requirement answers use `sha256Omitted: contains-requirement-value` |
+| `localExtensions[]` | emitted | source directory/entry inventory, not lifecycle state |
+| `launch` | emitted | `{kind: script, script: absolute-path, userUnit?: absolute-path}` |
+| `launch.userUnit` | emitted when exporting | contained `.service` file; adapter/role maps it to a path/SHA-256 unit record without rewriting the lock |
+| `engines` | emitted with selected engines | Bun/Node path, realPath and observed version |
+| `layout`, `state.path` | emitted with split layout | explicit roots/bindings and persistent state outside build |
+| `hostDependencies` | emitted with local inputs | archive hash/version/size/snapshot and package.json policy delta |
+| `incomplete` | emitted on interrupted/failed reconcile | always refused for deployment |
+| `units[]` | **planned** deployment extension, not emitted | optional contained path/SHA-256 records; mutually exclusive with exported unit hint |
+| `health` | **planned** deployment extension, not emitted | optional command argv; otherwise effective agent health |
 
-The inspected source and tests actually emit `build.id/dir`; these are **not**
-planned in that revision. Neither the RFC's prospective fields nor optional
-TypeScript fields alone are evidence of emission. This layer does not invent
-units/health/state fields in real locks. The optional units/health interpretation
-above is an explicitly **planned deployment extension**, not a claim of an
-upstream schema already agreed. Unknown lock fields are ignored.
+Cook itself reads v1 and v2; **this layer accepts v2 only**. The shared reader
+rejects missing required fields, invalid types, requirement answer fields,
+credential objects/assignments, credential-bearing URLs, recognizable token/key
+values, incomplete installs and unknown top-level fields. Errors never echo the
+suspected value. Required secret names must be covered by credentials or
+requirement env names. No generic string detector can prove an arbitrary string
+is not a secret: trusted configuration/provenance must never contain literals.
+The schema checks and isolated build environment are the primary boundary.
 
-Other emitted fields (`cook`, `recipe`, `components`, `outputs`, `createdAt`,
-`localExtensions`, etc.) remain upstream provenance and are not lifecycle state.
-This layer does not hash secret env files or resolve lock requirement values.
-The adapter must verify cook/framework/component provenance; this layer verifies
-the host pin and validates all supplied runtime/active connector pins before
-invocation, but cannot independently attest an arbitrary installed executable.
+Cook's outputs are an explicit inventory, not a filesystem attestation.
+`.env` is mode-only, never hashed. Build identity includes recipe bytes, transitive
+recipe provenance and component pins/options, but excludes the new engine/unit/
+layout/dependency extensions. The role's request identity includes the full
+normalized configuration and adapter argv instead. Neither identity is rewritten.
 
-## Input, invocation and identities
+## Production adapter
 
-`connectome_cook_command` is an argv array, with Python format placeholders:
-
-- `{recipe}`: private normalized `deployment.json`, not a stock cook recipe;
-- `{build_dir}`: a newly created empty request build directory (apart from spec);
-- `{state_dir}`: persistent agent state, outside the build directory.
-
-Example wiring (the adapter is deliberately private, not a claimed stock CLI):
+`scripts/cook-adapter.py` is the bundled adapter. Configure **all** executable
+paths; there are no host-specific defaults:
 
 ```yaml
 connectome_cook_command:
   - python3
-  - ./cook-adapter.py
+  - /absolute/public/scripts/cook-adapter.py
+  - --runtime
+  - /absolute/bin/bun
+  - --entrypoint
+  - /absolute/cook/bin/cook
+  - --bun-path
+  - /absolute/bin/bun
+  - --node-path
+  - /absolute/bin/node
   - --spec
   - '{recipe}'
   - --out
@@ -57,30 +71,92 @@ connectome_cook_command:
   - '{state_dir}'
 ```
 
-Use an absolute adapter path in actual inventory: its working directory is the
-build directory. Literal braces in command arguments must be doubled.
+Use immutable absolute paths on the target (the command's CWD is the build).
+The entrypoint must be a clean source checkout's `bin/cook`, at the requested
+cook pin and with the reviewed tree. Install its dependencies separately; the
+adapter does not bootstrap/download tools. Runtime must execute this source
+entrypoint (normally Bun). Selected Bun and Node are separately passed to cook
+and verified by cook against the acquired host's engine requirements.
 
-The JSON spec is `{config: <merged/pruned agent>, pins: {runtime, connectors}}`.
-Adapter obligations:
+The normalized input remains `{config: <merged/pruned agent>, pins: {runtime,
+connectors}}`. The role's four-layer merge is unchanged. Supply these additional
+nonsecret effective agent fields:
 
-1. Use the exact pinned cook, host, framework and connector commits. Never scan
-   the unfiltered catalog, build disabled entries, or import disabled modules.
-2. Translate descriptor `repo`, `build` argv lists, `settings`, and modules to
-   that cook version's recipe/host interface. Public connector build commands
-   are candidates and have not been verified against upstream source offline.
-3. Run cook's one-shot host materialization in the supplied build directory;
-   do not start or enable services. Emit its real `connectome.lock` v2 there.
-4. Bind all mutable runtime data to `{state_dir}`, not to a build. Do not pass
-   actual secret values to cook. Runtime secret names must appear in lock
-   requirements/credentials and be explicitly declared in `required_secrets`.
-5. Leave `launch.script` runnable within the build. If it sources an upstream
-   `.env`, it must not override the deployment-provided environment.
+```yaml
+agent:
+  systemPrompt: Example agent instructions.
+  provider: openai-codex
+cook:
+  host_repo: https://github.com/anima-research/connectome-host.git
+  framework_archive:
+    path: /absolute/inputs/agent-framework.tgz
+    sha256: REPLACE_WITH_REVIEWED_ARCHIVE_SHA256
+  connector_state: {}
+```
 
-An unset command fails closed. This is an explicit integration boundary because
-stock recipe/CLI changes and PR-only lock output cannot be verified offline.
-The reusable lifecycle is complete at this boundary; a production cook adapter
-and compatibility run are still required. The test stub implements the boundary
-without network access, but is not a production cook implementation.
+The framework archive must be a cook-compatible local gzip/ustar npm archive,
+with the framework package name and `package.json.gitHead` equal to the requested
+framework commit. Supply a trusted, authenticated archive/hash pair; `gitHead`
+is an artifact provenance assertion, **not source authentication**. Cook checks
+its name/version against the host range and binds all same-name Bun lock entries
+to the hash-pinned archive before recording `hostDependencies`. Other transitive
+dependencies are not a frozen closure. Build tools and archives remain trusted.
+
+Enabled connector descriptors need native cook MCP settings (`command`, `args`,
+`env`, etc.); the public catalog's empty candidate settings deliberately fail
+until supplied. `repo` and the resolved full commit become `source.url/ref`;
+`build` argv lists are individually shell-quoted and joined with `&&` into cook's
+custom install command. Each source has an explicit unique `/connectors/NAME`
+materialization path. `pin_ref` must be `connectors.NAME`. Module `settings` map
+to native host module settings (empty settings enable the module); source-backed
+modules/extensions are refused rather than silently ignored. No catalog scan,
+disabled import, fleet walk, inferred launch command, credential file or sidecar
+is added. Budgets remain role request metadata, not a claimed upstream mapping.
+
+The actual invocation is `RUNTIME ENTRYPOINT install RECIPE --out BUILD
+--no-prompts --yes --strict --ch-repo REPO --ch-ref HOST_SHA --bun-path BUN
+--node-path NODE --layout LAYOUT --host-dependency NAME=ARCHIVE#sha256=HASH
+--user-unit connectome-NAME.service`.
+The exported unit uses cook's headless launcher; only the role installs/activates it.
+No `--env-file`, service start, enable or prompt is used. Full component refs
+are supplied directly; `--pin-refs` is unnecessary. Only PATH/HOME/locale/temp
+infrastructure variables reach cook; arbitrary inherited env, COOK_PASS_ENV,
+preloads, Git overrides and secret values are excluded. Tool output is redacted.
+
+Every explicit `required_secrets` name becomes an optional, unresolved cook
+requirement with `exposeAs` (optional only at build time). Runtime secret env
+settings must be `${NAME}`, with no literal or default. No secret provider is
+called until the role validates the returned lock. The adapter refuses unexpected
+nonempty generated `.env`, so cook's sourcing cannot override runtime secret
+delivery. Operators must also keep literals out of prompts/settings/provenance.
+
+Split layout binds host state/CWD to `{state_dir}` and workspace to its sibling
+`workspace/`; per-request config and reserved empty credentials roots live under
+sibling `cook-config/REQUEST` and `cook-credentials/REQUEST`. All are outside the
+immutable build. Declare connector file state explicitly in `connector_state`;
+other application paths are not guessed. Cook requires private, non-overlapping
+roots with safe ancestors; consult its layout documentation. Runtime launches,
+child Bun autoload and operator absolute overrides need separate audits. The
+adapter checks returned layout, framework hash and exact component commits.
+
+## Offline tests
+
+Schema fixtures are recorded synthetic/anonymized cases, not claimed live-build
+captures. Unit doubles test invocation separately. `RealCookTests` uses the exact
+reviewed cook tree, real Git, real Bun/Node and real dependency installation for a
+tiny all-local host/framework recipe; it never replaces those tools. Set
+`CONNECTOME_TEST_COOK_SOURCE` to a local clone containing the reviewed commit,
+`CONNECTOME_TEST_COOK_DEPS` to an already-installed cook `node_modules` directory,
+and `CONNECTOME_TEST_BUN` to an installed Bun binary. Optional
+`CONNECTOME_TEST_NODE` selects Node; discovery also checks PATH and
+`/opt/node/bin/node`. Dependencies (including transitives) are copied, not
+symlinked, into a clean temporary checkout at the pinned commit. Tests never
+install cook dependencies or download runtimes. Run with a private 0700 `TMPDIR`
+under non-group-writable ancestors owned by the current user (or root), not the
+worktree hierarchy: cook rejects unsafe ancestors of split-layout roots.
+Missing prerequisites produce an explicit unittest skip reason. Available
+prerequisites followed by a failed build are a failure, not a skip. Unit scratch remains under the ignored worktree `.cache/`; the real-cook
+checkout, empty HOME and split-layout roots use `TMPDIR` and are cleaned up.
 
 Directory names use a **deployment request ID**: SHA-256 of the canonical merged
 spec, resolved pins and adapter argv. That is separate from cook's `build.id`,
@@ -96,7 +172,7 @@ content requires changing its immutable path/argv (or another request input).
 
 The explicit `required_secrets` name set is verified against the union of lock
 `credentials` and `requirements[].envName`. Only this explicit set is fetched;
-#14's conservative credentials superset must **not** cause lookup of every
+Cook's conservative credentials superset must **not** cause lookup of every
 alternative name. Missing declared names fail before activation. Declare any
 runtime-level secret in the agent's `required_secrets`, not just connectors.
 The provider result must have exactly this set, no extra keys.

@@ -9,6 +9,11 @@ import stat
 import subprocess
 import tempfile
 
+try:
+    from ansible.module_utils.connectome_lock import read_lock, LockError
+except ImportError:
+    from connectome_lock import read_lock, LockError
+
 
 class DeployError(Exception):
     pass
@@ -157,30 +162,12 @@ class Deployment:
     def _lock(self, build=None):
         build = build or self.build
         inside(self.builds, build)
-        data = json.loads(inside(build, 'connectome.lock').read_text())
-        if data.get('version') != 2 or data.get('backend') != 'host':
-            raise DeployError('host lock v2 required')
-        identity = data.get('build', {})
-        if (not re.fullmatch(r'[a-f0-9]{64}', identity.get('id', '')) or
-                Path(identity.get('dir', '')).resolve() != build.resolve()):
-            raise DeployError('lock build identity/directory mismatch')
-        requirements = data.get('requirements')
-        if not isinstance(requirements, list) or any(
-                not isinstance(r, dict) or set(r) != {'name', 'envName', 'origin'} or
-                not all(isinstance(v, str) for v in r.values()) for r in requirements):
-            raise DeployError('requirements must be names-only v2 records')
-        credentials = data.get('credentials', [])
-        # v2 credentials are a conservative superset, not always secrets.
-        # Only explicit operator-declared names are resolved; no discovery lookup.
-        if not isinstance(credentials, list) or any(not isinstance(n, str) for n in credentials):
-            raise DeployError('invalid credential names')
-        declared = set(credentials) | {r['envName'] for r in requirements}
-        if build == self.build and not set(self.names).issubset(declared):
-            raise DeployError('lock omits a declared required secret')
-        host_commit = data.get('connectomeHost', {}).get('commit')
-        if (not isinstance(host_commit, str) or not re.fullmatch(r'[a-f0-9]{40}', host_commit) or
-                (build == self.build and host_commit != self.pins['runtime']['connectome-host'])):
-            raise DeployError('lock host pin differs from request')
+        try:
+            data = read_lock(inside(build, 'connectome.lock'),
+                             host_pin=self.pins['runtime']['connectome-host'] if build == self.build else None,
+                             required_names=self.names if build == self.build else ())
+        except LockError as error:
+            raise DeployError(str(error)) from None
         state = data.get('state')
         if state:
             path = inside(self.root, state['path'])

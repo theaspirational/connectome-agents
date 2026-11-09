@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "backend": "host",
+  "recipePath": "/tmp/connectome-example/recipe.json",
+  "createdAt": "2026-11-09T00:00:00.000Z",
+  "connectomeHost": {
+    "url": "https://example.invalid/host.git",
+    "ref": "cccccccccccccccccccccccccccccccccccccccc",
+    "commit": "cccccccccccccccccccccccccccccccccccccccc",
+    "path": "/tmp/connectome-example/build/app"
+  },
+  "components": [],
+  "localExtensions": [],
+  "requirements": [
+    {
+      "name": "EXAMPLE_SECRET",
+      "envName": "EXAMPLE_SECRET",
+      "origin": "unresolved",
+      "value": "synthetic-legacy-answer"
+    }
+  ],
+  "launch": {
+    "kind": "script",
+    "script": "/tmp/connectome-example/build/run.sh"
+  }
+}
