@@ -15,7 +15,10 @@ in a separate private repository. The only example agent is `example`.
   The terminal connector has no trusted pin; enabling it fails closed.
 - A bundled production adapter translates the normalized spec to the reviewed
   cook fork's host CLI and validates its real v2 lock. Configure executable paths,
-  native launch settings and a pinned framework archive explicitly. See the
+  native launch settings and a hash-pinned framework archive explicitly. Registry
+  archives without gitHead require an explicit release declaration and matching
+  package name/version; plans record that the commit was not verifiable. Safe
+  typed adapter diagnostics are visible in the prepare task. See the
   [contract](docs/lock-contract.md); absent offline prerequisites skip the real
   build test, not a claim of compatibility qualification.
 

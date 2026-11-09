@@ -1,7 +1,8 @@
 #!/usr/bin/python
 """Ansible boundary for the shared, offline-tested deployment engine."""
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.connectome_deploy import Deployment, DeployError
+from ansible.module_utils.connectome_deploy import Deployment
+from ansible.module_utils.connectome_errors import SafeError, diagnostic
 import fcntl
 
 
@@ -34,12 +35,13 @@ def main():
             with open(deployment.lock_path(), 'a') as stream:
                 fcntl.flock(stream, fcntl.LOCK_EX)
                 result = execute()
-    except DeployError as error:
-        # Engine diagnostics are fixed strings, never config/secret values.
-        module.fail_json(msg=str(error))
+    except SafeError as error:
+        # Suppress Ansible's implicit argv/config invocation and debug traceback
+        # as well as raw tool output, including under verbose callbacks.
+        module.fail_json(invocation={}, exception=None, **error.public())
     except Exception:
         # Config, tool and provider exceptions must never expose secret values.
-        module.fail_json(msg='deployment failed; previous build retained/restored where possible; inspect private logs')
+        module.fail_json(invocation={}, exception=None, **diagnostic('E_DEPLOY_FAILED'))
     module.exit_json(**result)
 
 

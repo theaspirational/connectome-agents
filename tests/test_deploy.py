@@ -80,6 +80,35 @@ class DeployTests(unittest.TestCase):
                 p.read_bytes() if p.is_file() else None)
                 for p in [path, *path.rglob('*')]}
 
+    def test_registry_archive_plan_and_retained_sidecar(self):
+        from test_cook import framework_archive
+        from connectome_archive import FRAMEWORK
+        artifact = framework_archive(Path(self.tmp.name) / 'release.tgz', None, version='0.32.0')
+        artifact.update(registry_release=True, name=FRAMEWORK, version='0.32.0')
+        config = copy.deepcopy(self.config)
+        config['cook'] = {'framework_archive': artifact}
+        deployment = self.deployment(config, check=True)
+        before = deployment.prepare()['plan']['framework_archive']
+        self.assertFalse(before['commit_verifiable'])
+        self.assertEqual(before['name'], FRAMEWORK)
+        self.assertEqual(before['version'], '0.32.0')
+        self.assertEqual(before['requested_commit'], self.versions['runtime']['agent-framework'])
+        self.assertFalse(self.root.exists())  # check-mode does not write the sidecar
+        # Retained build plans use the validated sidecar, not an input archive
+        # that may no longer be provisioned at its original location.
+        deployment.build.mkdir(parents=True)
+        (deployment.build / 'framework.lock.json').write_text(json.dumps(before))
+        (deployment.build / '.prepared').write_text(deployment.request_id)
+        Path(artifact['path']).unlink()
+        self.assertEqual(deployment.plan()['framework_archive'], before)
+
+    def test_secrets_permissions_report_typed_code(self):
+        Path(self.config['secrets_file']).chmod(0o644)
+        with self.assertRaises(DeployError) as error:
+            self.deployment().prepare()
+        self.assertEqual(error.exception.code, 'E_SECRETS_MODE')
+        self.assertFalse(self.root.exists())
+
     def test_rebuild_and_rollback_leave_external_state_untouched(self):
         state = Path(self.config['state_dir'])
         state.mkdir(mode=0o700)
@@ -452,6 +481,7 @@ class DeployTests(unittest.TestCase):
             modules = {
                 'ansible.module_utils.basic': SimpleNamespace(AnsibleModule=Mock(return_value=module)),
                 'ansible.module_utils.connectome_deploy': sys.modules['connectome_deploy'],
+                'ansible.module_utils.connectome_errors': sys.modules['connectome_errors'],
             }
             spec = importlib.util.spec_from_file_location(
                 'release_boundary', ROOT / 'roles/connectome_agent/library/connectome_release.py')

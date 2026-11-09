@@ -4,30 +4,29 @@ Invoked by scripts/cook-adapter.py. No service activation and no secret lookup.
 """
 import argparse
 from copy import deepcopy
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
-import tarfile
+import tempfile
 
 from connectome_deploy import secret_names, validate_config, resolve_pins, DeployError
 from connectome_lock import read_lock, LockError, text, credential_shaped, repository
+from connectome_errors import SafeError, diagnostic, cook_code_from_stream
+from connectome_archive import FRAMEWORK, ArchiveError, framework_provenance
 
 COOK_COMMIT = '28236dd51045c99604ddc7ba6a2eb0c02679fd3d'
-FRAMEWORK = '@' + 'animalabs/agent-framework'
 BASE_ENV = {'PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'}
 
 
-class AdapterError(ValueError):
-    pass
+AdapterError = ArchiveError
 
 
-def need(condition, message):
+def need(condition, message, code='E_ADAPTER_INPUT'):
     if not condition:
-        raise AdapterError(message)
+        raise AdapterError(message, code)
 
 
 def validate_arguments(argv, flag_indices=()):
@@ -40,10 +39,19 @@ def validate_arguments(argv, flag_indices=()):
 
 def command(argv, cwd=None, env=None, capture=False, flag_indices=()):
     validate_arguments(argv, flag_indices)
-    result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, check=False)
-    need(result.returncode == 0, 'cook adapter command failed (output redacted)')
+    # Capture privately and scan with bounded memory. No raw output or
+    # exception containing argv ever crosses the adapter boundary.
+    with tempfile.TemporaryFile() as errors:
+        try:
+            result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                                    stderr=errors, check=False)
+        except OSError:
+            raise AdapterError('local command unavailable', 'E_COOK_FAILED') from None
+        if result.returncode:
+            upstream = cook_code_from_stream(errors) if not capture else None
+            raise AdapterError('cook adapter command failed (output redacted)',
+                               'E_COOK_FAILED', upstream)
     return result.stdout if capture else None
 
 
@@ -106,7 +114,7 @@ def recipe_from_spec(spec):
     need(resolve_pins(config, versions) == pins, 'normalized pins required')
     if config.get('budgets'):
         raise AdapterError('step/cost budgets not supported by host recipe schema at ' +
-                           pins['runtime']['connectome-host'] + '; remove budgets explicitly')
+                           pins['runtime']['connectome-host'] + '; remove budgets explicitly', 'E_BUDGETS_UNSUPPORTED')
     agent = config.get('agent')
     need(isinstance(agent, dict) and isinstance(agent.get('systemPrompt'), str) and agent['systemPrompt'],
          'agent.systemPrompt is required by cook')
@@ -150,28 +158,10 @@ def recipe_from_spec(spec):
 
 
 def framework_input(config, pin):
-    """Trusted artifact/hash pair with npm's gitHead provenance assertion.
-
-    Cook itself validates name/version/range and the installed Bun lock graph.
-    A gitHead assertion is not source authentication; operators must attest the
-    archive/hash pair, just as they attest runtime executables and build tools.
-    """
+    """Compatibility helper; provenance is recorded separately from cook's lock."""
+    framework_provenance(config, pin)
     artifact = config['cook']['framework_archive']
-    need(isinstance(artifact, dict) and set(artifact) == {'path', 'sha256'},
-         'cook.framework_archive requires path and sha256')
-    path = absolute_path(artifact['path'])
-    need(path.is_absolute() and path.is_file() and not path.is_symlink(),
-         'framework archive must be an absolute regular file')
-    need(isinstance(artifact['sha256'], str) and re.fullmatch(r'[a-f0-9]{64}', artifact['sha256']) and
-         hashlib.sha256(path.read_bytes()).hexdigest() == artifact['sha256'], 'framework archive hash mismatch')
-    with tarfile.open(path, 'r:gz') as archive:
-        manifests = [member for member in archive.getmembers()
-                     if re.fullmatch(r'[^/]+/package.json', member.name) and member.isfile()]
-        need(len(manifests) == 1 and manifests[0].size <= 1024 * 1024, 'framework archive manifest required')
-        manifest = json.load(archive.extractfile(manifests[0]))
-    need(manifest.get('name') == FRAMEWORK and manifest.get('gitHead') == pin,
-         'framework archive gitHead differs from requested pin')
-    return FRAMEWORK + '=' + str(path) + '#sha256=' + artifact['sha256']
+    return FRAMEWORK + '=' + artifact['path'] + '#sha256=' + artifact['sha256']
 
 
 def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_path):
@@ -197,7 +187,10 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     need(set(settings) == {'host_repo', 'framework_archive', 'connector_state'},
          'cook requires host_repo, framework_archive and explicit connector_state')
     need(repository(settings['host_repo']), 'cook.host_repo requires a safe HTTPS, SSH/scp or absolute local repository')
-    dependency = framework_input(config, pins['agent-framework'])
+    provenance = framework_provenance(config, pins['agent-framework'])
+    artifact = settings['framework_archive']
+    dependency = FRAMEWORK + '=' + artifact['path'] + '#sha256=' + artifact['sha256']
+    (build / 'framework.lock.json').write_text(json.dumps(provenance, sort_keys=True, indent=2) + '\n')
     recipe_path = build / 'cook-recipe.json'
     recipe_path.write_text(json.dumps(recipe, sort_keys=True, indent=2) + '\n')
     # Config/credentials are per-request, state/workspace persist. All roots
@@ -229,14 +222,15 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     command(argv, cwd=build, env=env, flag_indices=flag_indices)
     lock = read_lock(build / 'connectome.lock', host_pin=pins['connectome-host'], required_names=names)
     need(lock.get('layout') == layout and lock.get('state') == {'path': str(state)},
-         'cook lock did not preserve the requested persistent layout')
+         'cook lock did not preserve the requested persistent layout', 'E_LOCK_STATE_PATH')
     expected = {(entry['repo'], spec['pins']['connectors'][name])
                 for name, entry in config.get('connectors', {}).items()}
     actual = {(entry.get('url'), entry.get('commit')) for entry in lock['components']}
     need(actual == expected and all(c['kind'] == 'git' and c['role'] == 'mcp' for c in lock['components']),
          'cook component provenance differs from enabled inputs')
-    need(any(d.get('name') == FRAMEWORK and d.get('sha256') == settings['framework_archive']['sha256']
-             for d in lock.get('hostDependencies', [])), 'cook omitted pinned framework input')
+    need(any(d.get('name') == FRAMEWORK and d.get('version') == provenance['version'] and
+             d.get('sha256') == settings['framework_archive']['sha256']
+             for d in lock.get('hostDependencies', [])), 'cook omitted pinned framework input', 'E_LOCK_INVALID')
     # No values were supplied. Refuse unexpected value-bearing generated env,
     # so run.sh cannot override the role's runtime EnvironmentFile secrets.
     env_file = Path(layout['config']) / '.env'
@@ -244,14 +238,21 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     return lock
 
 
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, json.dumps(diagnostic('E_ADAPTER_INPUT')) + '\n')
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = SafeParser(description=__doc__)
     for option in ('spec', 'out', 'state', 'runtime', 'entrypoint', 'bun-path', 'node-path'):
         parser.add_argument('--' + option, required=True)
     args = parser.parse_args()
     try:
         adapt(args.spec, args.out, args.state, args.runtime, args.entrypoint, args.bun_path, args.node_path)
-    except (AdapterError, LockError, DeployError) as error:
-        parser.exit(1, str(error) + '\n')
+    except SafeError as error:
+        parser.exit(1, json.dumps(error.public()) + '\n')
+    except LockError:
+        parser.exit(1, json.dumps(diagnostic('E_LOCK_INVALID')) + '\n')
     except Exception:
-        parser.exit(1, 'cook adapter failed; malformed input or unavailable local prerequisite (output redacted)\n')
+        parser.exit(1, json.dumps(diagnostic('E_ADAPTER_INPUT')) + '\n')

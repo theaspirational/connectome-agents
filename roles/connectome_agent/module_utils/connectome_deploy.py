@@ -12,11 +12,15 @@ import tempfile
 
 try:
     from ansible.module_utils.connectome_lock import read_lock, LockError
+    from ansible.module_utils.connectome_errors import SafeError, adapter_diagnostic
+    from ansible.module_utils.connectome_archive import framework_provenance, validate_provenance
 except ImportError:
     from connectome_lock import read_lock, LockError
+    from connectome_errors import SafeError, adapter_diagnostic
+    from connectome_archive import framework_provenance, validate_provenance
 
 
-class DeployError(Exception):
+class DeployError(SafeError):
     pass
 
 
@@ -79,12 +83,21 @@ def inside(root, value):
     return path
 
 
-def run(argv, cwd=None):
-    # Never relay stdout/stderr: upstream tools may print resolved credentials.
-    result = subprocess.run(argv, cwd=cwd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, check=False)
-    if result.returncode:
-        raise DeployError('command failed (output redacted)')
+def run(argv, cwd=None, adapter=False):
+    # Only prepare may accept the adapter's closed JSON envelope. Systemctl and
+    # health output cannot impersonate adapter diagnostics.
+    with tempfile.TemporaryFile() as errors:
+        try:
+            result = subprocess.run(argv, cwd=cwd, stdout=subprocess.DEVNULL,
+                                    stderr=errors if adapter else subprocess.DEVNULL, check=False)
+        except OSError:
+            raise DeployError('command unavailable', 'E_COOK_FAILED' if adapter else 'E_DEPLOY_FAILED') from None
+        if result.returncode:
+            if adapter:
+                errors.seek(0)
+                safe = adapter_diagnostic(errors.read(65537))
+                raise DeployError(safe['msg'], safe['error_code'], safe.get('cook_error_code'))
+            raise DeployError('command failed (output redacted)')
 
 
 def secret_names(config):
@@ -206,7 +219,7 @@ class Deployment:
         except OSError:
             valid = False
         if not valid:
-            raise DeployError('secrets file check failed: require non-symlink directory 0700 and regular file 0600, both owned by the agent account (see plan secrets_file); not repaired')
+            raise DeployError('secrets file check failed: require non-symlink directory 0700 and regular file 0600, both owned by the agent account (see plan secrets_file); not repaired', 'E_SECRETS_MODE')
 
     def _read_secrets(self):
         self._check_secrets_file()
@@ -217,8 +230,18 @@ class Deployment:
             raise DeployError('agent secrets file lookup failed (values redacted)') from None
 
     def plan(self):
-        return {'state_dir': str(self.state_dir), 'secrets_file': str(self.secrets_file),
-                'budgets': self.config.get('budgets', {})}
+        result = {'state_dir': str(self.state_dir), 'secrets_file': str(self.secrets_file),
+                  'budgets': self.config.get('budgets', {})}
+        if 'framework_archive' in self.config.get('cook', {}):
+            lock = self.build / 'framework.lock.json'
+            if (self.build / '.prepared').is_file():
+                result['framework_archive'] = (validate_provenance(
+                    json.loads(lock.read_text()), self.config, self.pins['runtime']['agent-framework'])
+                    if lock.is_file() else {'provenance': 'not_recorded_legacy_build'})
+            else:
+                result['framework_archive'] = framework_provenance(
+                    self.config, self.pins['runtime']['agent-framework'])
+        return result
 
     def lock_path(self):
         return inside(self.root, '.deploy-lock')
@@ -231,18 +254,35 @@ class Deployment:
                              host_pin=self.pins['runtime']['connectome-host'] if build == self.build else None,
                              required_names=self.names if build == self.build else ())
         except LockError as error:
-            raise DeployError(str(error)) from None
+            raise DeployError(str(error), 'E_LOCK_INVALID') from None
         state = data.get('state')
         if not state:
-            raise DeployError('cook lock must declare configured external state_dir')
+            raise DeployError('cook lock must declare configured external state_dir', 'E_LOCK_STATE_PATH')
         if state:
             path = Path(state['path'])
             expected = self.state_dir if build == self.build else Path(self._config(build)['state_dir'])
             if not path.is_absolute() or state['path'] != str(expected):
-                raise DeployError('cook state does not match configured state_dir')
+                raise DeployError('cook state does not match configured state_dir', 'E_LOCK_STATE_PATH')
             base_path(path)  # Previous/rollback locks must not alias state either.
             if path.resolve().is_relative_to(self.root.resolve()):
-                raise DeployError('state must be outside deployment root/builds')
+                raise DeployError('state must be outside deployment root/builds', 'E_LOCK_STATE_PATH')
+        config = self.config if build == self.build else self._config(build)
+        if ('framework_archive' in config.get('cook', {}) and
+                ((build / 'framework.lock.json').exists() or
+                 config['cook']['framework_archive'].get('registry_release') is True)):
+            # Legacy gitHead-only builds predate the sidecar; do not adopt the
+            # registry exception without a provenance record.
+            # Use recorded request pin for retained builds, not today's pins.
+            pin = json.loads((build / 'deployment.json').read_text())['pins']['runtime']['agent-framework']
+            try:
+                recorded = json.loads((build / 'framework.lock.json').read_text())
+            except (OSError, ValueError):
+                raise DeployError('framework provenance lock missing or malformed', 'E_LOCK_INVALID') from None
+            expected = validate_provenance(recorded, config, pin)
+            if not any(
+                    dep['name'] == expected['name'] and dep['version'] == expected['version'] and
+                    dep['sha256'] == expected['sha256'] for dep in data.get('hostDependencies', [])):
+                raise DeployError('framework provenance lock mismatch', 'E_LOCK_INVALID')
         return data
 
     def prepare(self):
@@ -279,7 +319,7 @@ class Deployment:
         atomic_write(recipe, canonical(self.spec))
         substitutions = {'recipe': str(recipe),
                          'build_dir': str(self.build), 'state_dir': str(self.state_dir)}
-        run([arg.format_map(substitutions) for arg in self.cook_command], cwd=self.build)
+        run([arg.format_map(substitutions) for arg in self.cook_command], cwd=self.build, adapter=True)
         # Surface safe ownership diagnostics before Ansible's no_log secret
         # activation task, and before creating env/current/service state.
         self._activation_plan()

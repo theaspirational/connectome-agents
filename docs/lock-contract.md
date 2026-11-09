@@ -94,13 +94,48 @@ cook:
   connector_state: {}
 ```
 
-The framework archive must be a cook-compatible local gzip/ustar npm archive,
-with the framework package name and `package.json.gitHead` equal to the requested
-framework commit. Supply a trusted, authenticated archive/hash pair; `gitHead`
-is an artifact provenance assertion, **not source authentication**. Cook checks
-its name/version against the host range and binds all same-name Bun lock entries
-to the hash-pinned archive before recording `hostDependencies`. Other transitive
-dependencies are not a frozen closure. Build tools and archives remain trusted.
+The framework archive must be a cook-compatible **local** gzip/ustar npm archive,
+pinned by the required SHA-256. When `package.json` contains `gitHead`, it must
+match the requested framework commit, including for registry releases. A present
+but empty, null or mismatched `gitHead` never falls back to release identity.
+Without `gitHead`, the default still refuses. For registry tarballs that omit it
+(such as the npm-published framework 0.32.0), explicitly attest the release in a
+private/group/agent layer:
+
+```yaml
+cook:
+  framework_archive:
+    path: /absolute/inputs/agent-framework.tgz
+    sha256: REPLACE_WITH_REVIEWED_ARCHIVE_SHA256
+    registry_release: true
+    name: "@animalabs/agent-framework"
+    version: '0.32.0'
+```
+
+`registry_release` must be the boolean `true`, with both expected `name` and
+concrete `version`. They must exactly match the archive's package.json, and the
+name must be the framework package. This does **not** verify the commit by other
+means: the archive is pinned by its hash, not authenticated as that commit. No
+registry lookup, Git fetch or other acquisition is performed by this check.
+Supply a trusted, authenticated archive/hash pair; even a matching `gitHead` is
+an artifact assertion, **not source authentication**.
+
+The nonsecret plan's `framework_archive` and the role-owned
+`BUILD/framework.lock.json` record schema `connectome.framework-archive/v1`,
+SHA-256, package name/version, `requested_commit`, `registry_release` and
+`commit_verifiable`. Absent gitHead is explicitly `commit_verifiable: false`;
+the requested pin is never presented as verified. The sidecar is separate from
+cook's unchanged `connectome.lock` and build identity. Prepared builds validate
+it against the request and cook's dependency hash/name/version; retained builds
+do not need the original input archive. Legacy gitHead-only builds without a
+sidecar remain usable, with plan provenance `not_recorded_legacy_build`; registry
+release builds require the sidecar. Change the immutable adapter path/argv to
+materialize a new request after upgrading the adapter.
+
+Cook also checks name/version against the host range and binds all same-name Bun
+lock entries to the hash-pinned archive before recording `hostDependencies`.
+Other transitive dependencies are not a frozen closure. Build tools and archives
+remain trusted.
 
 Enabled connector descriptors need native cook MCP settings (`command`, `args`,
 `env`, etc.); the public catalog's empty candidate settings deliberately fail
@@ -149,12 +184,44 @@ roots with safe ancestors; consult its layout documentation. Runtime launches,
 child Bun autoload and operator absolute overrides need separate audits. The
 adapter checks returned layout, framework hash and exact component commits.
 
+## Safe failure diagnostics
+
+The adapter emits only a closed JSON error envelope on stderr: `error_code`,
+`msg` (code plus a fixed message), and optionally `cook_error_code`. The prepare
+Ansible task displays that code/message directly, for example:
+`E_ARCHIVE_GITHEAD: Framework archive gitHead is missing or differs from the requested pin.`
+Raw stderr/stdout, exception text, argv and config values are never relayed.
+Failure results also suppress Ansible's implicit invocation and debug traceback.
+Unknown/malformed subprocess output becomes `E_COOK_FAILED`, not a guessed
+explanation. CLI argument errors also use a fixed envelope without echoing argv.
+
+| Code | Meaning / operator action |
+| --- | --- |
+| `E_ARCHIVE_GITHEAD` | Missing or mismatched gitHead; inspect pin or explicitly attest a registry release. |
+| `E_ARCHIVE_IDENTITY` | Registry declaration or package name/version mismatch. |
+| `E_ARCHIVE_HASH` | Archive SHA-256 check failed. |
+| `E_ADAPTER_INPUT` | Invalid adapter input or unavailable local prerequisite. |
+| `E_LOCK_INVALID` | Cook lock or framework provenance lock failed validation. |
+| `E_LOCK_STATE_PATH` | Returned persistent state/layout differs from the request. |
+| `E_SECRETS_MODE` | Require owned directory 0700/file 0600 without symlinks; never repaired automatically. |
+| `E_BUDGETS_UNSUPPORTED` | Remove nonempty budgets explicitly; no enforcement is implied. |
+| `E_COOK_FAILED` | Child command failed; raw output remains redacted. |
+| `E_DEPLOY_FAILED` | Other deployment failure; retained/restored where possible. |
+
+For `E_COOK_FAILED`, a typed code printed by the reviewed cook is included only
+if it belongs to the literal allowlist in `connectome_errors.py` (host engine,
+layout, unit, private-directory and dependency codes). Only the code survives, never its surrounding
+message, paths or values. Ansible accepts only the exact closed envelope and
+regenerates the diagnostic locally; tool output cannot supply arbitrary messages.
+Activation and provider tasks remain `no_log` to protect secret-bearing inputs.
+
 ## Offline tests
 
 Schema fixtures are recorded synthetic/anonymized cases, not claimed live-build
 captures. Unit doubles test invocation separately. `RealCookTests` uses the exact
 reviewed cook tree, real Git, real Bun/Node and real dependency installation for a
-tiny all-local host/framework recipe; it never replaces those tools. Set
+tiny all-local host/framework recipe, covering both matching gitHead and explicit
+registry-release archives without gitHead; it never replaces those tools. Set
 `CONNECTOME_TEST_COOK_SOURCE` to a local clone containing the reviewed commit,
 `CONNECTOME_TEST_COOK_DEPS` to an already-installed cook `node_modules` directory,
 and `CONNECTOME_TEST_BUN` to an installed Bun binary. Optional
