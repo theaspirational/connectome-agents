@@ -293,6 +293,28 @@ class AdapterTests(ScratchTest):
         recipe, _ = adapter.recipe_from_spec(spec)
         self.assertNotIn('budgets', recipe)
 
+    def test_operator_recipe_skips_connector_module_and_agent_generation(self):
+        spec = self.spec()
+        content = b'{ "name":"example", "agent":{"systemPrompt":"Verbatim"} }\r\n'
+        path = self.work / 'operator.json'; path.write_bytes(content)
+        config = spec['config']
+        config['recipe_file'] = {'path': str(path), 'sha256': hashlib.sha256(content).hexdigest()}
+        config.pop('agent')
+        config['connectors']['extra'].pop('pin_ref')
+        config['connectors']['extra']['settings'] = {'not': 'generator metadata'}
+        config['modules']['lessons']['repo'] = 'not generated'
+        spec['pins']['connectors'] = {}
+        recipe, names = adapter.recipe_from_spec(spec)
+        self.assertEqual(recipe, json.loads(content))
+        self.assertEqual(names, ['EXAMPLE_SECRET'])
+        for invalid in (b'not JSON', b'[]', b'{"x":NaN}', b'{"x":1,"x":2}'):
+            path.write_bytes(invalid)
+            config['recipe_file']['sha256'] = hashlib.sha256(invalid).hexdigest()
+            with self.subTest(invalid=invalid), patch.object(adapter, 'command') as command:
+                with self.assertRaises(adapter.AdapterError):
+                    self.invoke(spec)
+                command.assert_not_called()
+
     def test_no_secret_recipe_omits_cook_only_requirements(self):
         spec = self.spec()
         spec['config']['connectors'] = {}
@@ -836,6 +858,9 @@ class RealCookTests(unittest.TestCase):
         self.build.parent.mkdir(mode=0o700)
         self.build.mkdir(mode=0o700)
 
+    def test_real_cook_offline_operator_recipe_and_secret_files(self):
+        self.real_build(registry=False, operator_inputs=True)
+
     def test_real_cook_offline_local_host_build(self):
         self.real_build(registry=False)
 
@@ -858,7 +883,7 @@ class RealCookTests(unittest.TestCase):
         self.real_build(registry=False, two_dependencies=True, trusted=True)
 
     def real_build(self, registry, with_secrets=True, two_dependencies=False, generic_only=False,
-                   trusted=False, registry_input=False):
+                   trusted=False, registry_input=False, operator_inputs=False):
         """No fake runtimes/Git/dependency tools, downloads, or network recipes."""
         required = ('CONNECTOME_TEST_COOK_SOURCE', 'CONNECTOME_TEST_BUN', 'CONNECTOME_TEST_COOK_DEPS')
         missing_env = [name for name in required if not os.environ.get(name)]
@@ -908,7 +933,11 @@ class RealCookTests(unittest.TestCase):
         host_pin = repository(host, {'package.json': json.dumps({'name': 'example-host', 'version': '1.0.0',
                      'type': 'module', 'engines': {'bun': '>=1.0.0', 'node': '>=20.0.0'},
                      'dependencies': dependencies,
-                     **({'trustedDependencies': ["@animalabs/context-manager"]} if trusted else {})}), 'src/index.ts': 'console.log("example");\n'})
+                     **({'trustedDependencies': ["@animalabs/context-manager"]} if trusted else {})}), 'src/index.ts': ('import {readFileSync, writeFileSync} from "node:fs";\n'
+                         'const value = readFileSync(process.env.EXAMPLE_FILE!, "utf8");\n'
+                         'if (!value || process.env.EXAMPLE_SECRET) process.exit(8);\n'
+                         'writeFileSync(process.env.DATA_DIR + "/file-seen", "ok");\n'
+                         if operator_inputs else 'console.log("example");\n')})
         spec = {'config': {'name': 'example', 'state_dir': str(self.work / 'state'),
                           'secrets_file': str(self.work / 'secrets/example.json'),
                           'agent': {'systemPrompt': 'Offline example'},
@@ -928,6 +957,9 @@ class RealCookTests(unittest.TestCase):
             spec['config']['cook']['host_dependencies'].insert(0, {'name': adapter.FRAMEWORK,
                 'archive': artifact['path'], 'sha256': artifact['sha256'], 'version': '1.0.0',
                 'kind': 'git_commit', 'commit': framework_pin})
+        if operator_inputs:
+            self.operator_lifecycle(spec, checkout, bun, node)
+            return
         spec_path = self.build / 'deployment.json'; spec_path.write_text(json.dumps(spec))
         # All acquisition is file-local. An empty private HOME prevents reuse
         # of operator credentials; Git's protocol allowlist prohibits remotes.
@@ -1019,3 +1051,64 @@ class RealCookTests(unittest.TestCase):
         else:
             # Old gitHead-only builds did not have this role-owned sidecar.
             self.assertEqual(deployment._lock(self.build)['build'], record['build'])
+
+    def operator_lifecycle(self, spec, checkout, bun, node):
+        from connectome_inputs import collect
+        config = spec['config']
+        config.pop('agent')
+        config['required_secrets'] = []
+        # These descriptors must never be translated or need source pins.
+        config['connectors'] = {'unresolved': {'settings': {}}}
+        config['modules'] = {'unused': {'repo': 'not translated'}}
+        config['secret_files'] = [{'secret': 'EXAMPLE_SECRET', 'env': 'EXAMPLE_FILE'}]
+        config['health'] = {'command': [sys.executable, str(ROOT / 'tests/fixtures/host-health.py')]}
+        recipe = self.work / 'operator.json'
+        content = (b'{ "name":"example", "agent":{"systemPrompt":"Operator recipe"}, '
+                   b'"requirements":{"EXAMPLE_FILE":{"exposeAs":"EXAMPLE_FILE","required":false}} }\r\n')
+        recipe.write_bytes(content)
+        config['recipe_file'] = {'path': str(recipe), 'sha256': hashlib.sha256(content).hexdigest()}
+        home = self.work / 'empty-home'; home.mkdir(mode=0o700)
+        secrets_dir = self.work / 'secrets'; secrets_dir.mkdir(mode=0o700)
+        canary = 'synthetic-offline-file-canary\nsecond line\n'
+        secrets = Path(config['secrets_file'])
+        secrets.write_text(json.dumps({'EXAMPLE_SECRET': canary}))
+        secrets.chmod(0o600)
+        cook = [sys.executable, str(ROOT / 'scripts/cook-adapter.py'),
+                '--runtime', str(Path(bun).absolute()), '--entrypoint', str(checkout / 'bin/cook'),
+                '--bun-path', str(Path(bun).absolute()), '--node-path', str(Path(node).absolute()),
+                '--spec', '{recipe}', '--out', '{build_dir}', '--state', '{state_dir}']
+        root = self.build.parent.parent
+        systemctl = [sys.executable, str(ROOT / 'tests/fixtures/systemctl.py'), str(root)]
+        with patch.dict(os.environ, {'HOME': str(home), 'GIT_ALLOW_PROTOCOL': 'file'}):
+            first = Deployment(root, self.work / 'units', config, {'runtime': spec['pins']['runtime']},
+                               cook, systemctl, operator_files=collect(config))
+            prepared = first.prepare()
+            first.activate()
+            self.assertEqual((first.state_dir / 'file-seen').read_text(), 'ok')
+            self.assertEqual((first.build / 'cook-recipe.json').read_bytes(), content)
+            self.assertEqual(first._lock()['recipe']['sha256'], config['recipe_file']['sha256'])
+            source_unit = (first.build / 'connectome-example.service').read_text()
+            self.assertIn('ExecStart=/bin/bash "' + str(first.build / 'run.sh') + '" --headless', source_unit)
+            self.assertFalse(first.activate()['changed'])
+            for output in (prepared, first.plan()):
+                self.assertNotIn(canary, json.dumps(output))
+            for path in [*first.build.rglob('*'), first.manifest_path, root / 'systemctl-calls']:
+                if path.is_file():
+                    self.assertNotIn(canary.encode(), path.read_bytes(), str(path))
+            self.assertEqual(first._secret_file_path('EXAMPLE_FILE').read_text(), canary)
+            second_config = deepcopy(config)
+            second_config['secret_files'][0]['env'] = 'OTHER_FILE'
+            content2 = content.replace(b'EXAMPLE_FILE', b'OTHER_FILE')
+            recipe.write_bytes(content2)
+            second_config['recipe_file']['sha256'] = hashlib.sha256(content2).hexdigest()
+            second = Deployment(root, self.work / 'units', second_config, {'runtime': spec['pins']['runtime']},
+                                cook, systemctl, operator_files=collect(second_config))
+            second.prepare()
+            recipe.unlink()  # Rollback must not read the old controller recipe.
+            with self.assertRaisesRegex(DeployError, 'restored') as error:
+                second.activate()
+            self.assertNotIn(canary, str(error.exception))
+            self.assertEqual(first.current.resolve(), first.build)
+            self.assertEqual(first._secret_file_path('EXAMPLE_FILE').read_text(), canary)
+            self.assertFalse(second._secret_file_path('OTHER_FILE').exists())
+            self.assertEqual((first.state_dir / 'file-seen').read_text(), 'ok')

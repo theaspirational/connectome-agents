@@ -498,3 +498,101 @@ entry. Stop the affected agent and have an operator inspect, back up and remove 
 artifacts before a fresh deployment; do not erase a manifest to bypass drift.
 Never edit a live deployment concurrently. Separate agents must use distinct
 roots and unique unit names.
+
+## Operator-supplied recipe (opt-in)
+
+For an existing hand-built agent, effective agent config may supply this **closed**
+record instead of generator settings:
+
+```yaml
+recipe_file:
+  path: /absolute/controller/recipe.json
+  sha256: REPLACE_WITH_REVIEWED_RECIPE_SHA256
+```
+
+`path` is controller-local, canonical and absolute. The controller lookup rejects
+symlinks (including ancestor aliases), non-regular files, hash mismatches and
+non-JSON input. JSON must be an object, without duplicate keys or nonfinite
+numbers. The lookup transports bytes separately from the normalized deployment
+spec; the target rechecks the hash/JSON and installs `BUILD/cook-recipe.json`
+verbatim, owned by the agent, mode 0600. No JSON reserialization, templating or
+placeholder substitution occurs. **Paths inside the recipe must already be the
+target's paths**, not controller paths. Only this one file is copied; any child
+recipes, source directories or other referenced files must already be available
+on the target. Secret references such as `${EXAMPLE_FILE}` retain cook's semantics;
+never put secret values in the recipe.
+
+Connector and module generation, including `agent` generation, is skipped.
+Connector descriptors therefore need no `pin_ref` or connector source pins;
+the resolved connector pin map is empty. Runtime pins, local host dependencies,
+budget refusal, cook's normal recipe validation, v2 lock validation and state
+layout checks still apply. The operator recipe owns its component/source
+metadata: the role does not assert that these components match ignored connector
+descriptors. Declare all required runtime environment names in the recipe's cook
+requirements, without values. The role never injects requirements into this file.
+
+The plan records `recipe_file.path` and `recipe_file.sha256`; cook's existing
+`recipe.sha256` in `connectome.lock` must match those exact installed bytes.
+Prepared/retained builds revalidate the installed bytes, owner/mode and lock;
+rollback does not need the original controller file. A fresh Ansible apply still
+reads/verifies the controller input. Build, unit export, EnvironmentFile delivery,
+current switch, health and rollback remain unchanged: **ExecStart continues to
+use cook's generated run.sh**. No alternate start command or extra unit directives
+are introduced. Absent these new inputs, recipe rendering, adapter/deployment
+argv, units and lock bytes are compared directly against baseline `06af58c` in
+the offline compatibility test.
+
+## File-only secrets (opt-in)
+
+The effective agent config accepts a **closed list**, replacement-merged like any
+other list, with only `secret` and `env` per entry:
+
+```yaml
+secret_files:
+  - secret: EXAMPLE_SECRET
+    env: EXAMPLE_FILE
+```
+
+`secret` names a string in the agent's secrets JSON (or the selected existing
+secret provider). `env` names the environment variable that the application uses
+to locate that secret's file, for example `GITHUB_TOKEN_FILE`. Both names use
+`[A-Z_][A-Z0-9_]*`. Duplicate destination env names, collisions with direct secret
+env delivery, state env names and adapter infrastructure env names are refused.
+Multiple file variables may refer to the same source secret. File-only source
+names are fetched but are **not** also exported as raw environment values. If a
+source is also explicitly declared in `required_secrets` (including a descriptor),
+that explicit direct delivery still applies. Existing secret provider selection,
+JSON permission checks and EnvironmentFile handling are unchanged.
+
+Files live at `ROOT/state/secret-files/ENV`, beside deployment bookkeeping, **not
+inside external runtime state**. The directory is agent-owned mode 0700; each file
+is agent-owned mode 0600. Existing files/directories must already have these exact
+modes and ownership; symlinks, writable ancestors and undeclared files are refused,
+not adopted or repaired. Values are written as exact UTF-8 string bytes, without
+an added newline; multiline file-only values are allowed. Each apply atomically
+rewrites declared files, even when unchanged. Changed bytes restart the service;
+unchanged bytes only recheck health. Removing an entry deletes its managed file
+on successful activation. Neither a new recipe nor a file-secret value rotates
+cook's launcher away from run.sh.
+
+`BUILD/secrets.env` sets each destination env variable to its absolute file path,
+using the existing EnvironmentFile drop-in. Plans contain only source/destination
+names and paths; locks cover runtime env **names**, not source values or file
+contents/hashes. Generated recipes declare destination env names, not file-only
+source names. With `recipe_file`, declare these destination names yourself as
+optional unresolved cook requirements (`exposeAs`, `required: false`). Values
+never enter the deployment spec, plan, lock, ownership manifest or diagnostics.
+Only the secret provider's input, the private secret files, and any explicitly
+requested direct EnvironmentFile delivery contain them.
+
+Activation snapshots the prior file set privately in memory. Failed health
+restores prior declarations **and bytes**, removes newly introduced files, restores
+the previous EnvironmentFile/unit/current references, and rechecks prior health.
+Same-request rotation failures restore the previous file bytes as well. This is
+normal failure rollback, not crash-atomic recovery or protection against trusted
+same-uid runtime code. Do not modify this private directory concurrently.
+
+The real-cook offline test builds a verbatim recipe and activates file-secret
+delivery, executes the real generated run.sh against a tiny local host, checks a
+synthetic canary for leaks, and rolls back a changed declaration. Systemctl remains
+an explicitly identified offline double; this is not live systemd qualification.

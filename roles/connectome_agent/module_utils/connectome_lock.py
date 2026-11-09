@@ -133,6 +133,19 @@ def map_lock(data, build, host_pin=None, required_names=(), config=None, framewo
             text(recipe['path']) and digest(recipe['sha256']) and
             text(data['recipePath']) and recipe['path'] == data['recipePath'] and text(data['createdAt']),
             'invalid lock recipe provenance')
+    if config is not None and 'recipe_file' in config:
+        try:
+            try:
+                from ansible.module_utils import connectome_inputs as inputs
+            except ImportError:
+                import connectome_inputs as inputs
+            inputs.validate(config)
+            path = build / 'cook-recipe.json'
+            inputs.read_file(path, config['recipe_file'])
+            require(recipe['sha256'] == config['recipe_file']['sha256'] and
+                    recipe['path'] == str(path), 'operator recipe provenance mismatch')
+        except ValueError:
+            raise LockError('invalid operator recipe provenance') from None
     try:
         require(re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z', data['createdAt'])
                 and datetime.fromisoformat(data['createdAt'].replace('Z', '+00:00')), 'invalid lock timestamp')

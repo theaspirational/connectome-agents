@@ -24,6 +24,7 @@
 - name: Materialize a fresh cook build or reuse the validated request
   connectome_release:
     operation: prepare
+    operator_files: "{{ lookup('connectome_inputs', connectome_effective) }}"
     base: "{{ connectome_base }}"
     root: "{{ connectome_root }}"
     unit_dir: "{{ connectome_unit_dir }}"

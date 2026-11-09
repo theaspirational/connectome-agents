@@ -12,7 +12,8 @@ import shlex
 import subprocess
 import tempfile
 
-from connectome_deploy import secret_names, validate_config, resolve_pins, DeployError
+import connectome_inputs as inputs
+from connectome_deploy import environment_names, validate_config, resolve_pins, DeployError
 from connectome_lock import read_lock, LockError, text, credential_shaped, repository
 from connectome_errors import SafeError, diagnostic, cook_code_from_stream
 from connectome_archive import FRAMEWORK, ArchiveError, framework_provenance, dependency_provenance, records_metadata
@@ -98,7 +99,7 @@ def source(entry, pin, target):
             'install': {'run': build_commands(entry), 'runtime': 'custom'}}
 
 
-def recipe_from_spec(spec):
+def recipe_from_spec(spec, recipe_bytes=None):
     """Only the effective entries are translated. No discovery/catalog reads.
 
     settings are native cook/host settings, not a guessed connector launch API.
@@ -109,12 +110,23 @@ def recipe_from_spec(spec):
     validate_config(config)
     # Revalidate full pins even when used without the Ansible role.
     versions = {'runtime': pins['runtime'], 'connectors': pins['connectors']}
-    for name, entry in config.get('connectors', {}).items():
+    for name, entry in ({} if 'recipe_file' in config else config.get('connectors', {})).items():
         need(entry.get('pin_ref') == 'connectors.' + name, 'connector pin_ref must name its resolved connector')
     need(resolve_pins(config, versions) == pins, 'normalized pins required')
     if config.get('budgets'):
         raise AdapterError('step/cost budgets not supported by host recipe schema at ' +
                            pins['runtime']['connectome-host'] + '; remove budgets explicitly', 'E_BUDGETS_UNSUPPORTED')
+    if 'recipe_file' in config:
+        record = config['recipe_file']
+        try:
+            content = (inputs.read_file(record['path'], record) if recipe_bytes is None else
+                       inputs.verify_bytes(recipe_bytes, record))
+        except ValueError as error:
+            raise AdapterError(str(error)) from None
+        names = environment_names(config)
+        need(not set(names) & BASE_ENV and not set(names) & {'DATA_DIR', 'WORKSPACE_DIR'},
+             'secret names overlap adapter-owned environment')
+        return json.loads(content), names
     agent = config.get('agent')
     need(isinstance(agent, dict) and isinstance(agent.get('systemPrompt'), str) and agent['systemPrompt'],
          'agent.systemPrompt is required by cook')
@@ -143,7 +155,7 @@ def recipe_from_spec(spec):
                 # Empty settings enable a native module. Disabled entries never
                 # reach this loop; the role already pruned them.
                 recipe['modules'][name] = settings or True
-    names = secret_names(config)
+    names = environment_names(config)
     need(not set(names) & BASE_ENV and not set(names) & {'DATA_DIR', 'WORKSPACE_DIR'},
          'secret names overlap adapter-owned environment')
     # Cook needs nonempty declarations to record runtime-only names in its
@@ -174,8 +186,7 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
         absolute_path(value)
     need(all(path.is_absolute() and path.resolve() == path for path in (build, state, spec_path)),
          'adapter paths must be absolute without symlink aliases')
-    need(build.is_dir() and set(build.iterdir()) == {spec_path} and spec_path.name == 'deployment.json',
-         'cook requires a fresh build containing only deployment.json')
+    need(build.is_dir() and spec_path.name == 'deployment.json', 'fresh deployment.json required')
     need(build.parent.name == 'builds', 'adapter output must be ROOT/builds/REQUEST')
     root = build.parent.parent
     need(not state.is_relative_to(root) and not root.is_relative_to(state),
@@ -183,7 +194,25 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     need(all(Path(p).is_absolute() and os.access(p, os.X_OK) for p in (runtime, bun_path, node_path)),
          'absolute executable runtime, Bun and Node paths required')
     spec = json.loads(spec_path.read_text())
-    recipe, names = recipe_from_spec(spec)
+    staged = build / 'cook-recipe.json'
+    supplied_recipe = 'recipe_file' in spec.get('config', {})
+    allowed = {spec_path}
+    content = None
+    if supplied_recipe:
+        if staged.exists() or staged.is_symlink():
+            allowed.add(staged)
+            try:
+                content = inputs.read_file(staged, spec['config']['recipe_file'])
+            except (ValueError, TypeError):
+                raise AdapterError('invalid staged recipe') from None
+        else:
+            try:
+                content = inputs.read_file(spec['config']['recipe_file']['path'],
+                                           spec['config']['recipe_file'])
+            except (ValueError, TypeError, KeyError):
+                raise AdapterError('invalid recipe input') from None
+    need(set(build.iterdir()) == allowed, 'cook requires a fresh build containing only deployment.json and optional recipe')
+    recipe, names = recipe_from_spec(spec, content)
     config, pins = spec['config'], spec['pins']['runtime']
     need(config.get('state_dir') == str(state), 'adapter state must match configured state_dir')
     settings = config.get('cook', {})
@@ -199,7 +228,11 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
         provenance = framework_provenance(config, pins['agent-framework'])
         (build / 'framework.lock.json').write_text(json.dumps(provenance, sort_keys=True, indent=2) + '\n')
     recipe_path = build / 'cook-recipe.json'
-    recipe_path.write_text(json.dumps(recipe, sort_keys=True, indent=2) + '\n')
+    if supplied_recipe:
+        recipe_path.write_bytes(content)
+        recipe_path.chmod(0o600)
+    else:
+        recipe_path.write_text(json.dumps(recipe, sort_keys=True, indent=2) + '\n')
     # Config/credentials are per-request, state/workspace persist. All roots
     # are non-overlapping as required by cook's split layout. Do not assume
     # the parent of an arbitrary external state_dir is writable by this uid.
@@ -233,10 +266,11 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     need(lock.get('layout') == layout and lock.get('state') == {'path': str(state)},
          'cook lock did not preserve the requested persistent layout', 'E_LOCK_STATE_PATH')
     expected = {(entry['repo'], spec['pins']['connectors'][name])
-                for name, entry in config.get('connectors', {}).items()}
+                for name, entry in ({} if supplied_recipe else config.get('connectors', {})).items()}
     actual = {(entry.get('url'), entry.get('commit')) for entry in lock['components']}
-    need(actual == expected and all(c['kind'] == 'git' and c['role'] == 'mcp' for c in lock['components']),
-         'cook component provenance differs from enabled inputs')
+    if not supplied_recipe:
+        need(actual == expected and all(c['kind'] == 'git' and c['role'] == 'mcp' for c in lock['components']),
+             'cook component provenance differs from enabled inputs')
     # Validate cook's inventory before adding config-only provenance. Legacy
     # configs never rewrite cook's lock, argv or build identity.
     expected = {d['name']: d for d in dependencies}

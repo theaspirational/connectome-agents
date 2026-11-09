@@ -13,6 +13,7 @@ def main():
         'root': {'type': 'path', 'required': True},
         'unit_dir': {'type': 'path', 'required': True},
         'config': {'type': 'dict', 'required': True},
+        'operator_files': {'type': 'dict', 'default': {}, 'no_log': True},
         'versions': {'type': 'dict', 'required': True},
         'cook_command': {'type': 'list', 'elements': 'str', 'required': True},
         'systemctl': {'type': 'list', 'elements': 'str', 'default': ['systemctl', '--user']},

@@ -124,3 +124,10 @@ including operator-supplied prebuilt artifacts. The legacy framework archive
 configuration remains supported.
 
 License: [MIT](LICENSE).
+
+Existing hand-built agents can opt into a hash-pinned, verbatim controller-local
+[`recipe_file`](docs/lock-contract.md#operator-supplied-recipe-opt-in) without
+regenerating connector/module recipes. Optional
+[`secret_files`](docs/lock-contract.md#file-only-secrets-opt-in) deliver selected
+secret values through private files and EnvironmentFile path variables. Both are
+off by default; cook's run.sh, health checks and transactional rollback remain.

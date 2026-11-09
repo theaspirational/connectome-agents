@@ -11,12 +11,14 @@ import subprocess
 import tempfile
 
 try:
+    from ansible.module_utils import connectome_inputs as inputs
     from ansible.module_utils.connectome_lock import read_lock, LockError
     from ansible.module_utils.connectome_errors import SafeError, adapter_diagnostic
     from ansible.module_utils.connectome_archive import (framework_provenance, validate_provenance,
                                                         dependency_provenance, dependency_inputs,
                                                         records_metadata, provenance_record)
 except ImportError:
+    import connectome_inputs as inputs
     from connectome_lock import read_lock, LockError
     from connectome_errors import SafeError, adapter_diagnostic
     from connectome_archive import (framework_provenance, validate_provenance,
@@ -73,7 +75,7 @@ def atomic_write(path, content, mode=0o600):
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.write-')
     try:
         os.fchmod(fd, mode)
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, 'wb' if isinstance(content, bytes) else 'w') as stream:
             stream.write(content)
         os.replace(tmp, path)
     finally:
@@ -102,6 +104,10 @@ def identifier(value):
 
 
 def validate_config(config):
+    try:
+        inputs.validate(config)
+    except ValueError as error:
+        raise DeployError(str(error)) from None
     identifier(config.get('name', 'example'))
     for name in config.get('connectors', {}):
         identifier(name)
@@ -142,7 +148,7 @@ def run(argv, cwd=None, adapter=False):
             raise DeployError('command failed (output redacted)')
 
 
-def secret_names(config):
+def direct_secret_names(config):
     entries = list(config.get('connectors', {}).values()) + list(config.get('modules', {}).values())
     names = set(config.get('required_secrets', []))
     for entry in entries:
@@ -154,10 +160,24 @@ def secret_names(config):
     return sorted(names)
 
 
+def secret_names(config):
+    direct = set(direct_secret_names(config))
+    records = config.get('secret_files', [])
+    if direct & {record['env'] for record in records}:
+        raise DeployError('secret file environment name conflicts with direct secret delivery')
+    return sorted(direct | {record['secret'] for record in records})
+
+
+def environment_names(config):
+    if config.get('secret_files'):
+        secret_names(config)  # Also reject direct/file destination collisions in standalone adapters.
+    return sorted(set(direct_secret_names(config)) | {record['env'] for record in config.get('secret_files', [])})
+
+
 def resolve_pins(config, versions):
     runtime = versions['runtime']
     result = {'runtime': runtime, 'connectors': {}}
-    for name, entry in config.get('connectors', {}).items():
+    for name, entry in ({} if 'recipe_file' in config else config.get('connectors', {})).items():
         value = versions
         try:
             for part in entry['pin_ref'].split('.'):
@@ -175,7 +195,7 @@ def resolve_pins(config, versions):
 
 class Deployment:
     def __init__(self, root, unit_dir, config, versions, cook_command, systemctl=None,
-                 check=False, base=None):
+                 check=False, base=None, operator_files=None):
         # This constructor must stay mutation-free: the Ansible boundary creates
         # the root/serialization lock only AFTER all identifiers are validated.
         validate_config(config)
@@ -183,6 +203,7 @@ class Deployment:
         self.root = inside(self.base, Path(os.path.abspath(Path(root).expanduser())))
         self.unit_dir = base_path(unit_dir)
         self.config = config
+        self.operator_files = operator_files
         self.pins = resolve_pins(config, versions)
         self.cook_command = cook_command
         self.systemctl = systemctl or ['systemctl', '--user']
@@ -284,6 +305,11 @@ class Deployment:
     def plan(self):
         result = {'state_dir': str(self.state_dir), 'secrets_file': str(self.secrets_file),
                   'budgets': self.config.get('budgets', {})}
+        if 'recipe_file' in self.config:
+            result['recipe_file'] = dict(self.config['recipe_file'])
+        if self.config.get('secret_files'):
+            result['secret_files'] = [dict(record, path=str(self._secret_file_path(record['env'])))
+                                      for record in self.config['secret_files']]
         if 'framework_archive' in self.config.get('cook', {}):
             lock = self.build / 'framework.lock.json'
             if (self.build / '.prepared').is_file():
@@ -323,7 +349,7 @@ class Deployment:
             data = read_lock(inside(build, 'connectome.lock'), config=config, framework_pin=pin,
                              framework_record=recorded,
                              host_pin=self.pins['runtime']['connectome-host'] if build == self.build else None,
-                             required_names=self.names if build == self.build else ())
+                             required_names=environment_names(config) if build == self.build else ())
         except LockError as error:
             raise DeployError(str(error), 'E_LOCK_INVALID') from None
         state = data.get('state')
@@ -354,6 +380,10 @@ class Deployment:
                     dep['name'] == expected['name'] and dep['version'] == expected['version'] and
                     dep['sha256'] == expected['sha256'] for dep in data.get('hostDependencies', [])):
                 raise DeployError('framework provenance lock mismatch', 'E_LOCK_INVALID')
+        try:
+            inputs.installed(build, config)
+        except ValueError as error:
+            raise DeployError(str(error), 'E_LOCK_INVALID') from None
         return data
 
     def prepare(self):
@@ -361,16 +391,24 @@ class Deployment:
         self._check_secrets_file()
         self._load_ownership()
         self._check_build_ownership()
-        if not self.check:
+        if not self.check and 'recipe_file' not in self.config:
             self._ensure_state()
         marker = inside(self.build, '.prepared')
         if marker.is_file() and marker.read_text() == self.request_id:
+            if not self.check and 'recipe_file' in self.config:
+                self._ensure_state()
             self._activation_plan()
             return {'changed': False, 'build_dir': str(self.build), 'secret_names': self.names, 'plan': self.plan()}
+        try:
+            payloads = inputs.payloads(self.config, self.operator_files)
+        except ValueError as error:
+            raise DeployError(str(error)) from None
         if self.check:
             return {'changed': True, 'build_dir': str(self.build), 'secret_names': self.names, 'plan': self.plan()}
         if not self.cook_command:
             raise DeployError('configure a pinned cook adapter command')
+        if 'recipe_file' in self.config:
+            self._ensure_state()
         if self.current.is_symlink() and self.current.resolve() == self.build:
             raise DeployError('refusing to rebuild active directory')
         if any(path != self.build and path.is_relative_to(self.build) for path in self.owned):
@@ -388,6 +426,8 @@ class Deployment:
         self._save_ownership()  # persist ownership before invoking cook
         recipe = inside(self.build, 'deployment.json')
         atomic_write(recipe, canonical(self.spec))
+        if 'recipe_file' in self.config:
+            self._write_input(self.build / 'cook-recipe.json', payloads['cook-recipe.json'], 0o600)
         substitutions = {'recipe': str(recipe),
                          'build_dir': str(self.build), 'state_dir': str(self.state_dir)}
         run([arg.format_map(substitutions) for arg in self.cook_command], cwd=self.build, adapter=True)
@@ -445,6 +485,16 @@ class Deployment:
                               'E_SYSTEMD_PATH')
         return value
 
+    def _write_input(self, path, content, mode):
+        self._safe_parent(path)
+        if path.exists() or path.is_symlink():
+            raise DeployError('operator input destination already exists')
+        make_directory(path.parent)
+        # Byte mode is essential: no JSON reserialization or newline conversion.
+        with open(path, 'xb') as stream:
+            os.fchmod(stream.fileno(), mode)
+            stream.write(content)
+
     def _check_environment_file(self, name, build):
         expected = self._systemd_path(str(inside(build, 'secrets.env')))
         try:
@@ -469,6 +519,47 @@ class Deployment:
             if not isinstance(health['command'], list):
                 raise DeployError('health command must be argv')
             run(health['command'], cwd=build)
+
+    def _secret_file_path(self, env):
+        return self.state / 'secret-files' / env
+
+    def _secret_file_snapshot(self, previous, config):
+        old = self._config(previous).get('secret_files', []) if previous else []
+        before = {record['env'] for record in old}
+        after = {record['env'] for record in config.get('secret_files', [])}
+        if not before and not after:
+            return {}, set()
+        return self._inspect_secret_files(before), before | after
+
+    def _inspect_secret_files(self, allowed):
+        directory = self.state / 'secret-files'
+        self._safe_parent(directory / '.path-check')
+        if not directory.exists():
+            return {}
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or
+                info.st_uid != os.geteuid()):
+            raise DeployError('secret file directory must be agent-owned mode 0700; not repaired')
+        result = {}
+        for path in directory.iterdir():
+            info = path.lstat()
+            if (path.name not in allowed or not stat.S_ISREG(info.st_mode) or
+                    stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.geteuid()):
+                raise DeployError('secret file must be declared, regular and agent-owned mode 0600; not repaired')
+            result[path.name] = path.read_bytes()
+        return result
+
+    def _set_secret_files(self, content, allowed):
+        existing = self._inspect_secret_files(allowed)
+        directory = self.state / 'secret-files'
+        if content:
+            make_directory(directory)
+        for env in existing.keys() - content.keys():
+            self._secret_file_path(env).unlink()
+        for env, value in content.items():
+            atomic_write(self._secret_file_path(env), value)
+        if directory.exists() and not list(directory.iterdir()):
+            directory.rmdir()
 
     def _unit_path(self, name):
         if not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', name):
@@ -696,13 +787,21 @@ class Deployment:
             raise DeployError('secret provider must return exactly the declared names')
         if any(not isinstance(v, str) for v in secrets.values()):
             raise DeployError('secret provider must return exactly the declared names')
-        if any(any(c in value for c in ('\x00', '\n', '\r')) for value in secrets.values()):
+        if any(any(c in secrets[name] for c in ('\x00', '\n', '\r'))
+               for name in direct_secret_names(self.config) if name in secrets):
             raise DeployError('multiline/NUL env secrets are unsupported')
         if self.check and not (self.build / '.prepared').is_file():
             return {'changed': True}
         lock, units, previous, previous_lock, previous_units, artifacts = self._activation_plan()
+        file_snapshot, file_names = self._secret_file_snapshot(previous, self.config)
+        file_values = {record['env']: secrets[record['secret']].encode('utf-8')
+                       for record in self.config.get('secret_files', [])} if not self.check else {}
+        direct = set(direct_secret_names(self.config))
+        env_values = {name: value for name, value in secrets.items() if name in direct}
+        env_values.update({record['env']: self._systemd_path(str(self._secret_file_path(record['env'])))
+                           for record in self.config.get('secret_files', [])})
         env = ''.join(name + '=' + '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"\n'
-                      for name, value in sorted(secrets.items()))
+                      for name, value in sorted(env_values.items()))
         env_path = inside(self.build, 'secrets.env')
         same_env = (env_path.is_file() and env_path.read_text() == env and
                     env_path.stat().st_mode & 0o777 == 0o600)
@@ -712,17 +811,23 @@ class Deployment:
         if self.check:
             return {'changed': previous != self.build or not same_units or retired}
         self._ensure_state()
-        if previous == self.build and same_env and same_units and not retired:
+        if previous == self.build and same_env and same_units and not retired and file_values == file_snapshot:
+            if file_names:
+                self._set_secret_files(file_values, file_names)
             self._health(units, lock, self.build)
             return {'changed': False}
         old_env = env_path.read_text() if env_path.exists() else None
         atomic_write(env_path, env)
         try:
+            if file_names:
+                self._set_secret_files(file_values, file_names)
             self._put(self.current, self._link_record(self.build))
             self._install(units, previous_units, self.build)
             self._health(units, lock, self.build)
         except Exception as error:
             try:
+                if file_names:
+                    self._set_secret_files(file_snapshot, file_names)
                 if previous:
                     if previous == self.build and old_env is not None:
                         atomic_write(env_path, old_env)

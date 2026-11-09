@@ -61,4 +61,5 @@ def public_catalog(defaults, catalog):
 def required_names(config):
     entries = list(config.get('connectors', {}).values()) + list(config.get('modules', {}).values())
     return sorted(set(config.get('required_secrets', [])) |
+                  {entry['secret'] for entry in config.get('secret_files', [])} |
                   {name for entry in entries for name in entry.get('required_secrets', [])})
