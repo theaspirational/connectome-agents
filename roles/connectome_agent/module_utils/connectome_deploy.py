@@ -1088,7 +1088,13 @@ class Deployment:
                     '\nEnvironmentFile=' +
                     self._systemd_path(str(inside(build, 'secrets.env'))) + '\n')
             if catalog.active(self._config(build)):
-                body += catalog.preflight_unit(self._config(build), build)
+                config = self._config(build)
+                pins = json.loads(inside(build, 'deployment.json').read_text())['pins']
+                unit_body = self.rendered_units.get(source, None)
+                if unit_body is None:
+                    unit_body = source.read_text()
+                cwd = catalog.audit_unit(unit_body, self.root, Path(config['state_dir']), pins['platform'])
+                body += catalog.preflight_unit(config, build, cwd, pins['platform'])
             additions[self._dropin(name)] = (self._file_record(body), body)
             for path, artifact in additions.items():
                 if path in result and result[path] != artifact:

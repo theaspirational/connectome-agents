@@ -12,7 +12,7 @@ layout = json.loads(Path(args[args.index('--layout') + 1]).read_text())
 settings = json.loads(recipe.read_text())
 unit = args[args.index('--user-unit') + 1]
 (build / 'run.sh').write_text('#!/bin/sh\nexit 0\n')
-(build / unit).write_text('[Service]\nExecStart=/bin/sh ' + str(build / 'run.sh') +
+(build / unit).write_text('[Service]\nWorkingDirectory=' + layout['state'] + '\nExecStart=/bin/sh ' + str(build / 'run.sh') +
                          '\n[Install]\nWantedBy=default.target\n')
 pin = args[args.index('--ch-ref') + 1]
 lock = {'version': 2, 'backend': 'host', 'cook': {'version': '0.0.0-test-only'},

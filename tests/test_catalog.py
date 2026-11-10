@@ -185,6 +185,187 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(ArchiveError):
             catalog.verify(self.config, spec['pins'], self.build, lock)
 
+    def escape_args(self, cwd):
+        outside = self.work / 'outside.py'
+        outside.write_text('from pathlib import Path\nPath(__file__).with_suffix(".ran").touch()\n')
+        alias = self.root / 'alias'
+        if not alias.is_symlink():
+            alias.symlink_to(self.work, target_is_directory=True)
+        relative = os.path.relpath(outside, cwd)
+        linked = os.path.relpath(alias / 'outside.py', cwd)
+        return (relative, linked, '--config=' + relative,
+                '--config=' + linked, '--config=' + str(outside))
+
+    def repin(self):
+        for name, entry in catalog.entries_for(self.config).items():
+            section = 'connectors' if catalog.kind(entry) == 'connector' else 'artifacts'
+            self.versions[section][name]['descriptor_sha256'] = catalog.descriptor_digest(entry)
+        return self.spec()['pins']
+
+    def reseal(self, pins, recipe):
+        # Simulate a digest-valid lock produced by the old, absolute-only audit.
+        path = self.build / 'cook-recipe.json'
+        path.write_text(json.dumps(recipe))
+        record_path = self.build / 'catalog.lock.json'
+        record = json.loads(record_path.read_text())
+        record['pins'] = {key: pins[key] for key in ('artifacts', 'platform')}
+        record['descriptors'] = {n: catalog.descriptor_digest(e)
+                                 for n, e in catalog.entries_for(self.config).items()}
+        record['recipe_sha256'] = catalog.sha256(path)
+        record_path.write_bytes(catalog.canonical(record) + b'\n')
+
+    def launch_lock(self, pins):
+        return {'launch': {'script': 'run.sh'},
+                'recipe': {'sha256': catalog.sha256(self.build / 'cook-recipe.json')},
+                'components': [], 'localExtensions': [],
+                'external': [{'name': 'extra', 'command': catalog.runtime(self.config, self.build, 'node')}],
+                'engines': {name: {'path': catalog.runtime(self.config, self.build, name),
+                                  'realPath': catalog.runtime(self.config, self.build, name),
+                                  'version': pins['artifacts'][name]['version']} for name in ('node', 'bun')}}
+
+    def test_build_escapes_refused_before_any_execution(self):
+        entry = self.config['connectors']['extra']
+        args = self.escape_args(self.build / 'catalog/extra')
+        self.assertEqual(args[0], '../../../../../outside.py')
+        for arg in args:
+            entry['build'] = [['{artifact:node}/bin/node', arg]]
+            self.repin()
+            with self.subTest(arg=arg), patch.object(catalog.subprocess, 'run') as run:
+                with self.assertRaises(ArchiveError):
+                    self.install()
+                run.assert_not_called()
+                self.assertFalse((self.work / 'outside.ran').exists())
+
+    def test_build_created_symlink_is_refused_before_next_command(self):
+        outside = self.work / 'outside.py'
+        marker = self.work / 'outside.ran'
+        outside.write_text('from pathlib import Path\nPath(' + repr(str(marker)) + ').touch()\n')
+        entry = deepcopy(self.config['connectors']['extra'])
+        entry['build'].append(['{artifact:node}/bin/node', 'alias.py'])
+        payload = ('from pathlib import Path\nPath("alias.py").symlink_to(' +
+                   repr(str(outside)) + ')\n').encode()
+        self.add('extra', entry, {'build.py': payload})
+        with patch.object(catalog.subprocess, 'run', wraps=subprocess.run) as run:
+            with self.assertRaises(ArchiveError):
+                self.install()
+            self.assertEqual(run.call_count, 1)
+        self.assertFalse(marker.exists())
+
+    def test_preflight_and_launch_escapes_refused_before_execution_or_unit_render(self):
+        original = deepcopy(self.config)
+        for surface in ('preflight', 'launch'):
+            for arg in self.escape_args(Path(self.config['state_dir'])):
+                self.config = deepcopy(original)
+                if surface == 'preflight':
+                    self.config['catalog']['readiness']['run'][1] = arg
+                else:
+                    self.config['connectors']['extra']['settings']['args'] = [arg]
+                self.repin()
+                with self.subTest(surface=surface, arg=arg), patch.object(catalog.subprocess, 'run') as run:
+                    with self.assertRaises(ArchiveError):
+                        self.install()
+                    run.assert_not_called()
+                    if surface == 'preflight':
+                        with self.assertRaises(ArchiveError):
+                            catalog.preflight_unit(self.config, self.build)
+
+    def test_verify_reaudits_digest_valid_build_preflight_and_launch_argv(self):
+        _, original_recipe = self.install()
+        original = deepcopy(self.config)
+        for surface in ('build', 'preflight', 'launch'):
+            cwd = self.build / 'catalog/extra' if surface == 'build' else Path(self.config['state_dir'])
+            for arg in self.escape_args(cwd):
+                self.config = deepcopy(original)
+                recipe = deepcopy(original_recipe)
+                if surface == 'build':
+                    self.config['connectors']['extra']['build'][0][1] = arg
+                elif surface == 'preflight':
+                    self.config['catalog']['readiness']['run'][1] = arg
+                else:
+                    self.config['connectors']['extra']['settings']['args'] = [arg]
+                    recipe['mcpServers']['extra']['args'] = [arg]
+                pins = self.repin()
+                self.reseal(pins, recipe)
+                with self.subTest(surface=surface, arg=arg), self.assertRaises(ArchiveError):
+                    catalog.verify(self.config, pins, self.build)
+
+    def test_exported_launch_and_execstartpre_use_actual_cwd(self):
+        spec, _ = self.install()
+        pins = spec['pins']
+        script = self.build / 'run.sh'
+        unit = self.build / 'example.service'
+        node = catalog.runtime(self.config, self.build, 'node')
+        cwd = self.root / 'workspace'
+        cwd.mkdir()
+        lock = self.launch_lock(pins)
+        lock['units'] = [{'path': unit.name}]
+        for surface in ('launcher', 'ExecStart', 'ExecStartPre'):
+            for arg in self.escape_args(cwd):
+                script.write_text('#!/bin/sh\nexit 0\n')
+                body = '[Service]\nWorkingDirectory=' + str(cwd) + '\n'
+                if surface == 'launcher':
+                    script.write_text('#!/bin/sh\nexec ' + node + ' ' + arg + '\n')
+                    body += 'ExecStart=/bin/sh ' + str(script) + '\n'
+                else:
+                    body += surface + '=' + node + ' ' + arg + '\n'
+                unit.write_text(body)
+                with self.subTest(surface=surface, arg=arg), self.assertRaises(ArchiveError):
+                    catalog.verify(self.config, pins, self.build, lock)
+        # A relative path safe from the default state cwd escapes from this
+        # unit's cwd: the preflight drop-in must use the unit, not the default.
+        self.config['catalog']['readiness']['run'][1] = '../outside.py'
+        with self.assertRaises(ArchiveError):
+            catalog.preflight_unit(self.config, self.build, self.root, pins['platform'])
+
+    def test_argv_executable_exports_symlinks_and_ambiguous_forms(self):
+        spec, _ = self.install()
+        cwd = self.build / 'catalog/extra'
+        node = catalog.runtime(self.config, self.build, 'node')
+        for executable in self.escape_args(cwd)[:2]:
+            with self.subTest(executable=executable), self.assertRaises(ArchiveError):
+                catalog.audit_argv([executable], cwd, self.root, Path(self.config['state_dir']), {})
+        for arg in ('--config=../a:../../outside', '-r../../outside.py',
+                    '$(pwd)/file', '@../response', 'file:../outside', '--config=~/outside', '--eval=outside'):
+            with self.subTest(arg=arg), self.assertRaises(ArchiveError):
+                catalog.audit_argv([node, arg], cwd, self.root, Path(self.config['state_dir']), {})
+        (cwd / 'server.py').unlink()
+        (cwd / 'server.py').symlink_to(self.work / 'outside.py')
+        with self.assertRaises(ArchiveError):
+            catalog.audit_descriptors(self.config, spec['pins'], self.build)
+
+    def test_launcher_cd_and_unclassified_shell_forms_fail_closed(self):
+        spec, _ = self.install()
+        node = catalog.runtime(self.config, self.build, 'node')
+        lock = self.launch_lock(spec['pins'])
+        for body in ('cd ' + str(self.root) + '\nexec ' + node + ' ../outside.py',
+                     'exec ' + node + ' $(pwd)/script.py',
+                     'exec ' + node + ' build.py; exit 0',
+                     'cd relative\nexec ' + node + ' build.py',
+                     '/bin/sh -c outside'):
+            (self.build / 'run.sh').write_text('#!/bin/sh\n' + body + '\n')
+            with self.subTest(body=body), self.assertRaises(ArchiveError):
+                catalog.verify(self.config, spec['pins'], self.build, lock)
+
+    def test_literal_local_argv_and_unit_cwd_are_accepted(self):
+        spec, _ = self.install()
+        cwd = self.build / 'catalog/extra'
+        node = catalog.runtime(self.config, self.build, 'node')
+        for arg in ('build.py', './build.py', '../extra/build.py', '--outfile=dist/adapter.js'):
+            catalog.audit_argv([node, arg], cwd, self.root, Path(self.config['state_dir']), {})
+        (cwd / 'alias.py').symlink_to(cwd / 'build.py')
+        catalog.audit_argv([node, 'alias.py'], cwd, self.root, Path(self.config['state_dir']), {})
+        body = '[Service]\nWorkingDirectory=' + str(cwd) + '\nExecStart=' + node + ' ./build.py\n'
+        self.assertEqual(catalog.audit_unit(body, self.root, Path(self.config['state_dir']), {}), cwd)
+        with self.assertRaises(ArchiveError):
+            catalog.audit_unit('[Service]\nExecStart=' + node, self.root, Path(self.config['state_dir']), {})
+        for command in ('-/outside/node', 'node', '@' + node):
+            bad = '[Service]\nWorkingDirectory=' + str(cwd) + '\nExecStart=' + command
+            with self.subTest(command=command), self.assertRaises(ArchiveError):
+                catalog.audit_unit(bad, self.root, Path(self.config['state_dir']), {})
+        with self.assertRaises(ArchiveError):
+            catalog.audit_unit(body + 'WorkingDirectory = ' + str(self.root),
+                               self.root, Path(self.config['state_dir']), {})
+
     def test_input_archives_and_checkout_must_belong_to_agent(self):
         self.config['cook']['host_repo'] = '/opt/other-agent/host'
         with self.assertRaises(ArchiveError):

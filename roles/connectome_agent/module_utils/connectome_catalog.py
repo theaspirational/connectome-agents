@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import subprocess
 import tarfile
 
@@ -194,6 +195,161 @@ def audit(value, root, state, platform):
                  raw in platform, 'absolute dependency outside agent tree and pinned platform closure')
 
 
+def audit_path(value, cwd, root, state, platform):
+    """Resolve against the execution cwd, including existing symlink parents."""
+    need(isinstance(value, str) and bool(re.fullmatch(r'[A-Za-z0-9_.+@/-]+', value)),
+         'ambiguous command path')
+    path = Path(value)
+    path = path if path.is_absolute() else Path(cwd) / path
+    try:
+        resolved = path.resolve()
+        roots = (Path(root).resolve(), Path(state).resolve())
+        pinned = {Path(p).resolve() for p in platform}
+    except (OSError, RuntimeError):
+        need(False, 'unresolvable command path')
+    need(any(resolved.is_relative_to(base) for base in roots) or resolved in pinned,
+         'command dependency outside agent tree and pinned platform closure')
+    return resolved
+
+
+def audit_argv(argv, cwd, root, state, platform):
+    """Accept literal words/paths and flags, not an embedded command language.
+
+    Even bare words may name files: check them as cwd-relative paths. Only
+    unambiguous long-option=value syntax is split; attached short options,
+    response files, URLs, lists, substitutions and encoded forms fail closed.
+    """
+    need(isinstance(argv, list) and argv and all(isinstance(a, str) and a for a in argv),
+         'command must be nonempty argv')
+    audit_path(str(cwd), root, root, state, platform)
+    need('/' in argv[0], 'executable requires an explicit path')
+    audit_path(argv[0], cwd, root, state, platform)
+    options = True
+    for arg in argv[1:]:
+        if options and arg == '--':
+            options = False
+            continue
+        if options and arg.startswith('-'):
+            option, sep, value = arg.partition('=')
+            need(bool(re.fullmatch(r'--[A-Za-z0-9][A-Za-z0-9-]*|-[A-Za-z0-9]', option)),
+                 'ambiguous command option')
+            need(option not in ('-c', '-e', '--command', '--eval'), 'inline command language refused')
+            if not sep:
+                continue
+            need(option.startswith('--'), 'ambiguous attached short option')
+            arg = value
+        need(not arg.startswith('@'), 'ambiguous command argument')
+        audit_path(arg, cwd, root, state, platform)
+
+
+def build_argv(config, build, argv):
+    argv = expand(argv, build, entries_for(config))
+    if argv[0] in ('bun', 'node'):
+        argv[0] = runtime(config, build, argv[0])
+    return argv
+
+
+def audit_recipe(recipe, build, state, platform, cwd=None):
+    root = Path(build).parent.parent
+    audit(recipe, root, Path(state), platform)
+    # Native command/args objects can also occur in provider/adapter settings.
+    def visit(value, cwd):
+        if isinstance(value, dict):
+            if 'cwd' in value:
+                cwd = audit_path(value['cwd'], cwd, root, state, platform)
+            if 'command' in value:
+                command, args = value['command'], value.get('args', [])
+                need(isinstance(command, str) and isinstance(args, list), 'ambiguous launch command')
+                audit_argv([command] + args, cwd, root, state, platform)
+            elif 'args' in value:
+                need(False, 'launch args without a classified command')
+            for child in value.values():
+                visit(child, cwd)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, cwd)
+    visit(recipe, Path(state) if cwd is None else cwd)
+
+
+def audit_descriptors(config, pins, build):
+    build = Path(build)
+    root, state = build.parent.parent, Path(config['state_dir'])
+    for name, entry in entries_for(config).items():
+        cwd = build / 'catalog' / name
+        for argv in entry.get('build', []):
+            audit_argv(build_argv(config, build, argv), cwd, root, state, pins['platform'])
+        for value in entry.get('exports', {}).values():
+            audit_path(value, cwd, root, state, pins['platform'])
+    for argv in preflights(config, build):
+        audit_argv(argv, state, root, state, pins['platform'])
+    if 'command' in config.get('health', {}):
+        audit_argv(config['health']['command'], build, root, state, pins['platform'])
+
+
+def literal_words(value):
+    need(not any(c in value for c in '$%`\\;|&<>(){}*?\n\r'),
+         'ambiguous launch syntax')
+    try:
+        return shlex.split(value)
+    except ValueError:
+        need(False, 'invalid launch quoting')
+
+
+def audit_unit(body, root, state, platform):
+    """Only literal Service commands with an explicit execution directory."""
+    section, commands, cwd = None, [], None
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith(('#', ';')):
+            continue
+        if line.startswith('['):
+            section = line
+            continue
+        key, sep, value = line.partition('=')
+        key, value = key.strip(), value.strip()
+        if section != '[Service]':
+            continue
+        need(bool(sep), 'ambiguous unit directive')
+        need(key not in ('RootDirectory', 'RootImage', 'ExecSearchPath'), 'unit execution remapping refused')
+        if key == 'WorkingDirectory':
+            need(cwd is None and Path(value).is_absolute(), 'ambiguous unit working directory')
+            cwd = audit_path(value, root, root, state, platform)
+        if key.startswith('Exec'):
+            commands.append(literal_words(value))
+    need(cwd is not None, 'unit requires explicit working directory')
+    for argv in commands:
+        need(argv and Path(argv[0]).is_absolute(), 'unit requires a literal absolute executable')
+        audit_argv(argv, cwd, root, state, platform)
+    return cwd
+
+
+def audit_launcher(body, cwd, root, state, platform):
+    # This is deliberately not a shell interpreter. Unclassified shell syntax
+    # must not turn into an unchecked argv or an unknown execution directory.
+    working_dirs = [cwd]
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith('#!'):
+            audit_argv(literal_words(line[2:]), cwd, root, state, platform)
+            continue
+        if not line or line.startswith('#'):
+            continue
+        argv = literal_words(line)
+        need(bool(argv), 'empty launcher command')
+        if argv[0] == 'cd':
+            # Shell CDPATH and logical '..' processing must not change the
+            # directory from the literal physical path checked here.
+            need(len(argv) == 2 and Path(argv[1]).is_absolute() and
+                 '..' not in Path(argv[1]).parts, 'ambiguous launcher cwd')
+            cwd = audit_path(argv[1], cwd, root, state, platform)
+            working_dirs.append(cwd)
+        elif argv[0] == 'exit':
+            need(len(argv) == 2 and argv[1].isdigit(), 'ambiguous launcher exit')
+        else:
+            audit_argv(argv[1:] if argv[0] == 'exec' else argv, cwd, root, state, platform)
+    return working_dirs
+
+
 def tree_inventory(directory):
     need(directory.is_dir() and directory.resolve() == directory, 'artifact directory alias refused')
     result = {}
@@ -240,6 +396,8 @@ def install(config, pins, build):
     root, state = build.parent.parent, Path(config['state_dir'])
     entries = entries_for(config)
     check_platform(pins)
+    audit_descriptors(config, pins, build)
+    audit_recipe(json.loads((build / 'cook-recipe.json').read_text()), build, state, pins['platform'])
     directory = build / 'catalog'
     directory.mkdir()
     env = {'HOME': str(build / 'catalog-home'), 'TMPDIR': str(build / 'catalog-tmp'),
@@ -255,17 +413,20 @@ def install(config, pins, build):
         env['PATH'] = os.pathsep.join(str(directory / n / Path(e['exports'][n]).parent)
                                       for n, e in entries.items() if n in ('node', 'bun') and
                                       (directory / n).exists())
-        for argv in expand(entry.get('build', []), build, entries):
-            if argv[0] in ('bun', 'node'):
-                argv[0] = runtime(config, build, argv[0])
-            audit(argv, root, state, pins['platform'])
-            need(Path(argv[0]).is_absolute() and Path(argv[0]).is_file(), 'build executable must be absolute and installed')
+        for raw in entry.get('build', []):
+            argv = build_argv(config, build, raw)
+            audit_argv(argv, directory / name, root, state, pins['platform'])
+            executable = audit_path(argv[0], directory / name, root, state, pins['platform'])
+            need(executable.is_file(), 'build executable must be installed')
             # Output is private; build scripts cannot print credentials into a result.
             result = subprocess.run(argv, cwd=directory / name, env=env,
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             need(result.returncode == 0, 'artifact build failed')
         for value in entry.get('exports', {}).values():
+            audit_path(value, directory / name, root, state, pins['platform'])
             need((directory / name / value).is_file(), 'artifact export missing after build')
+    audit_descriptors(config, pins, build)
+    audit_recipe(json.loads((build / 'cook-recipe.json').read_text()), build, state, pins['platform'])
     record = {'schema': 'connectome.catalog-lock/v1', 'pins': {k: pins[k] for k in ('artifacts', 'platform')},
               'descriptors': {n: descriptor_digest(e) for n, e in entries.items()},
               'recipe_sha256': sha256(build / 'cook-recipe.json'),
@@ -285,9 +446,14 @@ def preflights(config, build):
             for name in order(entries) if kind(entries[name]) == 'preflight']
 
 
-def preflight_unit(config, build):
+def preflight_unit(config, build, cwd=None, platform=None):
+    build = Path(build)
+    state = Path(config['state_dir'])
+    cwd = state if cwd is None else cwd
+    platform = {} if platform is None else platform
     lines = []
     for argv in preflights(config, build):
+        audit_argv(argv, cwd, build.parent.parent, state, platform)
         need(Path(argv[0]).is_absolute(), 'preflight executable must be absolute')
         # No systemd specifiers or environment expansion in executable argv.
         need(all(not any(c in arg for c in '%$\n\r\\\"') for arg in argv), 'unsafe preflight unit argv')
@@ -308,9 +474,10 @@ def verify(config, pins, build, lock=None):
         need(record == expected, 'catalog installed inventory differs from lock')
         check_platform(pins)
         recipe = json.loads((build / 'cook-recipe.json').read_text())
-        audit(recipe, root, state, pins['platform'])
+        audit_descriptors(config, pins, build)
+        audit_recipe(recipe, build, state, pins['platform'])
         audit(config.get('health', {}), root, state, pins['platform'])
-        audit(preflight_unit(config, build), root, state, pins['platform'])
+        audit(preflight_unit(config, build, platform=pins['platform']), root, state, pins['platform'])
         if lock:
             audit(lock, root, state, pins['platform'])
             need(lock['recipe']['sha256'] == record['recipe_sha256'], 'cook recipe digest mismatch')
@@ -321,11 +488,20 @@ def verify(config, pins, build, lock=None):
             for name, engine in lock['engines'].items():
                 need(engine['path'] == engine['realPath'] == runtime(config, build, name), 'engine outside pinned catalog')
                 need(engine['version'].removeprefix('v') == pins['artifacts'][name]['version'], 'engine version mismatch')
-            paths = [lock['launch']['script']] + [u['path'] for u in lock.get('units', [])]
-            for name in paths:
-                path = build / name
-                need(path.resolve().is_relative_to(build), 'launch path escapes build')
+            working_dirs = []
+            for unit in lock.get('units', []):
+                path = build / unit['path']
+                need(path.resolve().is_relative_to(build), 'unit path escapes build')
                 audit(path.read_text(), root, state, pins['platform'])
+                cwd = audit_unit(path.read_text(), root, state, pins['platform'])
+                preflight_unit(config, build, cwd, pins['platform'])
+                working_dirs.append(cwd)
+            path = build / lock['launch']['script']
+            need(path.resolve().is_relative_to(build), 'launch path escapes build')
+            audit(path.read_text(), root, state, pins['platform'])
+            for cwd in working_dirs or [state]:
+                for launch_cwd in audit_launcher(path.read_text(), cwd, root, state, pins['platform']):
+                    audit_recipe(recipe, build, state, pins['platform'], launch_cwd)
     except (OSError, ValueError, KeyError, TypeError):
         raise ArchiveError('catalog lock or launch surface invalid', 'E_CATALOG_INVALID') from None
 

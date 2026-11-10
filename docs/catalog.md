@@ -132,9 +132,19 @@ before build and activation/reuse. Cook's build PATH contains only installed
 engines and aliases for these exact pinned tools, with private build caches.
 
 The audit refuses undeclared absolute paths in compiled recipe fields (including
-nested args/env), build argv, preflight argv, health commands, cook lock paths,
-launcher scripts and exported units. It rejects symlink escapes and checks the
-entire installed artifact inventory (file hashes/modes and no links). The only
+nested args/env), health settings, cook lock paths, launcher scripts and exported
+units. Every build, launch, health and preflight argv is additionally checked
+against its execution cwd, including its executable, relative paths, bare file
+names and `--option=value` operands. Symlinks are resolved before the boundary
+check. Build argv are rechecked during lock verification, not just installation.
+Ambiguous argument syntax (attached short-option values, response files, URLs,
+path lists, inline command evaluation, substitutions or encoded forms) fails closed. Use literal argv and
+explicit executable paths (build-only `node`/`bun` aliases remain supported).
+Exported units must have an explicit literal `WorkingDirectory`; their Exec
+commands and the added preflights use that cwd. Launch scripts accept only
+literal commands, `exec`, absolute `cd` without `..`, and numeric `exit`, not
+arbitrary shell syntax.
+The audit also checks the entire installed artifact inventory (file hashes/modes and no links). The only
 path roots admitted are the agent deployment tree, its explicitly configured
 separate persistent state, and exact platform pins. There is no external-directory
 exception for catalog MCP servers. Cook's engine provenance and external server

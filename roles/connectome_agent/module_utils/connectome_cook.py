@@ -177,7 +177,7 @@ def recipe_from_spec(spec, recipe_bytes=None, build_dir=None):
                 settings['source'] = {'external': True}
                 recipe['mcpServers'][name] = settings
         recipe = catalog.expand(recipe, build_dir, catalog.entries_for(config))
-        catalog.audit(recipe, Path(build_dir).parent.parent, Path(config['state_dir']), pins['platform'])
+        catalog.audit_recipe(recipe, build_dir, config['state_dir'], pins['platform'])
     names = environment_names(config)
     need(not set(names) & BASE_ENV and not set(names) & {'DATA_DIR', 'WORKSPACE_DIR'},
          'secret names overlap adapter-owned environment')
@@ -305,6 +305,14 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
             argv.append(value)
     # Validate all input before even the verification Git subprocesses spawn.
     validate_arguments(argv, flag_indices)
+    if catalog.active(config):
+        # These operands are assembled above, not arbitrary catalog syntax:
+        # cook's name=archive#sha256=digest has exactly one filesystem field.
+        audited = list(argv)
+        for index in flag_indices:
+            if argv[index] == '--host-dependency':
+                audited[index + 1] = argv[index + 1].split('=', 1)[1].rsplit('#sha256=', 1)[0]
+        catalog.audit_argv(audited, build, root, state, spec['pins']['platform'])
     env = (catalog.environment(config, spec['pins'], build) if catalog.active(config) else clean_environment())
     verify_cook(entrypoint, pins['cook'], env)
     command(argv, cwd=build, env=env, flag_indices=flag_indices)
