@@ -93,6 +93,15 @@ The syntax script explicitly skips when Ansible is unavailable; the Python
 suite then exercises the same deployment engine and a merge fallback, not an
 Ansible execution. No gate downloads dependencies or contacts a remote.
 
+Deployment unit tests inject offline cook, service-manager and static-verifier
+commands. Their private scratch ignores `TMPDIR`/`HOME`; a test-only metadata
+boundary models root-owned 0755 ancestors **above** the scratch root. Files and
+metadata inside it remain real, including unsafe-ancestor refusal cases. No host
+permissions are changed. Unprivileged-account tests explicitly skip as root.
+The real static verifier is opt-in with `CONNECTOME_TEST_SYSTEMD_ANALYZE=1`;
+it skips when systemd tools, a user runtime directory or user manager are absent.
+Historical compatibility tests skip if their local Git baseline is unavailable.
+
 Publication: publish only the clean branch descending from the initial commit;
 do not mirror unrelated refs. The public checker scans tracked and nonignored
 untracked working-tree files, including paths. With `--range A..B` it also scans

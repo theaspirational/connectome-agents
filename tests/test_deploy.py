@@ -6,7 +6,6 @@ import importlib.util
 from pathlib import Path
 import stat
 import sys
-import tempfile
 import unittest
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
@@ -17,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'roles/connectome_agent/module_utils'))
 from connectome_config import merge_layers, public_catalog
 from connectome_deploy import Deployment, DeployError, make_directory
+from deploy_fixtures import private_scratch
 
 
 def read(path):
@@ -44,11 +44,11 @@ class MockProvider:
 
 class DeployTests(unittest.TestCase):
     def setUp(self):
+        if os.geteuid() == 0:
+            self.skipTest('deployment fixtures model an unprivileged agent account')
         old_mask = os.umask(0o022)
         self.addCleanup(os.umask, old_mask)
-        # Deployment fixtures must have non-writable ancestors, like real cook.
-        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', Path.home()))
-        self.addCleanup(self.tmp.cleanup)
+        self.tmp = private_scratch(self)
         self.root = Path(self.tmp.name) / 'agent'
         self.units = Path(self.tmp.name) / 'units'
         self.config = example()
@@ -66,10 +66,12 @@ class DeployTests(unittest.TestCase):
         self.provider_path.write_text(json.dumps({'EXAMPLE_SECRET': 'synthetic-value',
                                                  'UNUSED_SECRET': 'never-requested'}))
         self.provider = MockProvider(self.provider_path)
+        self.analyze = [sys.executable, str(ROOT / 'tests/fixtures/analyze.py')]
 
     def deployment(self, config=None, check=False, versions=None):
         return Deployment(self.root, self.units, config or self.config,
-                          versions or self.versions, self.cook, self.systemctl, check)
+                          versions or self.versions, self.cook, self.systemctl, check,
+                          analyze_command=self.analyze)
 
     def apply(self, deployment):
         plan = deployment.prepare()
@@ -223,6 +225,7 @@ class DeployTests(unittest.TestCase):
         self.assert_no_activation()
 
     def test_install_only_runs_static_verify_when_available(self):
+        self.analyze = None  # Exercise production discovery with a fake tool.
         self.track_units()
         self.config['activation'] = 'install_only'
         import connectome_deploy
@@ -230,6 +233,7 @@ class DeployTests(unittest.TestCase):
         def verify(argv, **kwargs):
             if argv[0] == '/test/systemd-analyze':
                 self.assertEqual(argv[1:3], ['--user', 'verify'])
+                self.assertTrue(kwargs['unit_verify'])
                 self.assertTrue(Path(argv[3]).is_file())
                 return
             return original(argv, **kwargs)
@@ -252,6 +256,73 @@ class DeployTests(unittest.TestCase):
         self.assert_no_activation()
         with patch('connectome_deploy.shutil.which', return_value=None):
             self.assertFalse(self.apply(self.deployment())['changed'])
+
+    def test_verifier_failure_reports_step_tool_status_without_output(self):
+        self.track_units()
+        self.config['activation'] = 'install_only'
+        # Exercise real subprocess failure, not just a mocked exception.
+        self.analyze = [sys.executable, '-c',
+                        'import sys; print("synthetic-private-canary", file=sys.stderr); sys.exit(7)']
+        dep = self.deployment()
+        dep.prepare()
+        with patch('connectome_deploy.shutil.which', side_effect=AssertionError('host discovery')), \
+                self.assertRaises(DeployError) as failure:
+            dep.activate({})
+        error = failure.exception
+        self.assertEqual(error.code, 'E_UNIT_VERIFY')
+        self.assertIn('activation failed at health: systemd-analyze exited 7', str(error))
+        self.assertIn('systemd-analyze exited 7', error.public()['msg'])
+        self.assertEqual(error.__cause__.returncode, 7)
+        self.assertFalse(dep.current.exists())
+        self.assert_no_activation()
+        import traceback
+        diagnostic = ''.join(traceback.format_exception(error)) + json.dumps(error.public())
+        self.assertNotIn('synthetic-private-canary', diagnostic)
+
+    def test_activation_cause_survives_failed_recovery_without_private_context(self):
+        import connectome_deploy
+        import traceback
+        for recovery_fails in (False, True):
+            with self.subTest(recovery_fails=recovery_fails):
+                first = self.deployment()
+                self.apply(first)
+                second = self.deployment(dict(self.config, description='changed'))
+                second.prepare()
+                original = DeployError('synthetic-private-canary', 'E_ENVIRONMENT_FILE')
+                recovery = RuntimeError('synthetic-private-canary') if recovery_fails else None
+                with patch.object(connectome_deploy.Deployment, '_health',
+                                  side_effect=[original, recovery]), self.assertRaises(DeployError) as failure:
+                    second.activate({})
+                error = failure.exception
+                self.assertEqual(error.__cause__.code, 'E_ENVIRONMENT_FILE')
+                self.assertIn('activation failed at health', str(error))
+                self.assertIn('rollback recovery also failed' if recovery_fails else
+                              'previous deployment restored', str(error))
+                self.assertEqual(first.current.resolve(), first.build)
+                diagnostic = ''.join(traceback.format_exception(error)) + json.dumps(error.public())
+                self.assertNotIn('synthetic-private-canary', diagnostic)
+
+    @unittest.skipUnless(os.environ.get('CONNECTOME_TEST_SYSTEMD_ANALYZE') == '1',
+                         'real systemd-analyze integration is opt-in')
+    def test_real_static_verifier_with_user_runtime(self):
+        import shutil
+        import subprocess
+        analyzer, manager = shutil.which('systemd-analyze'), shutil.which('systemctl')
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        if not analyzer or not manager or not runtime or not Path(runtime).is_dir():
+            self.skipTest('real verifier requires systemd tools and a user runtime directory')
+        try:
+            status = subprocess.run([manager, '--user', 'show-environment'], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=5).returncode
+        except (OSError, subprocess.TimeoutExpired):
+            self.skipTest('real verifier requires an available user manager')
+        if status:
+            self.skipTest('real verifier requires a reachable user manager')
+        self.analyze = [analyzer]
+        self.track_units()
+        self.config['activation'] = 'install_only'
+        self.apply(self.deployment())
+        self.assert_no_activation()
 
     def test_exclusive_units_refuse_start_in_both_scopes(self):
         for scope in ('system', 'user'):

@@ -4,18 +4,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import pwd
 import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import unittest
 from unittest.mock import call, patch
 from types import SimpleNamespace
 
 import test_cook
 import test_deploy
+from deploy_fixtures import private_scratch, scratch
 from test_cook import fixture, adapter
 from connectome_lock import read_lock, LockError
 import connectome_inputs as inputs
@@ -60,21 +59,6 @@ def system_script():
             return str(path)
     except DeployError:
         pass
-    return None
-
-
-def fakeroot_base():
-    """A directory whose ancestors fakeroot can present as root-owned and usable.
-
-    Ancestors must not be group/other-writable and must grant read/traverse to
-    other or to group (the fakeroot case then assigns them the agent's group).
-    """
-    for candidate in (os.environ.get('TMPDIR'), str(Path.home())):
-        if candidate and Path(candidate).is_dir():
-            path = Path(candidate).resolve()
-            if all(not mode & 0o022 and (mode & 0o005 == 0o005 or mode & 0o050 == 0o050)
-                   for mode in (p.stat().st_mode for p in (path, *path.parents))):
-                return path
     return None
 
 
@@ -218,8 +202,9 @@ class ExternalAdapterTests(test_cook.ScratchTest):
 
 class OwnershipTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', Path.home()))
-        self.addCleanup(self.tmp.cleanup)
+        if os.geteuid() == 0:
+            self.skipTest('ownership/access fixtures model an unprivileged agent account')
+        self.tmp = private_scratch(self)
         self.work = Path(self.tmp.name).resolve()
 
     def test_real_root_owned_command_and_symlink_chain_accepted(self):
@@ -243,10 +228,7 @@ class OwnershipTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('fakeroot'), 'fakeroot unavailable')
     def test_fakeroot_owner_mode_ancestor_and_link_refusals(self):
         """Real lstat on real files; fakeroot only fakes uid 0 and chown."""
-        base = fakeroot_base()
-        if base is None:
-            self.skipTest('TMPDIR/HOME ancestors are writable, or deny the agent read/traverse')
-        tmp = tempfile.TemporaryDirectory(dir=base)
+        tmp = scratch()
         self.addCleanup(tmp.cleanup)
         self.work = Path(tmp.name).resolve()
         script = r'''
@@ -254,6 +236,8 @@ import json, os, sys
 from pathlib import Path
 from connectome_deploy import DeployError, check_external_command
 base = Path(sys.argv[1])
+from deploy_fixtures import safe_ancestors
+safe_ancestors(base).start()
 account = (int(sys.argv[2]), set(json.loads(sys.argv[3])))
 OTHER_GROUP = 4321
 def tree(label, file_mode=0o755, dir_mode=0o755):
@@ -266,12 +250,6 @@ def tree(label, file_mode=0o755, dir_mode=0o755):
     directory.chmod(dir_mode)
     return directory, target
 os.chmod(base, 0o755)
-# A private TMPDIR's own ancestors may deny "other" (for example a 0750
-# HOME). Within fakeroot only, give them the agent's group; real files keep
-# their owner. Every created case below is still checked with real modes.
-for parent in base.parents:
-    if parent.stat().st_mode & 0o005 != 0o005:
-        os.chown(parent, 0, min(account[1]))
 cases = {}
 _, cases['ok'] = tree('ok')
 directory, target = tree('relative-link')
@@ -321,7 +299,8 @@ print(json.dumps(result))
         self.assertNotIn(4321, groups)
         output = subprocess.run(['fakeroot', sys.executable, '-c', script, str(self.work),
                                  str(os.geteuid()), json.dumps(groups)],
-                                env=dict(os.environ, PYTHONPATH=str(MODULES)), cwd=self.work,
+                                env=dict(os.environ, PYTHONPATH=os.pathsep.join((str(MODULES), str(ROOT / 'tests')))),
+                                cwd=self.work,
                                 stdout=subprocess.PIPE, check=True).stdout
         result = json.loads(output)
         self.assertEqual(result.pop('ok'), ['ok', str(self.work / 'ok/bin/server')])
@@ -349,10 +328,7 @@ print(json.dumps(result))
     @unittest.skipUnless(shutil.which('fakeroot'), 'fakeroot unavailable')
     def test_fakeroot_pinned_node_file_and_python_directory(self):
         """Real files and all production checks; fakeroot supplies root ownership."""
-        base = fakeroot_base()
-        if base is None:
-            self.skipTest('no safe fakeroot ancestors')
-        with tempfile.TemporaryDirectory(dir=base) as work:
+        with scratch() as work:
             script = r'''
 import json
 import os
@@ -360,12 +336,13 @@ from pathlib import Path
 import sys
 from connectome_deploy import DeployError, external_paths, check_external_command, check_external_data_arg
 work = Path(sys.argv[1])
+from deploy_fixtures import safe_ancestors
+safe_ancestors(work).start()
 uid = int(sys.argv[2])
 account = (uid, set(json.loads(sys.argv[3])))
 os.umask(0o022)
 # Model a root-maintained /opt installation and a separate agent home.
-for parent in (work, *work.parents):
-    os.chown(parent, 0, os.getegid())
+os.chown(work, 0, os.getegid())
 work.chmod(0o755)
 opt = work / 'opt/example'
 opt.mkdir(parents=True)
@@ -444,7 +421,7 @@ print(json.dumps(dict(accepted=results, refused=len(refused))))
             groups = sorted({os.getegid(), *os.getgroups()})
             output = subprocess.run(
                 ['fakeroot', sys.executable, '-c', script, work, str(os.geteuid()), json.dumps(groups)],
-                env=dict(os.environ, PYTHONPATH=str(MODULES)), cwd=work,
+                env=dict(os.environ, PYTHONPATH=os.pathsep.join((str(MODULES), str(ROOT / 'tests')))), cwd=work,
                 stdout=subprocess.PIPE, check=True).stdout
             self.assertEqual(json.loads(output), {
                 'accepted': ['node', 'python', 'python-equals'], 'refused': 7})
@@ -518,10 +495,12 @@ class ExternalDeploymentTests(unittest.TestCase):
 class ExternalDataArgTests(unittest.TestCase):
     """Real private files, with targeted metadata changes for foreign uid cases."""
     def setUp(self):
-        self.home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
-        self.tmp = tempfile.TemporaryDirectory(dir=self.home)
-        self.addCleanup(self.tmp.cleanup)
-        self.directory = Path(self.tmp.name)
+        if os.geteuid() == 0:
+            self.skipTest('private-data ownership tests require a non-root account')
+        self.tmp = private_scratch(self)
+        self.home = Path(self.tmp.name)
+        self.directory = self.home / 'private'
+        self.directory.mkdir(mode=0o700)
         self.path = self.directory / 'registry.json'
         self.path.write_text('synthetic-private-data-canary')
         self.path.chmod(0o600)
@@ -530,7 +509,7 @@ class ExternalDataArgTests(unittest.TestCase):
                       'path': str(self.path), 'kind': 'file'}
 
     def check(self, path=None, kind='file'):
-        return check_external_data_arg('alpha', str(path or self.path), kind=kind)
+        return check_external_data_arg('alpha', str(path or self.path), home=self.home, kind=kind)
 
     def assert_data_error(self, call):
         with self.assertRaises(DeployError) as error:
@@ -719,6 +698,8 @@ class ExternalDataArgTests(unittest.TestCase):
         if command is None:
             self.skipTest('no safe root-owned script path')
         script = system_script()
+        if script is None:
+            self.skipTest('no safe root-owned script path')
         server = {'command': command, 'args': [], 'source': {'external': True}}
         recipe = {'mcpServers': {'alpha': server}}
         lock = {'external': [{'name': 'alpha', 'command': command}]}
@@ -908,6 +889,12 @@ class ExternalDataDeploymentTests(unittest.TestCase):
     recipe = ExternalDeploymentTests.recipe
 
     def data_config(self):
+        if os.geteuid() == 0:
+            self.skipTest('private-data ownership tests require a non-root account')
+        home = patch('connectome_deploy.pwd.getpwuid',
+                     return_value=SimpleNamespace(pw_dir=self.tmp.name))
+        home.start()
+        self.addCleanup(home.stop)
         self.command = system_interpreter()
         if self.command is None:
             self.skipTest('no safe root-owned executable')
@@ -966,6 +953,8 @@ class ExternalDataDeploymentTests(unittest.TestCase):
     def test_python_state_directory_flag_prepare_activate_and_recheck(self):
         self.data_config()
         command, script = '/usr/bin/python3', system_script()
+        if script is None:
+            self.skipTest('no safe root-owned script path')
         try:
             check_external_command('alpha', command)
             check_external_command('alpha', script, True)
@@ -1110,6 +1099,8 @@ class ExternalDataDeploymentTests(unittest.TestCase):
     def test_python_option_value_private_script_probe_refused(self):
         self.data_config()
         command, script = '/usr/bin/python3', system_script()
+        if script is None:
+            self.skipTest('no safe root-owned script path')
         try:
             check_external_command('alpha', command)
             check_external_command('alpha', script, True)

@@ -30,6 +30,32 @@ class DeployError(SafeError):
     pass
 
 
+class UnitVerificationFailed(DeployError):
+    """Closed tool identity and numeric status only; never command output."""
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+        detail = ('unavailable' if returncode is None else 'exited ' + str(returncode))
+        super().__init__('systemd-analyze ' + detail, 'E_UNIT_VERIFY')
+
+    def public(self):
+        result = super().public()
+        result['msg'] += ' (' + str(self) + ')'
+        return result
+
+
+class ActivationFailed(DeployError):
+    """Activation context built only from fixed steps and sanitized causes."""
+    def __init__(self, step, cause, restored):
+        status = 'previous deployment restored' if restored else 'rollback recovery also failed'
+        super().__init__('activation failed at ' + step + ': ' + str(cause) + '; ' + status,
+                         cause.code if restored else 'E_DEPLOY_FAILED')
+
+    def public(self):
+        result = super().public()
+        result['msg'] += ' (' + str(self) + ')'
+        return result
+
+
 class UnitActive(DeployError):
     """Unit names and scopes have passed the closed input/unit-name schema."""
     def __init__(self, unit, scope='user', code='E_UNIT_ACTIVE'):
@@ -346,7 +372,7 @@ def inside(root, value):
     return path
 
 
-def run(argv, cwd=None, adapter=False):
+def run(argv, cwd=None, adapter=False, unit_verify=False):
     # Only prepare may accept the adapter's closed JSON envelope. Systemctl and
     # health output cannot impersonate adapter diagnostics.
     with tempfile.TemporaryFile() as errors:
@@ -354,8 +380,12 @@ def run(argv, cwd=None, adapter=False):
             result = subprocess.run(argv, cwd=cwd, stdout=subprocess.DEVNULL,
                                     stderr=errors if adapter else subprocess.DEVNULL, check=False)
         except OSError:
+            if unit_verify:
+                raise UnitVerificationFailed() from None
             raise DeployError('command unavailable', 'E_COOK_FAILED' if adapter else 'E_DEPLOY_FAILED') from None
         if result.returncode:
+            if unit_verify:
+                raise UnitVerificationFailed(result.returncode) from None
             if adapter:
                 errors.seek(0)
                 safe = adapter_diagnostic(errors.read(65537))
@@ -410,7 +440,7 @@ def resolve_pins(config, versions):
 
 class Deployment:
     def __init__(self, root, unit_dir, config, versions, cook_command, systemctl=None,
-                 check=False, base=None, operator_files=None):
+                 check=False, base=None, operator_files=None, analyze_command=None):
         # This constructor must stay mutation-free: the Ansible boundary creates
         # the root/serialization lock only AFTER all identifiers are validated.
         validate_config(config)
@@ -423,6 +453,9 @@ class Deployment:
         self.pins = resolve_pins(config, versions)
         self.cook_command = cook_command
         self.systemctl = systemctl or ['systemctl', '--user']
+        # None discovers the host verifier; an explicit argv is injectable like
+        # cook/systemctl. An empty argv models an unavailable optional verifier.
+        self.analyze_command = analyze_command
         self.check = check
         self.rendered_units = {}
         self.names = secret_names(config)
@@ -815,9 +848,13 @@ class Deployment:
                     raise DeployError('installed unit file missing')
                 self._check_environment_file(name, build)
             self._refuse_active(units)
-            analyze = shutil.which('systemd-analyze')
+            analyze = self.analyze_command
+            if analyze is None:
+                executable = shutil.which('systemd-analyze')
+                analyze = [executable] if executable else []
             if analyze and units:
-                run([analyze, '--user', 'verify'] + [str(self._unit_path(name)) for name in units])
+                run(analyze + ['--user', 'verify'] + [str(self._unit_path(name)) for name in units],
+                    unit_verify=True)
             return
         for name in units:
             run(self.systemctl + ['is-active', '--quiet', name])
@@ -1153,17 +1190,29 @@ class Deployment:
             return self._status({'changed': False})
         old_env = env_path.read_text() if env_path.exists() else None
         atomic_write(env_path, env)
+        step = 'secret files'
         try:
             if file_names:
                 self._set_secret_files(file_values, file_names)
+            step = 'release pointer'
             self._put(self.current, self._link_record(self.build))
+            step = 'unit installation'
             self._install(units, previous_units, self.build)
+            step = 'health'
             self._health(units, lock, self.build)
+            step = 'activation state'
             if self.activation == 'install_only':
                 atomic_write(self.state / 'activation', 'install_only\n')
             else:
                 (self.state / 'activation').unlink(missing_ok=True)
         except Exception as error:
+            # Use only closed diagnostics, never exception text, command argv,
+            # stderr or environment values. Preserve the *first* failure even
+            # when recovery fails too; public() still uses the existing code.
+            cause = (error if isinstance(error, UnitVerificationFailed) else
+                     DeployError(SafeError.public(error)['msg'], error.code)
+                     if isinstance(error, SafeError) else
+                     DeployError('unexpected activation exception (details redacted)'))
             try:
                 if file_names:
                     self._set_secret_files(file_snapshot, file_names)
@@ -1177,7 +1226,6 @@ class Deployment:
                     self._remove(self.current)
                     self._install({}, units, self.build)
             except Exception:
-                raise DeployError('activation failed; rollback recovery also failed') from None
-            raise DeployError('activation failed; previous deployment restored',
-                              error.code if isinstance(error, DeployError) else 'E_DEPLOY_FAILED') from None
+                raise ActivationFailed(step, cause, restored=False) from cause
+            raise ActivationFailed(step, cause, restored=True) from cause
         return self._status({'changed': True, 'build_dir': str(self.build), 'build_id': lock['build']['id']})

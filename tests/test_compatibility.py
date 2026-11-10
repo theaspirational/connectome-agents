@@ -5,11 +5,11 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 
 import test_deploy
 import test_cook
+from deploy_fixtures import scratch
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = '64d0e3a'
@@ -35,7 +35,8 @@ original = deploy.run
 def record(argv, **kwargs):
     calls.append(argv)
     return original(argv, **kwargs)
-with patch.object(deploy, 'run', side_effect=record):
+from deploy_fixtures import safe_ancestors
+with safe_ancestors(work), patch.object(deploy, 'run', side_effect=record):
     dep = deploy.Deployment(work / 'agent', work / 'units', config, versions, cook, manager)
     prepared = dep.prepare()
     dep.activate({})
@@ -65,9 +66,13 @@ print(json.dumps(result, sort_keys=True))
 '''
 
 
+@unittest.skipIf(os.geteuid() == 0, 'compatibility fixtures require an unprivileged account')
 class CompatibilityTests(unittest.TestCase):
     def test_default_off_byte_identical_render_argv_and_lock(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR', Path.home())) as tmp:
+        if subprocess.run(['git', 'cat-file', '-e', BASELINE + '^{commit}'], cwd=ROOT,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            self.skipTest('historical compatibility baseline unavailable locally')
+        with scratch() as tmp:
             work = Path(tmp).resolve()
             baseline = work / 'baseline'; baseline.mkdir()
             prefix = 'roles/connectome_agent/module_utils/'
@@ -98,7 +103,7 @@ class CompatibilityTests(unittest.TestCase):
             snapshots = []
             for modules, explicit in ((baseline, False), (ROOT / 'roles/connectome_agent/module_utils', False),
                                       (ROOT / 'roles/connectome_agent/module_utils', True)):
-                env = dict(os.environ, PYTHONPATH=str(modules))
+                env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(modules), str(ROOT / 'tests'))))
                 snapshots.append(subprocess.check_output([sys.executable, '-c', DRIVER, str(work)] +
                                  (['explicit'] if explicit else []), env=env, cwd=ROOT))
                 for name in ('agent', 'units', 'runtime-state', 'adapter'):
