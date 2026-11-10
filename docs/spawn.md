@@ -184,7 +184,17 @@ Descriptor contract shared with the role:
   archive pin record with `archive`, `version`, `sha256`, `descriptor_sha256`,
   and full nonzero `commit`.
 * `versions.artifacts.NAME` uses those four archive fields, without `commit`.
-  `version` is concrete semver; `archive` is a contained relative file path.
+  As in the role, that section takes precedence even for connector archive
+  records (which still require `commit`). `version` follows the role's concrete
+  three-number version syntax with an optional prerelease OR build suffix;
+  `archive` is a contained path under `inputs/`. Artifact paths allow `+` and
+  `@`, and export keys are strings, matching the role.
+* Archive connectors without `requires` implicitly require `node` and `bun`;
+  legacy Git-source connectors retain their dependency-free default.
+  Archive connector `settings.data_args` lowers to appended `--data-*=PATH`
+  operands and is removed, matching catalog compilation. The planner checks
+  literal containment in the instance state directory without probing target
+  files; apply-time link and launch-surface checks remain the role's job.
 * Descriptor SHA is computed from sorted compact JSON, `ensure_ascii=True`,
   UTF-8, excluding **only** `enabled`. Archive SHA is computed from local bytes.
   Both must match the reviewed catalog pins. Users never enter recipe/plan SHA

@@ -1,10 +1,11 @@
 """Read-only compiler; a plan is neither authorization nor a deployment receipt."""
 from copy import deepcopy
 import hashlib
+from pathlib import PurePosixPath
 import re
 import shlex
 
-from .catalog import (local_roots, pin, resolve, resolve_runtime, select, validate_catalog)
+from .catalog import (artifact_relative, local_roots, pin, resolve, resolve_runtime, select, validate_catalog)
 from .data import BUILD_BINDING, canonical, digest, fields, json_data, match, need
 from .schema import concrete, instance, template
 
@@ -68,11 +69,13 @@ def expand(value, selected):
     return value
 
 
-def connector_recipe(name, entry, record, selected):
+def connector_recipe(name, entry, record, selected, state):
     settings = deepcopy(entry['settings'])
     allowed = {'command', 'args', 'env', 'url', 'transport', 'token', 'toolPrefix',
                'enabledFeatureSets', 'disabledFeatureSets', 'enabledTools', 'disabledTools',
                'reconnect', 'reconnectIntervalMs', 'channelSubscription'}
+    if record['kind'] == 'archive':
+        allowed.add('data_args')
     need(settings.keys() <= allowed and type(settings.get('command')) is str,
          'connector requires supported native launch metadata')
     concrete(settings['command'])
@@ -90,6 +93,15 @@ def connector_recipe(name, entry, record, selected):
             need(key in names and value == '${' + key + '}', 'secret values forbidden in recipe')
     if record['kind'] == 'archive':
         settings = expand(settings, selected)
+        if 'data_args' in settings:
+            data = settings.pop('data_args')
+            need(type(data) is dict, 'data_args must be a mapping')
+            for flag, value in data.items():
+                need(match(flag, r'--data-[a-z][a-z0-9-]*') and type(value) is str and
+                     value.startswith('/'), 'invalid data argument')
+                artifact_relative(value[1:])
+                need(PurePosixPath(value).is_relative_to(state), 'data argument outside state')
+            settings['args'] = settings.get('args', []) + [k + '=' + v for k, v in data.items()]
         settings['source'] = {'external': True}
     else:
         need(not any('{artifact:' in s for s in (settings['command'], *settings.get('args', []))),
@@ -137,13 +149,15 @@ def make_plan(template_value, instance_value, catalog, stores, *, observed=None)
     recipe = {'name': logical, 'agent': agent, 'modules': {n: True for n in spec['modules']},
               'mcpServers': {}, 'extensions': {}}
     requirements, preflights, exports = set(), {}, {}
+    home, name = declaration['homeDirectory'], declaration['instance']
+    state = home + '/.local/state/connectome/' + name
     staged = {name for name, record in artifacts.items() if record['kind'] == 'archive'}
     for name in selected:
         entry = trusted.descriptors[name]
         requirements.update(entry.get('required_secrets', []))
         kind = entry.get('kind', 'connector')
         if kind == 'connector':
-            recipe['mcpServers'][name] = connector_recipe(name, entry, artifacts[name], staged)
+            recipe['mcpServers'][name] = connector_recipe(name, entry, artifacts[name], staged, state)
         if kind == 'preflight':
             preflights[name] = expand(entry['run'], staged)
         if entry.get('exports'):

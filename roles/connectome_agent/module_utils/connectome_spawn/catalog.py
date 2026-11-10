@@ -7,11 +7,11 @@ from pathlib import Path
 import re
 
 from .data import SpawnError, decode, fields, json_data, match, need
-from .sources import ARTIFACT_LIMIT, COMMIT, absolute, read_file, relative, resolve_artifact
+from .sources import ARTIFACT_LIMIT, COMMIT, absolute, read_file, resolve_artifact
 
 CATALOG_NAME = r'[a-z0-9][a-z0-9_-]{0,62}'
 SHA = r'[0-9a-f]{64}'
-VERSION = r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?'
+VERSION = r'\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?'
 # Explicit dispatch registry; adding a kind requires a validator and resolver.
 KINDS = {'connector': 'connectors', 'runtime': 'artifacts',
          'adapter': 'artifacts', 'preflight': 'artifacts'}
@@ -33,6 +33,13 @@ def descriptor_digest(entry):
 def argv(value):
     need(type(value) is list and bool(value) and all(type(v) is str and v and
          not any(ord(c) < 32 for c in v) for v in value), 'catalog argv must contain literal strings')
+
+
+def artifact_relative(value):
+    # The role permits package path characters beyond template-source paths.
+    need(match(value, r'[A-Za-z0-9_.+@/-]+') and
+         all(p not in ('', '.', '..') for p in value.split('/')),
+         'literal contained artifact path required')
 
 
 def descriptor(name, entry):
@@ -64,9 +71,9 @@ def descriptor(name, entry):
     if kind == 'preflight':
         need('run' in entry, 'preflight run argv required')
     exports = entry.get('exports', {})
-    need(type(exports) is dict and all(match(k, CATALOG_NAME) for k in exports), 'invalid exports')
+    need(type(exports) is dict and all(type(k) is str for k in exports), 'invalid exports')
     for value in exports.values():
-        relative(value)
+        artifact_relative(value)
     return kind
 
 
@@ -103,15 +110,16 @@ def pin(catalog, name):
     entry = catalog.descriptors[name]
     kind = descriptor(name, entry)
     pins = catalog.versions.get(KINDS[kind], {})
-    need(name in pins, 'catalog pin missing')
-    value = pins[name]
+    value = catalog.versions.get('artifacts', {}).get(name, pins.get(name))
+    need(value is not None, 'catalog pin missing')
     if type(value) is str:
         need(kind == 'connector' and match(value, COMMIT) and value != '0' * 40,
              'full nonzero connector commit required')
     else:
         fields(value, ('archive', 'version', 'sha256', 'descriptor_sha256'),
                ('commit',) if kind == 'connector' else ())
-        relative(value['archive'])
+        artifact_relative(value['archive'])
+        need(value['archive'].startswith('inputs/'), 'archive must be under inputs')
         need(match(value['version'], VERSION), 'concrete artifact version required')
         for field in ('sha256', 'descriptor_sha256'):
             need(match(value[field], SHA) and value[field] != '0' * 64, 'nonzero artifact digest required')
@@ -130,7 +138,13 @@ def select(catalog, connectors, runtime, preflights):
         if name in selected:
             return
         active.add(name)
-        for dependency in catalog.descriptors[name].get('requires', []):
+        entry = catalog.descriptors[name]
+        # T2 archive connectors implicitly depend on both local runtimes. The
+        # legacy Git-source bridge retains T1's dependency-free default.
+        archive_connector = (entry.get('kind', 'connector') == 'connector' and
+                             type(pin(catalog, name)) is dict)
+        default = ['node', 'bun'] if archive_connector else []
+        for dependency in entry.get('requires', default):
             visit(dependency)
         active.remove(name)
         selected.add(name)
@@ -154,7 +168,7 @@ def local_roots(value):
 def payload(root, path):
     """Archive roots and every ancestor must be literal and non-symlinked."""
     absolute(root)
-    relative(path)
+    artifact_relative(path)
     candidate = Path(root) / path
     for component in (candidate, *candidate.parents):
         need(not component.is_symlink(), 'symlinked payload path refused')

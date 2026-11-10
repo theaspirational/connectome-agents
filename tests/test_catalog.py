@@ -84,6 +84,92 @@ class CatalogTests(unittest.TestCase):
     def spec(self):
         return {'config': self.config, 'pins': resolve_pins(self.config, self.versions)}
 
+    def test_spawn_reader_loads_role_fixtures_and_matches_catalog_recipe(self):
+        from connectome_spawn import load_catalog, make_plan, SpawnError
+        from connectome_spawn.catalog import pin
+        from connectome_spawn.data import BUILD_BINDING
+
+        # Use the actual T2 descriptors, archives and versions from setUp,
+        # including its implicit node/bun connector dependencies.
+        self.add('adapter', {'kind': 'adapter', 'requires': ['bun'],
+                             'exports': {'adapter': 'adapter.js'}},
+                 {'adapter.js': b'// offline adapter fixture\n'})
+        declaration = yaml.safe_load((ROOT / 'examples/spawn/instance.yml').read_text())
+        declaration['homeDirectory'] = str(self.work)
+        state = self.work / '.local/state/connectome' / declaration['instance']
+        self.config['state_dir'] = str(state)
+        entry = self.config['connectors']['extra']
+        entry['settings']['data_args'] = {'--data-file': str(state / 'records.json')}
+        self.versions['connectors']['extra']['descriptor_sha256'] = catalog.descriptor_digest(entry)
+        # T2 gives artifacts.NAME priority even for connector archive pins.
+        self.versions['artifacts']['extra'] = self.versions['connectors']['extra']
+        self.versions['connectors']['extra'] = 'PLACEHOLDER'
+        path = self.root / 'inputs/node.tar.gz'
+        path.rename(self.root / ('inputs/node+runtime' + '@' + '24.tar.gz'))
+        self.versions['artifacts']['node']['archive'] = ('inputs/node+runtime' + '@' + '24.tar.gz')
+        node = self.config['catalog']['node']
+        node['exports']['Node.Path'] = 'bin/node'
+        self.versions['artifacts']['node']['descriptor_sha256'] = catalog.descriptor_digest(node)
+
+        object_store = self.work / 'objects'
+        object_store.mkdir()
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(object_store), *args],
+                                           stderr=subprocess.DEVNULL).decode().strip()
+        git('init', '-q')
+        (object_store / 'payload').write_text('offline fixture')
+        git('add', '.')
+        git('-c', 'user.name=Example', '-c', 'user.email=' + 'noreply' + '@' + 'example.invalid',
+            'commit', '-qm', 'Local catalog fixture')
+        self.versions['runtime'] = {name: git('rev-parse', 'HEAD') for name in self.versions['runtime']}
+        descriptors = self.work / 'role-catalog'
+        (descriptors / 'connectors').mkdir(parents=True)
+        for name, value in catalog.entries_for(self.config).items():
+            (descriptors / 'connectors' / (name + '.yml')).write_text(yaml.safe_dump({name: value}))
+        (descriptors / 'versions.yml').write_text(yaml.safe_dump(self.versions))
+        loaded = load_catalog(descriptors)
+        role_pins = catalog.resolve(self.config, self.versions)['artifacts']
+        for name, value in role_pins.items():
+            self.assertEqual(pin(loaded, name), value)
+        spec = yaml.safe_load((ROOT / 'examples/spawn/template.yml').read_text())
+        spec.update(connectors=['extra'], runtime=['adapter'], preflights=['readiness'])
+        stores = {'runtime.' + name: str(object_store) for name in self.versions['runtime']}
+        stores.update({value['pin_ref']: str(self.root)
+                       for value in catalog.entries_for(self.config).values()})
+        plan = make_plan(spec, declaration, loaded, stores)['plan']
+        self.assertEqual(set(plan['artifacts']), set(role_pins))
+        role_recipe, _ = cook.recipe_from_spec(self.spec(), build_dir=self.build)
+        expected = json.loads(json.dumps(role_recipe['mcpServers']['extra']).replace(str(self.build), BUILD_BINDING))
+        self.assertEqual(plan['recipe']['mcpServers']['extra'], expected)
+        self.assertEqual(plan['preflights']['readiness'],
+                         [arg.replace(str(self.build), BUILD_BINDING)
+                          for arg in catalog.preflights(self.config, self.build)[0]])
+        for bad in ({'--require': str(state / 'code.js')}, {'--data-file': str(self.work / 'outside')},
+                    {'--data-file': str(state) + '/../escape'}, []):
+            rejected = deepcopy(loaded)
+            rejected.descriptors['extra']['settings']['data_args'] = bad
+            rejected.versions['artifacts']['extra']['descriptor_sha256'] = catalog.descriptor_digest(rejected.descriptors['extra'])
+            with self.subTest(data=bad), self.assertRaises(SpawnError):
+                make_plan(spec, declaration, rejected, stores)
+
+    def test_spawn_reader_matches_role_archive_pin_validation(self):
+        from connectome_spawn.catalog import RoleCatalog, pin
+        from connectome_spawn import SpawnError
+        loaded = RoleCatalog(catalog.entries_for(self.config), deepcopy(self.versions))
+        for version in ('01.2.3', '1.2.3+build'):
+            loaded.versions['artifacts']['bun']['version'] = version
+            self.assertEqual(pin(loaded, 'bun')['version'], version)
+            catalog.resolve(self.config, loaded.versions)
+        for value in ({'archive': 'outside/node.tar.gz'}, {'archive': '/inputs/node.tar.gz'},
+                      {'version': '1.2.3-pre+build'}):
+            rejected = deepcopy(loaded)
+            rejected.versions['artifacts']['bun'].update(value)
+            with self.subTest(pin=value):
+                with self.assertRaises(SpawnError):
+                    pin(rejected, 'bun')
+                with self.assertRaises(ArchiveError):
+                    catalog.resolve(self.config, rejected.versions)
+
     def install(self):
         spec = self.spec()
         recipe, _ = cook.recipe_from_spec(spec, build_dir=self.build)
@@ -349,13 +435,13 @@ class CatalogTests(unittest.TestCase):
         body = ('[Service]\nWorkingDirectory=' + str(self.build) + '\nEnvironment="MODE=development"\n'
                 'ExecStart=' + ' '.join(command) + '\n')
         dropin = catalog.isolated_unit(self.config, spec['pins'], self.build, body)
-        analyzer = shutil.which('systemd-analyze')
-        if analyzer:
-            unit = state / 'closed-env.service'
-            unit.write_text(body + dropin)
-            checked = subprocess.run([analyzer, '--user', 'verify', str(unit)],
-                                     capture_output=True, text=True)
-            self.assertEqual(checked.returncode, 0, checked.stderr)
+        # The bootstrap execution below is real, but static verification uses
+        # T1's offline seam. Host systemd integration remains separately opt-in.
+        unit = state / 'closed-env.service'
+        unit.write_text(body + dropin)
+        checked = subprocess.run([sys.executable, str(ROOT / 'tests/fixtures/analyze.py'),
+                                  '--user', 'verify', str(unit)], capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
         unset = next(line.split('=', 1)[1].split() for line in dropin.splitlines()
                      if line.startswith('UnsetEnvironment='))
         ambient = {'NODE_OPTIONS': '--require=../outside.cjs', 'PYTHONPATH': '../outside',
