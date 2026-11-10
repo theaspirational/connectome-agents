@@ -1,0 +1,15 @@
+# Reviewed source; payload contains vendored dependencies. No install at deployment.
+# Repository identity from the archived package.json repository.url.
+heartbeat-mcpl:
+  pin_ref: connectors.heartbeat-mcpl
+  enabled: false
+  repo: https://github.com/anima-research/heartbeat-mcpl.git
+  build:
+  - - '{artifact:node}/bin/node'
+    - node_modules/typescript/bin/tsc
+  settings:
+    command: '{artifact:node}/bin/node'
+    args:
+    - '{artifact:heartbeat-mcpl}/dist/src/index.js'
+    - --stdio
+  required_secrets: []

@@ -1,5 +1,5 @@
-# Runtime commit pins retained for the recipe-file bridge.
-# Catalog artifacts and connector releases require reviewed values; placeholders fail closed.
+# Public artifact digests bind locally assembled Linux x86_64 payloads.
+# Runtime bridge commits are retained, not newly compatibility-qualified.
 runtime:
   connectome-host: cef933981dc0699fc00e5189b129d854ff8d43f6
   agent-framework: aa134e75fc19bc8cb3b73cb1ec53465dd9cf5c91
@@ -7,50 +7,51 @@ runtime:
 connectors:
   slack-mcpl:
     archive: inputs/slack-mcpl.tar.gz
-    version: PLACEHOLDER
-    sha256: PLACEHOLDER
-    descriptor_sha256: PLACEHOLDER
-    commit: PLACEHOLDER
+    version: 0.1.0
+    sha256: e331c83e8913c648215179a7e33f764faa66678b3d5a8db835a981a9d08ce647
+    descriptor_sha256: dacb89f138fefec359b790db654adec2060fc95dd093e4357e69621c9558f4be
+    commit: 79d117315523e47e28199c2e7f914c1b1559433e
   telegram-bot-mcpl:
     archive: inputs/telegram-bot-mcpl.tar.gz
-    version: PLACEHOLDER
-    sha256: PLACEHOLDER
-    descriptor_sha256: PLACEHOLDER
-    commit: PLACEHOLDER
+    version: 0.1.0
+    sha256: 955e819579e96d9a0da99934f6dc64241c8387f307ac95e1f7a47b73e1cb75ea
+    descriptor_sha256: bd2cb2abfdf6db86c6e485fdadaac225b344d88015cfbefb044eb7a609f6d9fc
+    commit: 0cdbdd45daa9caaaab6c4dabf231a215f802e48f
   zulip_mcp:
     archive: inputs/zulip_mcp.tar.gz
-    version: PLACEHOLDER
-    sha256: PLACEHOLDER
-    descriptor_sha256: PLACEHOLDER
-    commit: PLACEHOLDER
+    version: 3.0.0
+    sha256: 06b2c8e61185d51b176d59828d5c5b1f36902b6cb0e029b4b102e6fe25e88abc
+    descriptor_sha256: 25e6c4f3e0b45b25c6f2ee370278c273ba2986affbad1464b2fc5127fb2918e5
+    commit: 4b3bd50ebef29ff6bd6faea6679e6ae1b8c83292
   github-mcpl:
     archive: inputs/github-mcpl.tar.gz
-    version: PLACEHOLDER
-    sha256: PLACEHOLDER
-    descriptor_sha256: PLACEHOLDER
-    commit: PLACEHOLDER
+    version: 0.1.0
+    sha256: 5e9ddf714a452567300d34a27c610fc34daa691cc447dc08d5aabd66a022a19c
+    descriptor_sha256: 3781a504b140210eba3532fbad023bf50145bba07b574561a535fc0c2002174d
+    commit: 8541eccf616a1a04fbbb68484b7e7d4527dd0bf1
   terminal-sessions-mcp:
     archive: inputs/terminal-sessions-mcp.tar.gz
-    version: PLACEHOLDER
-    sha256: PLACEHOLDER
-    descriptor_sha256: PLACEHOLDER
-    commit: PLACEHOLDER
+    version: 1.7.3
+    sha256: 41047d2451f91cae9ba446fed25f2e5d06c6c4dffe6fe0718e54253f309ccd76
+    descriptor_sha256: 59366afe01221c3b0de2a68799674e450d96eb1bd1d663a3d7c5375b9e1bda4f
+    commit: 4d4f879ea9290bcf63ca488165f20abb9bedca6e
+  heartbeat-mcpl:
+    archive: inputs/heartbeat-mcpl.tar.gz
+    version: 0.4.1
+    sha256: 8f6479e4de0c60f69a25049f4efc5e9a71893d338280159966499b78a5bdd3a9
+    descriptor_sha256: 20d41e92c883dcbdef5dfd63826293e64ed1b0745c34bfc108df781d2112d3a2
+    commit: 9cf40510a00aa2dac37dd5fc6b62b2adc61b6288
 artifacts:
   node:
     archive: inputs/node.tar.gz
-    version: PLACEHOLDER
-    sha256: PLACEHOLDER
-    descriptor_sha256: PLACEHOLDER
+    version: 24.14.0
+    sha256: d56b7f02ecb6e18905eda074d356ff9856ac0bce029cd0aa39a79f030ebabfcd
+    descriptor_sha256: 2aa0b211f633cc7cd8d3842107da2dbbef2842369a7ca36296fdf413a750c4c0
   bun:
     archive: inputs/bun.tar.gz
-    version: PLACEHOLDER
-    sha256: PLACEHOLDER
-    descriptor_sha256: PLACEHOLDER
-  openai-codex-adapter:
-    archive: inputs/openai-codex-adapter.tar.gz
-    version: PLACEHOLDER
-    sha256: PLACEHOLDER
-    descriptor_sha256: PLACEHOLDER
+    version: 1.4.4
+    sha256: 0fb32363e1008577b80dd50eed6a1b9d0fd2145ccf58231714461f37fe4c0652
+    descriptor_sha256: 8b153208e689b8a239509e337614fcb762cac31c7091a8d9e6b24e80ee449e97
   inference-gate-check:
     archive: inputs/inference-gate-check.tar.gz
     version: PLACEHOLDER

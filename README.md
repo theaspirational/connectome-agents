@@ -11,8 +11,9 @@ in a separate private repository. The only example agent is `example`.
   private env files, user units, atomic `current` switch, health and rollback.
 - Offline lifecycle tests use a mock secret provider and fake systemctl.
   Adapter unit tests and a prerequisite-gated real-cook local build are separate.
-- Pins are supplied upstream HEADs, **not compatibility-tested releases**.
-  The terminal connector has no trusted pin; enabling it fails closed.
+- The catalog pins offline-built Linux x86_64 Node/Bun and six connector
+  payloads; these are **not compatibility-tested deployment releases**. See
+  [catalog provenance and remaining inputs](docs/catalog.md#offline-pins-round).
 - A bundled production adapter translates the normalized spec to the reviewed
   cook fork's host CLI and validates its real v2 lock. Configure executable paths,
   native launch settings and a hash-pinned framework archive explicitly. Registry

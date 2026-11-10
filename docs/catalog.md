@@ -37,8 +37,8 @@ REQUEST is the role's existing request hash, **not** a compiler plan hash.
 New entries use `pin_ref: artifacts.NAME`. Existing connectors retain
 `pin_ref: connectors.NAME` and their repository/build meaning. The old commit-only
 private connector format still works with the legacy compiler path. Public
-connector pins have been replaced with unresolved digest records rather than
-presenting unverified upstream commits as releases.
+connector pins bind the reviewed offline-built payloads described below; they
+are not a claim of deployed runtime compatibility.
 
 ```yaml
 artifacts:
@@ -92,24 +92,22 @@ budgets: null
 catalog:
   node: {enabled: true}
   bun: {enabled: true}
-  openai-codex-adapter: {enabled: true}
   inference-gate-check: {enabled: true}
   transport-readiness: {enabled: true}
 ```
 
 Disable unneeded connectors using their existing `enabled: false` overrides.
-For each selected connector, supply reviewed native stdio `settings.command` and
-`settings.args`; public empty settings intentionally do not guess upstream entry
-points. Use the artifact placeholders for all runtimes/scripts. Per-connector
+Public connector descriptors now supply reviewed native stdio `settings.command`
+and `settings.args` matching the built payloads. Review these for the instance;
+use artifact placeholders for all runtimes/scripts. Per-connector
 state paths belong in the explicit `settings.data_args` fields described below,
 not ordinary args/env or cook's `connector_state` mapping:
 cook sees these already installed servers as `source.external`.
 
-Supply the agent's native provider configuration with an artifact placeholder
-where the reviewed host schema expects the adapter executable. The role does not
-invent provider-specific host keys or provision credentials. The adapter payload
-contract is `src/index.ts` plus vendored dependencies, built by the pinned Bun into
-`dist/adapter.js`; change and re-pin the descriptor if the reviewed build differs.
+Supply the agent's native provider configuration through the reviewed host/framework
+schema. The OpenAI provider belongs to host/framework; no separate adapter artifact
+is supplied or required by this catalog. The role does not invent provider-specific
+host keys or provision credentials.
 
 The cook checkout, local host checkout and local host-dependency archives must
 also reside under this agent's root. Existing `cook.host_dependencies` hash and
@@ -327,28 +325,131 @@ minted by these checks.
 
 ## Exact coordinator supply checklist
 
-No real artifact pins were fetched or certified. For **each selected** entry:
+The offline pins round supplies the engine and connector release records below.
+For **each selected** entry, the deployment coordinator must still supply/review:
 
-1. `artifacts.node`, `artifacts.bun`, `artifacts.openai-codex-adapter`,
-   `artifacts.inference-gate-check`, `artifacts.transport-readiness`: supply
-   **version, archive SHA-256, descriptor SHA-256**, plus the reviewed archive
-   bytes at the declared `inputs/NAME.tar.gz` location. Node must be v24.
+1. Stage the reviewed `artifacts.node` and `artifacts.bun` archive bytes at their
+   declared `inputs/NAME.tar.gz` locations. Both digests and versions are pinned.
+   `artifacts.inference-gate-check` and `artifacts.transport-readiness` remain
+   disabled placeholders: generic versions and reproducible archives are a later
+   task; selecting them still requires version and both digests. Node must be v24.
 2. `connectors.slack-mcpl`, `connectors.telegram-bot-mcpl`,
    `connectors.zulip_mcp`, `connectors.github-mcpl`,
-   `connectors.terminal-sessions-mcp`: supply **reviewed fork repo/launch/build
-   metadata, full commit, version, archive SHA-256, descriptor SHA-256**, and
-   corresponding complete archive bytes. The existing upstream repo names are
-   candidates, not verified fork recommendations. Hash after finalizing metadata.
+   `connectors.terminal-sessions-mcp`, `connectors.heartbeat-mcpl`: stage the
+   corresponding complete archive bytes. Reviewed repo/launch/build metadata,
+   full commits, versions and both digests are pinned. Instance overrides change
+   effective descriptors and therefore need newly reviewed descriptor hashes.
 3. **Target-platform file hashes** for `/bin/bash`, `/bin/sh`, `/usr/bin/git`, and
    any additional exact OS tools actually required by the reviewed build/launcher.
    Remove unused entries instead of retaining unresolved placeholders.
 4. **Reviewed host/cook/framework commits and local payloads**, plus the existing
    `cook.host_dependencies` package identities/hashes (or legacy framework archive
    hash). Recheck bridge-era commit values for the new closure; this change does
-   not certify their compatibility with the selected adapter/engines.
+   not certify their compatibility with the selected provider/engines.
 5. Instance-only inputs: native provider/connector launch settings, intended
    persistent state, privately provisioned endpoint/token environment names and
    values. These are not release pins and never belong in public archives.
 
 Disabled entries need no pins. Selected placeholders, all-zero hashes/commits,
 missing dependencies, wrong descriptor hashes or changed archive bytes fail closed.
+
+## Offline pins round
+
+The release records in `versions.yml` bind Node **24.14.0**, Bun **1.4.4** and
+six source-archive commits. Package versions come from each archived
+`package.json` (they do not imply a published npm release). Source provenance
+was supplied by the coordinator; git archives contain no `.git/config` remotes.
+Telegram, Slack, Zulip and terminal-sessions use the coordinator-selected
+`theaspirational` forks. Heartbeat's URL comes from its archived
+`package.json` `repository.url` (with `git+` removed). GitHub's URL is retained
+from the pre-existing descriptor, not inferred from an absent remote.
+
+The coordinator verified Node's upstream signature. Bun's checksum was verified;
+**Bun's signature was NOT verified**. The supplied checksum manifest was itself
+SHA-256 checked before every listed file was checked. No network fetching was
+performed. Builds used the supplied Node 24.14.0, a writable copy of the supplied
+npm cache, `NO_UPDATE_NOTIFIER=1`, and `npm ci --offline --cache <copy>` with
+lifecycle scripts enabled, followed by each package's normal `npm run build`
+(`tsc`). Build processes ran in a 4 GiB scope with non-Unix sockets denied.
+
+Terminal-sessions initially stopped because Puppeteer wanted Chrome
+major 142 (build 7444, patch 61), absent from the offline inputs. With coordinator approval, both
+clean builds used `PUPPETEER_SKIP_DOWNLOAD=1` and
+`PUPPETEER_SKIP_CHROME_HEADLESS_SHELL_DOWNLOAD=1` during npm installation. These
+source-assembly environment settings are recorded in its descriptor comments;
+they are not unsupported per-command environment fields. Browser payloads and
+screenshot functionality are **not shipped or qualified**. The stdio launch
+includes `--disable-screenshot`; it connects to a separately managed session
+backend and does not forward that flag to it. That backend must independently
+launch `dist/src/server/start-session-server.js --headless --disable-screenshot`
+with the pinned Node and instance-reviewed access/authentication settings.
+
+### Payload and rebuild contract
+
+Stage each archive as `inputs/NAME.tar.gz`; extract its contents directly into
+the artifact root, without an enclosing NAME directory. Node contains `bin/node`
+and the upstream `LICENSE`; Bun contains `bin/bun`. Connector payloads contain
+source, package/lock/config files, compiled output and the complete npm-installed
+dependency closure, including development compilers and platform packages.
+No reference tree was used as a build or packaging input.
+
+To assemble a payload from either independently installed source tree:
+
+* Omit npm's `node_modules/.bin` links: descriptors invoke the real compiler
+  through the explicit pinned Node interpreter instead. Other payload entries
+  are regular files/directories, never links or hardlink records.
+* Omit native node-pty build-host records (`build/Makefile`, `config.gypi`,
+  `pty.target.mk`, `binding.Makefile`); retain `build/Release/pty.node` built for
+  Node 24. Do not rebuild native dependencies during deployment.
+* Omit paths outside the catalog's literal filename alphabet (the terminal
+  demonstration GIF with spaces). These are not build/runtime dependencies.
+* Replace initial script shebang lines with blank lines, retaining line numbers.
+  This avoids undeclared platform interpreters in the sealed closure. Reviewed
+  JavaScript entry points and compilers use explicit Node argv; incidental
+  dependency/tool scripts are not supported standalone executable entry points.
+  Recompile normalized sources with `node node_modules/typescript/bin/tsc`,
+  removing old `*.tsbuildinfo` first. Do not run npm install at deployment.
+* Enumerate all entries in bytewise path order, excluding a `.` root entry. Use
+  GNU tar format, no recursive duplicate entries, mtime fixed to Unix epoch zero,
+  `--owner=0 --group=0 --numeric-owner --mode=u+rwX,go+rX,go-w
+  --hard-dereference`, then `gzip -n -9`.
+
+Two fresh source extractions, offline installations, builds and normalized
+payload assemblies produced identical SHA-256 values for **all eight archives**.
+Descriptor build argv was also executed against both vendored payload trees.
+The archive bytes, detailed transformation lists and checksum lists are retained
+as run evidence, not in this public repository.
+
+### Reference comparison and limits
+
+Comparison is of the original built trees, before packaging normalization.
+The supplied references used Node 22.23.x; this build used Node 24.14.0.
+Differences are classified as (a) Node-version effects or (b) other causes:
+
+| Connector | Result and examples |
+| --- | --- |
+| telegram-bot-mcpl | Expected (b): the reference omits source/test/docs, e.g. `src/config.ts`, `test/`, `docs/AGENT-GUIDE.md`. Every shared file, including `dist/`, is identical. |
+| slack-mcpl | Expected (b): this complete build closure retains dev/optional tools absent in the reference, e.g. `node_modules/typescript/`, the scoped TypeScript Linux x64 package, `.bin/tsc`, and the corresponding `.package-lock.json` entries. Shared compiled output is identical. |
+| heartbeat-mcpl | Expected (b): retained dev tooling, e.g. Node type declarations, `typescript/`, `.bin/tsc`, and `.package-lock.json` entries. Shared compiled output is identical. |
+| terminal-sessions-mcp | Expected (a): `node_modules/node-pty/build/Release/pty.node` and Node configuration (ABI 127 to 137). Expected (b): gyp Makefile/tool/header paths, added docs/tests and xterm source data files (e.g. the scoped xterm package's `src/common/data/Charsets.ts`). Shared `dist/` is identical. Build-host gyp records are omitted from the payload. |
+| zulip_mcp | Comparison unavailable: reference not readable by the worker. Sorted built `build/` path/hash manifest and package/lock hashes retained for coordinator comparison. |
+| github-mcpl | No reference supplied. |
+
+Other-cause differences above were inspected; none changed shared connector
+application output. **Node 22 to Node 24 runtime behaviour is not qualified by
+this round**. Offline compilation and archive reproducibility are not deployment,
+authentication, persistent-state, OS-ABI or native-feature qualification. In
+particular, GitHub expects instance-selected App credentials or `GITHUB_TOKEN_FILE`
+and a repository allow-list, not the old descriptor's unused `GITHUB_TOKEN`.
+Connector state paths, Zulip identity/realm, Telegram policy and optional helpers,
+and the terminal backend remain instance-review inputs. Connectors whose state
+interfaces cannot satisfy the catalog's explicit data-path contract need a
+separately reviewed adaptation before deployment; writable code-tree defaults
+are not permission to weaken sealing.
+
+No entry depends on a separate OpenAI adapter artifact: its descriptor and pin
+were removed. The two preflight placeholders remain disabled for later generic
+releases. No control-plane MCP server is added: its source remains unresolved.
+Target-platform hashes and compatible host/cook/framework closure payloads are
+still coordinator inputs. Build-host executable hashes belong only in the run
+report, never in public pins.

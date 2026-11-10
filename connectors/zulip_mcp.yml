@@ -1,15 +1,15 @@
-# Candidate upstream metadata; verify offline-unavailable refs before use.
+# Reviewed source; payload contains vendored dependencies. No install at deployment.
 zulip_mcp:
-  repo: https://github.com/antra-tess/zulip_mcp.git
+  repo: https://github.com/theaspirational/zulip_mcp.git
   pin_ref: connectors.zulip_mcp
   enabled: true
   build:
-  - - bun
-    - install
-    - --frozen-lockfile
-  - - bun
-    - run
-    - build
-  settings: {}
+  - - '{artifact:node}/bin/node'
+    - node_modules/typescript/bin/tsc
+  settings:
+    command: '{artifact:node}/bin/node'
+    args:
+    - '{artifact:zulip_mcp}/build/index.js'
+    - --stdio
   required_secrets:
   - ZULIP_API_KEY

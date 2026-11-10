@@ -1,16 +1,16 @@
-# Candidate upstream metadata; verify offline-unavailable refs before use.
+# Reviewed source; payload contains vendored dependencies. No install at deployment.
 slack-mcpl:
-  repo: https://github.com/anima-research/slack-mcpl.git
+  repo: https://github.com/theaspirational/slack-mcpl.git
   pin_ref: connectors.slack-mcpl
   enabled: true
   build:
-  - - bun
-    - install
-    - --frozen-lockfile
-  - - bun
-    - run
-    - build
-  settings: {}
+  - - '{artifact:node}/bin/node'
+    - node_modules/typescript/bin/tsc
+  settings:
+    command: '{artifact:node}/bin/node'
+    args:
+    - '{artifact:slack-mcpl}/dist/src/index.js'
+    - --stdio
   required_secrets:
   - SLACK_BOT_TOKEN
   - SLACK_APP_TOKEN

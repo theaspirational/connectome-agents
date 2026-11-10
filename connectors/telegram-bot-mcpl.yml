@@ -1,15 +1,14 @@
-# Candidate upstream metadata; verify offline-unavailable refs before use.
+# Reviewed source; payload contains vendored dependencies. No install at deployment.
 telegram-bot-mcpl:
   repo: https://github.com/theaspirational/telegram-bot-mcpl.git
   pin_ref: connectors.telegram-bot-mcpl
   enabled: true
   build:
-  - - bun
-    - install
-    - --frozen-lockfile
-  - - bun
-    - run
-    - build
-  settings: {}
+  - - '{artifact:node}/bin/node'
+    - node_modules/typescript/bin/tsc
+  settings:
+    command: '{artifact:node}/bin/node'
+    args:
+    - '{artifact:telegram-bot-mcpl}/dist/src/index.js'
   required_secrets:
   - TELEGRAM_BOT_TOKEN

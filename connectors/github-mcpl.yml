@@ -1,15 +1,16 @@
-# Candidate upstream metadata; verify offline-unavailable refs before use.
+# Reviewed source; payload contains vendored dependencies. No install at deployment.
+# Repository identity retained from the prior descriptor; archives have no git remotes.
+# Authentication is instance-selected: App or private token file, not GITHUB_TOKEN.
 github-mcpl:
   repo: https://github.com/anima-research/github-mcpl.git
   pin_ref: connectors.github-mcpl
   enabled: true
   build:
-  - - bun
-    - install
-    - --frozen-lockfile
-  - - bun
-    - run
-    - build
-  settings: {}
-  required_secrets:
-  - GITHUB_TOKEN
+  - - '{artifact:node}/bin/node'
+    - node_modules/typescript/bin/tsc
+  settings:
+    command: '{artifact:node}/bin/node'
+    args:
+    - '{artifact:github-mcpl}/dist/src/index.js'
+    - --stdio
+  required_secrets: []

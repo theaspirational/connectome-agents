@@ -1,15 +1,19 @@
-# Candidate upstream metadata; verify offline-unavailable refs before use.
+# Reviewed source; payload contains vendored dependencies. No install at deployment.
+# Source-assembly build environment (npm ci, lifecycle scripts enabled):
+# PUPPETEER_SKIP_DOWNLOAD=1 PUPPETEER_SKIP_CHROME_HEADLESS_SHELL_DOWNLOAD=1
+# Browser payloads are not shipped. The separate backend MUST also launch with
+# --disable-screenshot; a stdio frontend flag cannot control a remote backend.
 terminal-sessions-mcp:
-  repo: https://github.com/anima-research/terminal-sessions-mcp.git
+  repo: https://github.com/theaspirational/terminal-sessions-mcp.git
   pin_ref: connectors.terminal-sessions-mcp
   enabled: true
   build:
-  - - bun
-    - install
-    - --frozen-lockfile
-  - - bun
-    - run
-    - build
-  settings: {}
+  - - '{artifact:node}/bin/node'
+    - node_modules/typescript/bin/tsc
+  settings:
+    command: '{artifact:node}/bin/node'
+    args:
+    - '{artifact:terminal-sessions-mcp}/dist/src/mcp/mcp-stdio-server.js'
+    - --disable-screenshot
   required_secrets:
   - SESSION_SERVER_TOKEN
