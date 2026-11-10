@@ -177,8 +177,13 @@ def recipe_from_spec(spec, recipe_bytes=None, build_dir=None):
                 settings['source'] = {'external': True}
                 recipe['mcpServers'][name] = settings
         recipe = catalog.expand(recipe, build_dir, catalog.entries_for(config))
+        catalog.audit_descriptors(config, pins, build_dir)
         catalog.audit_recipe(recipe, build_dir, config['state_dir'], pins['platform'],
                              secrets=catalog.secret_environment_names(config))
+        recipe = catalog.compile_data_args(recipe)
+        catalog.audit_recipe(recipe, build_dir, config['state_dir'], pins['platform'],
+                             secrets=catalog.secret_environment_names(config),
+                             data_options=catalog.data_options_for(config, build_dir))
     names = environment_names(config)
     need(not set(names) & BASE_ENV and not set(names) & {'DATA_DIR', 'WORKSPACE_DIR'},
          'secret names overlap adapter-owned environment')
@@ -291,6 +296,10 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
         bun_path = catalog.runtime(config, build, 'bun')
         node_path = catalog.runtime(config, build, 'node')
         runtime = bun_path
+        # Stage code into the role-written build; never execute the input checkout.
+        entrypoint = str(catalog.stage_checkout(Path(entrypoint).parent.parent, build / 'cook-source') / 'bin/cook')
+        settings = dict(settings, host_repo=str(catalog.stage_checkout(
+            Path(settings['host_repo']), build / 'host-source')))
     argv = [runtime, entrypoint, 'install', str(recipe_path)]
     flag_indices = []
     for flag, value in (
@@ -313,8 +322,14 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
         for index in flag_indices:
             if argv[index] == '--host-dependency':
                 audited[index + 1] = argv[index + 1].split('=', 1)[1].rsplit('#sha256=', 1)[0]
+        # These control-plane operands include archive/data inputs. Code positions
+        # are independently restricted to the staged closure, not the input tree.
         catalog.audit_argv(audited, build, root, state, spec['pins']['platform'])
+        for value in (runtime, entrypoint, settings['host_repo']):
+            catalog.audit_path(value, build, build, state, spec['pins']['platform'])
     env = (catalog.environment(config, spec['pins'], build) if catalog.active(config) else clean_environment())
+    if catalog.active(config):
+        catalog.audit_tree_code(build, state, spec['pins']['platform'])
     verify_cook(entrypoint, pins['cook'], env)
     command(argv, cwd=build, env=env, flag_indices=flag_indices)
     lock = read_lock(build / 'connectome.lock', host_pin=pins['connectome-host'], required_names=names)
@@ -358,7 +373,7 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     env_file = Path(layout['config']) / '.env'
     need(not env_file.exists() or not env_file.read_text().strip(), 'cook unexpectedly wrote runtime env values')
     if catalog.active(config):
-        catalog.verify(config, spec['pins'], build, lock)
+        catalog.verify(config, spec['pins'], build, lock, immutable=False)
     return lock
 
 

@@ -101,7 +101,8 @@ Disable unneeded connectors using their existing `enabled: false` overrides.
 For each selected connector, supply reviewed native stdio `settings.command` and
 `settings.args`; public empty settings intentionally do not guess upstream entry
 points. Use the artifact placeholders for all runtimes/scripts. Per-connector
-state paths belong in native settings, not cook's `connector_state` mapping:
+state paths belong in the explicit `settings.data_args` fields described below,
+not ordinary args/env or cook's `connector_state` mapping:
 cook sees these already installed servers as `source.external`.
 
 Supply the agent's native provider configuration with an artifact placeholder
@@ -113,7 +114,10 @@ contract is `src/index.ts` plus vendored dependencies, built by the pinned Bun i
 The cook checkout, local host checkout and local host-dependency archives must
 also reside under this agent's root. Existing `cook.host_dependencies` hash and
 package-identity checks still apply. Existing `runtime` full-commit pins still
-bind cook/host/framework. The reviewed cook source-tree check is unchanged.
+bind cook/host/framework. The role copies the cook and host checkouts into the build before executing
+code from them; links/special files are refused. The reviewed cook source-tree
+check is performed on that staged copy. The operator-supplied role/Python adapter
+bootstrap remains a trusted control-plane prerequisite, not catalog code.
 
 The catalog adapter command only needs `--spec`, `--out`, `--state`, and
 `--entrypoint ROOT/inputs/cook/bin/cook`. Its Python interpreter and the role are
@@ -127,9 +131,10 @@ mode they are ignored in favor of installed pinned engines.
 SHA-256 hashes (initial examples: `/bin/bash`, `/bin/sh`, `/usr/bin/git`). It is
 not a directory allowlist. Only files directly under `/bin`, `/usr/bin`, or
 `/usr/local/bin` can be platform tools; application installation trees cannot
-be granted exceptions. These OS tools are not copied; their bytes are checked
+be granted exceptions. These OS tool bytes and agent-nonwritability (including ancestors) are checked
 before build and activation/reuse. Cook's build PATH contains only installed
-engines and aliases for these exact pinned tools, with private build caches.
+engines and role-written copies of these exact pinned tools, with private build
+caches; no outward platform-bin symlinks are created.
 
 The audit refuses undeclared absolute paths in compiled recipe fields (including
 nested args/env), health settings, cook lock paths, launcher scripts and exported
@@ -140,14 +145,18 @@ check. Build argv are rechecked during lock verification, not just installation.
 Ambiguous argument syntax (attached short-option values, response files, URLs,
 path lists, inline command evaluation, substitutions or encoded forms) fails closed. Use literal argv and
 explicit executable paths (build-only `node`/`bun` aliases remain supported).
-Exported units must have an explicit literal `WorkingDirectory`; their Exec
+Exported units must have an explicit literal build-local `WorkingDirectory`; their Exec
 commands and the added preflights use that cwd. Launch scripts accept only
 literal commands, `exec`, absolute `cd` without `..`, and numeric `exit`, not
 arbitrary shell syntax.
-The audit also checks the entire installed artifact inventory (file hashes/modes and no links). The only
-path roots admitted are the agent deployment tree, its explicitly configured
-separate persistent state, and exact platform pins. There is no external-directory
-exception for catalog MCP servers. Cook's engine provenance and external server
+The audit also checks the entire installed artifact inventory (file hashes and
+final read-only modes). **Code paths must be inside this build or exactly name a
+pinned platform tool**: not another build, inputs, workspace, or persistent state.
+This applies to executable argv, interpreter scripts/shebangs, preload arguments,
+build/preflight/health commands, exported Exec targets, recipe commands and env.
+Relative code and environment paths resolve from a build-local cwd. All build
+symlinks (including inward links), hardlinked files and special files are refused
+at sealing/verification. There is no external-directory exception for catalog MCP servers. Cook's engine provenance and external server
 inventory must exactly match the installed closure. A separate catalog sidecar
 preserves cook's raw schema and build identity.
 
@@ -157,6 +166,68 @@ or administrator-created private systemd overrides. The OS ABI and control plane
 remain prerequisites. Reviewed payloads must not conceal dependencies; stronger
 execution confinement and effective-unit probing belong to later apply/verify
 work. Unrelated state and credentials are never copied into archives or locks.
+
+## Build sealing, starts and the same-UID limit
+
+After cook finishes and the role materializes managed units and `.prepared`, it
+removes **all write bits** (`mode & 0555`) from every build file and directory,
+including the build root. No agent-owned writable directory remains inside it.
+Verification checks the whole tree, not just executable files; write bits, links,
+special files and build aliases fail closed. This also removes the POSIX ACL
+write mask. The role does not silently repair an already prepared writable build.
+The inventory records final sealed modes. The internal pre-seal assembly audit
+is not a reusable/activation verification.
+
+Every generated Exec bootstrap (preflights and all exported Exec directives)
+walks the entire tree with `lstat` before `execve`, checking modes, links and file
+types, and rechecks platform writability. Thus systemd automatic restarts also
+check the boundary, without rehashing all files. Role-requested restarts perform
+full verification again immediately before restart. HOME and module/package
+caches stay in the read-only build; runtime TMPDIR and DATA_DIR refer to data
+state. Applications requiring writable code caches must be prebuilt, not granted
+a writable module search path. Runtime secrets are written to role bookkeeping
+`ROOT/state/REQUEST.env`, **outside the sealed build**; secret rotation and
+activation do not reopen it. This is not the agent's persistent `state_dir`.
+
+**Same-UID policy: read-only modes plus start-time detection, not kernel-enforced
+immutability.** A malicious process sharing the deploying UID can chmod owned
+files/directories, replace writable ancestors, tamper with units/the bootstrap,
+or race a check and restore read-only modes. The pinned Node bootstrap must
+itself load before it can check the tree. Modes do not authenticate changed bytes
+on automatic restart. These residual risks are NOT solved by this role. For a
+hostile agent, use a separate deployment owner and non-agent-writable ancestors,
+units and runtime, or a read-only mount/confinement boundary maintained outside
+the agent UID. No such ownership/mount isolation is provisioned here. OS ABI,
+loader/shared-library dependencies and reviewed application behavior remain
+trusted. Native payloads must not interpret data files as code.
+
+## Explicit state data arguments
+
+Only `data_args` in a native command object (for example connector `settings`)
+allows catalog-supplied state paths. It maps **application `--data-*` options** to
+literal absolute paths inside the configured state directory, resolving links:
+
+```yaml
+settings:
+  command: '{artifact:node}/bin/node'
+  args: ['{artifact:example-connector}/server.js']
+  data_args:
+    --data-file: /example/state/records.json
+```
+
+The compiler appends `--data-file=/example/state/records.json` to native cook
+`args` and removes `data_args`; no cook/host schema extension is required. The
+role rebinds these operands to the reviewed command/declaration at install and
+verify. Positional data exceptions, interpreter flags (`--require`, `--import`,
+`--eval`, etc.), state cwd, and state references in ordinary args or env are
+refused. A bare state executable or interpreter script is refused even before
+it exists. Use an application that supports a reviewed `--data-*` option (or a
+reviewed build-local adapter); do not disguise a code-loading option as data.
+The descriptor is trusted executable policy: these fields are not permission for
+application code to execute/evaluate a state file. Built-in DATA_DIR/TMPDIR and
+private secret transport are role-constructed data channels, not catalog code
+exceptions. The recipe-file bridge's separate `external_data_args` semantics are
+unchanged and do not create catalog exceptions.
 
 ## Closed catalog environment
 
@@ -208,8 +279,8 @@ environment channel. Exported units cannot supply `EnvironmentFile`,
 `PassEnvironment`, `UnsetEnvironment`, or PAM environment indirection.
 
 Builds/cook receive a constructed environment, never `os.environ` plus removals:
-private HOME/temp/cache, fixed `LANG=C.UTF-8`, offline/no-notifier settings,
-installed runtimes and individually pinned platform aliases on PATH. There is
+private build HOME/temp/cache, fixed `LANG=C.UTF-8`, offline/no-notifier settings,
+installed runtimes and individually pinned platform copies on PATH. There is
 no ambient locale or shell PATH inheritance. Only the control-plane Python
 adapter bootstrap uses fixed `/usr/bin:/bin`; application PATH is stricter and
 contains no unpinned system directories. Health commands use the same clean

@@ -570,6 +570,19 @@ class Deployment:
             raise DeployError('agent secrets file lookup failed (values redacted)') from None
 
     def plan(self):
+        if catalog.active(self.config):
+            catalog.audit_descriptors(self.config, self.pins, self.build)
+            # Include native provider/module command objects without importing
+            # the standalone cook adapter into the Ansible module bundle.
+            settings = [self.config.get('agent', {})] + [
+                entry.get('settings', {}) for entry in self.config.get('modules', {}).values()]
+            settings += [entry.get('settings', {}) for entry in catalog.entries_for(self.config).values()]
+            settings = catalog.expand(settings, self.build, catalog.entries_for(self.config))
+            for compiled in (False, True):
+                surface = catalog.compile_data_args(settings) if compiled else settings
+                catalog.audit_recipe(surface, self.build, self.state_dir, self.pins['platform'],
+                                     secrets=catalog.secret_environment_names(self.config),
+                                     data_options=catalog.data_options_for(self.config, self.build))
         result = {'state_dir': str(self.state_dir), 'secrets_file': str(self.secrets_file),
                   'budgets': self.config.get('budgets', {})}
         if self.activation == 'install_only':
@@ -693,7 +706,8 @@ class Deployment:
         if catalog.active(config):
             catalog_pins = (self.pins if build == self.build else
                             json.loads((build / 'deployment.json').read_text())['pins'])
-            catalog.verify(config, catalog_pins, build, data)
+            catalog.verify(config, catalog_pins, build, data,
+                           immutable=not (getattr(self, '_building_catalog', False) and build == self.build))
         state = data.get('state')
         if not state:
             raise DeployError('cook lock must declare configured external state_dir', 'E_LOCK_STATE_PATH')
@@ -784,8 +798,21 @@ class Deployment:
         run([arg.format_map(substitutions) for arg in self.cook_command], cwd=self.build, adapter=True, **options)
         # Surface safe ownership diagnostics before Ansible's no_log secret
         # activation task, and before creating env/current/service state.
-        self._activation_plan()
-        atomic_write(inside(self.build, '.prepared'), self.request_id)
+        self._building_catalog = catalog.active(self.config)
+        try:
+            artifacts = self._activation_plan()[-1]
+            if self._building_catalog:
+                # Materialize managed units before sealing; activation only links them.
+                for path, (record, content) in artifacts.items():
+                    if path.is_relative_to(self.build):
+                        self._put(path, record, content)
+            atomic_write(inside(self.build, '.prepared'), self.request_id)
+            if self._building_catalog:
+                catalog.seal(self.build)
+        finally:
+            self._building_catalog = False
+        if catalog.active(self.config):
+            self._lock()
         return {'changed': True, 'build_dir': str(self.build), 'secret_names': self.names, 'plan': self.plan()}
 
     def _config(self, build):
@@ -806,7 +833,8 @@ class Deployment:
             identifier(name)
             unit = inside(build, 'connectome-' + name + '.service')
             body = ('[Unit]\nDescription=Connectome agent\n[Service]\nType=simple\n'
-                    'WorkingDirectory=' + self._systemd_path(self._config(build)['state_dir']) + '\nExecStart=' +
+                    'WorkingDirectory=' + self._systemd_path(str(build) if catalog.active(self._config(build))
+                                                                 else self._config(build)['state_dir']) + '\nExecStart=' +
                     self._systemd_path(str(script)) + '\nRestart=on-failure\n[Install]\nWantedBy=default.target\n')
             self.rendered_units[unit] = body
             return {unit.name: unit}
@@ -846,8 +874,13 @@ class Deployment:
             os.fchmod(stream.fileno(), mode)
             stream.write(content)
 
+    def _environment_path(self, build):
+        if catalog.active(self._config(build)):
+            return inside(self.state, catalog.secret_env_path(build))
+        return inside(build, 'secrets.env')
+
     def _check_environment_file(self, name, build):
-        expected = self._systemd_path(str(inside(build, 'secrets.env')))
+        expected = self._systemd_path(str(self._environment_path(build)))
         try:
             result = subprocess.run(self.systemctl + ['show', '-p', 'EnvironmentFiles', '--value', name],
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
@@ -1147,6 +1180,8 @@ class Deployment:
         if self.activation == 'start':
             self._exclusive_status(refuse=True)
             for name in units:
+                if catalog.active(self._config(build)):
+                    self._lock(build)
                 run(self.systemctl + ['restart', name])
 
     def _activation_plan(self):
@@ -1206,7 +1241,7 @@ class Deployment:
                            for record in self.config.get('secret_files', [])})
         env = ''.join(name + '=' + '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"\n'
                       for name, value in sorted(env_values.items()))
-        env_path = inside(self.build, 'secrets.env')
+        env_path = self._environment_path(self.build)
         same_env = (env_path.is_file() and env_path.read_text() == env and
                     env_path.stat().st_mode & 0o777 == 0o600)
         same_units = all(path in self.owned and self.owned[path] == record and self._matches(path, record)

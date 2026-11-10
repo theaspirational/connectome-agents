@@ -42,6 +42,12 @@ if args[0] == 'show':
     current = (root / 'current').resolve()
     reject = root / 'reject-env'
     if not reject.exists() or reject.read_text() != str(current):
-        print(str(current / 'secrets.env') + ' (ignore_errors=no)')
+        env = current / 'secrets.env'
+        spec = current / 'deployment.json'
+        if spec.is_file():
+            config = json.loads(spec.read_text())['config']
+            if 'recipe_file' not in config and config.get('catalog'):
+                env = root / 'state' / (current.name + '.env')
+        print(str(env) + ' (ignore_errors=no)')
 
 sys.exit(0)

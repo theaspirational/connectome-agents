@@ -11,6 +11,8 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import tarfile
 
@@ -164,7 +166,9 @@ def check_platform(pins):
     for path, sha in pins.get('platform', {}).items():
         need(Path(path).is_file() and Path(path).resolve().parent in
              (Path('/bin'), Path('/usr/bin'), Path('/usr/local/bin')) and
-             sha256(path) == sha, 'platform digest mismatch or non-platform target')
+             sha256(path) == sha and not any(os.access(p, os.W_OK)
+                 for p in (Path(path).resolve(), *Path(path).resolve().parents)),
+             'platform digest mismatch, writable or non-platform target')
 
 
 # Absolute references inside argv, env assignments, PATH lists, JSON and unit
@@ -209,16 +213,17 @@ def audit_location(value, cwd, root, state, platform):
     path = path if path.is_absolute() else Path(cwd) / path
     try:
         resolved = path.resolve()
-        roots = (Path(root).resolve(), Path(state).resolve())
+        roots = (Path(root).resolve(),)
         pinned = {Path(p).resolve() for p in platform}
     except (OSError, RuntimeError):
         need(False, 'unresolvable command path')
-    need(any(resolved.is_relative_to(base) for base in roots) or resolved in pinned,
-         'command dependency outside agent tree and pinned platform closure')
+    need((path.is_relative_to(Path(root)) and resolved.is_relative_to(roots[0])) or
+         (str(path) in platform and resolved in pinned),
+         'command dependency outside build and pinned platform closure')
     return resolved
 
 
-def audit_argv(argv, cwd, root, state, platform):
+def audit_argv(argv, cwd, root, state, platform, data_args=None):
     """Accept literal words/paths and flags, not an embedded command language.
 
     Even bare words may name files: check them as cwd-relative paths. Only
@@ -230,6 +235,7 @@ def audit_argv(argv, cwd, root, state, platform):
     audit_path(str(cwd), root, root, state, platform)
     need('/' in argv[0], 'executable requires an explicit path')
     audit_path(argv[0], cwd, root, state, platform)
+    data_args = {} if data_args is None else data_args
     options = True
     for arg in argv[1:]:
         if options and arg == '--':
@@ -243,6 +249,10 @@ def audit_argv(argv, cwd, root, state, platform):
             if not sep:
                 continue
             need(option.startswith('--'), 'ambiguous attached short option')
+            if option in data_args:
+                need(value == data_args[option], 'data argument differs from declaration')
+                audit_data_args({option: value}, state)
+                continue
             arg = value
         need(not arg.startswith('@'), 'ambiguous command argument')
         audit_path(arg, cwd, root, state, platform)
@@ -328,9 +338,97 @@ def build_argv(config, build, argv):
     return argv
 
 
-def audit_recipe(recipe, build, state, platform, cwd=None, secrets=()):
-    root = Path(build).parent.parent
-    audit(recipe, root, Path(state), platform)
+def audit_data_args(data, state):
+    """Only explicitly named application data options, never positional code."""
+    need(isinstance(data, dict), 'data_args must be a mapping')
+    for flag, value in data.items():
+        need(isinstance(flag, str) and re.fullmatch(r'--data-[a-z][a-z0-9-]*', flag),
+             'data_args requires --data-* application options')
+        need(isinstance(value, str) and Path(value).is_absolute(), 'data argument must be absolute')
+        audit_path(value, state, Path(state), state, {})
+
+
+def data_options_for(config, build):
+    result = {}
+    def visit(value):
+        if isinstance(value, dict):
+            if 'data_args' in value:
+                need(isinstance(value.get('command'), str), 'data_args requires a command')
+                audit_data_args(value['data_args'], config['state_dir'])
+                command = value['command']
+                need(command not in result or result[command] == value['data_args'],
+                     'conflicting data argument declarations')
+                result[command] = value['data_args']
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    visit(expand(config, build, entries_for(config)))
+    return result
+
+
+def compile_data_args(value):
+    """Lower reviewed data fields to native cook argv, with no schema extension."""
+    if isinstance(value, dict):
+        result = {k: compile_data_args(v) for k, v in value.items() if k != 'data_args'}
+        if 'data_args' in value:
+            result['args'] = result.get('args', []) + [k + '=' + v for k, v in value['data_args'].items()]
+        return result
+    if isinstance(value, list):
+        return [compile_data_args(v) for v in value]
+    return value
+
+
+def check_immutable(build):
+    """Conservative mode policy, including directories; refuse ALL symlinks.
+
+    No write bits for any class also closes POSIX ACL mask write grants. Same-uid
+    owners can chmod/replace ancestors: this is detection, not a hostile-uid sandbox.
+    """
+    build = Path(build)
+    need(build.is_dir() and build.resolve() == build, 'build alias refused')
+    for path in [build, *build.rglob('*')]:
+        info = path.lstat()
+        need(not stat.S_ISLNK(info.st_mode), 'build symlinks are refused')
+        need(stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode), 'build special file refused')
+        need(not stat.S_ISREG(info.st_mode) or info.st_nlink == 1, 'build hardlink refused')
+        need(not info.st_mode & 0o222, 'agent-writable build path refused')
+
+
+def seal(build):
+    """Called once by the role after ALL build outputs and units are written."""
+    build = Path(build)
+    need(build.resolve() == build, 'build alias refused')
+    paths = [build, *build.rglob('*')]
+    for path in paths:
+        info = path.lstat()
+        need(stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode), 'build links/special files refused')
+        need(not stat.S_ISREG(info.st_mode) or info.st_nlink == 1, 'build hardlink refused')
+    for path in reversed(paths):
+        path.chmod(path.stat().st_mode & 0o555)
+    check_immutable(build)
+
+
+def secret_env_path(build):
+    return Path(build).parent.parent / 'state' / (Path(build).name + '.env')
+
+
+def audit_recipe(recipe, build, state, platform, cwd=None, secrets=(), data_options=None):
+    root = Path(build)
+    data_options = {} if data_options is None else data_options
+    def code_surface(value):
+        if isinstance(value, dict):
+            result = {k: code_surface(v) for k, v in value.items() if k != 'data_args'}
+            data = data_options.get(value.get('command'), {}) if isinstance(value.get('command'), str) else {}
+            if data and isinstance(result.get('args'), list):
+                result['args'] = [a for a in result['args'] if a not in
+                                  [flag + '=' + path for flag, path in data.items()]]
+            return result
+        if isinstance(value, list):
+            return [code_surface(v) for v in value]
+        return value
+    audit(code_surface(recipe), root, root, platform)
     # Native command/args objects can also occur in provider/adapter settings.
     def visit(value, cwd):
         if isinstance(value, dict):
@@ -341,7 +439,11 @@ def audit_recipe(recipe, build, state, platform, cwd=None, secrets=()):
             if 'command' in value:
                 command, args = value['command'], value.get('args', [])
                 need(isinstance(command, str) and isinstance(args, list), 'ambiguous launch command')
-                audit_argv([command] + args, cwd, root, state, platform)
+                data = value.get('data_args', {})
+                audit_data_args(data, state)
+                audit_argv([command] + args, cwd, root, state, platform, data_options.get(command, {}))
+            elif 'data_args' in value:
+                need(False, 'data_args requires a command')
             elif 'args' in value:
                 need(False, 'launch args without a classified command')
             for child in value.values():
@@ -349,12 +451,14 @@ def audit_recipe(recipe, build, state, platform, cwd=None, secrets=()):
         elif isinstance(value, list):
             for child in value:
                 visit(child, cwd)
-    visit(recipe, Path(state) if cwd is None else cwd)
+    visit(recipe, Path(build) if cwd is None else cwd)
 
 
 def audit_descriptors(config, pins, build):
     build = Path(build)
-    root, state = build.parent.parent, Path(config['state_dir'])
+    root, state = build, Path(config['state_dir'])
+    need(not state.resolve().is_relative_to(build.resolve()) and
+         not build.resolve().is_relative_to(state.resolve()), 'state and build must be separate')
     secrets = secret_environment_names(config)
     for name, entry in entries_for(config).items():
         cwd = build / 'catalog' / name
@@ -365,7 +469,7 @@ def audit_descriptors(config, pins, build):
         for value in entry.get('exports', {}).values():
             audit_path(value, cwd, root, state, pins['platform'])
     for argv in preflights(config, build):
-        audit_argv(argv, state, root, state, pins['platform'])
+        audit_argv(argv, build, root, state, pins['platform'])
     if 'command' in config.get('health', {}):
         audit_argv(config['health']['command'], build, root, state, pins['platform'])
 
@@ -445,6 +549,23 @@ def audit_launcher(body, cwd, root, state, platform):
     return working_dirs
 
 
+def audit_tree_code(build, state, platform):
+    """Shebangs are code positions too, including scripts invoked indirectly."""
+    build = Path(build)
+    for path in build.rglob('*'):
+        need(not path.is_symlink(), 'build symlinks are refused')
+        if path.is_file():
+            with path.open('rb') as stream:
+                prefix = stream.read(4096)
+            if prefix.startswith(b'#!'):
+                try:
+                    argv = literal_words(prefix.split(b'\n', 1)[0][2:].decode('utf-8'))
+                except UnicodeError:
+                    need(False, 'invalid interpreter directive')
+                need(argv and Path(argv[0]).is_absolute(), 'interpreter must be absolute')
+                audit_argv(argv, path.parent, build, state, platform)
+
+
 def tree_inventory(directory):
     need(directory.is_dir() and directory.resolve() == directory, 'artifact directory alias refused')
     result = {}
@@ -453,7 +574,7 @@ def tree_inventory(directory):
         if path.is_dir():
             continue
         need(path.is_file(), 'artifact special file refused')
-        result[str(path.relative_to(directory))] = {'sha256': sha256(path), 'mode': path.stat().st_mode & 0o777}
+        result[str(path.relative_to(directory))] = {'sha256': sha256(path), 'mode': path.stat().st_mode & 0o555}
     return result
 
 
@@ -488,12 +609,12 @@ def extract(path, target, expected):
 
 def install(config, pins, build):
     build = Path(build)
-    root, state = build.parent.parent, Path(config['state_dir'])
+    root, state = build, Path(config['state_dir'])
     entries = entries_for(config)
     check_platform(pins)
     audit_descriptors(config, pins, build)
     audit_recipe(json.loads((build / 'cook-recipe.json').read_text()), build, state, pins['platform'],
-                 secrets=secret_environment_names(config))
+                 secrets=secret_environment_names(config), data_options=data_options_for(config, build))
     directory = build / 'catalog'
     directory.mkdir()
     env = {'HOME': str(build / 'catalog-home'), 'TMPDIR': str(build / 'catalog-tmp'),
@@ -503,13 +624,15 @@ def install(config, pins, build):
         Path(env[key]).mkdir()
     for name in order(entries):
         entry, pin = entries[name], pins['artifacts'][name]
-        archive = root / pin['archive']
-        need(archive.is_relative_to(root) and archive.resolve().is_relative_to(root.resolve()), 'archive escapes agent tree')
+        archive = build.parent.parent / pin['archive']
+        need(archive.resolve().is_relative_to(build.parent.parent.resolve()), 'archive escapes agent tree')
         extract(archive, directory / name, pin['sha256'])
+        audit_tree_code(build, state, pins['platform'])
         env['PATH'] = os.pathsep.join(str(directory / n / Path(e['exports'][n]).parent)
                                       for n, e in entries.items() if n in ('node', 'bun') and
                                       (directory / n).exists())
         for raw in entry.get('build', []):
+            audit_tree_code(build, state, pins['platform'])
             argv = build_argv(config, build, raw)
             audit_argv(argv, directory / name, root, state, pins['platform'])
             executable = audit_path(argv[0], directory / name, root, state, pins['platform'])
@@ -523,7 +646,7 @@ def install(config, pins, build):
             need((directory / name / value).is_file(), 'artifact export missing after build')
     audit_descriptors(config, pins, build)
     audit_recipe(json.loads((build / 'cook-recipe.json').read_text()), build, state, pins['platform'],
-                 secrets=secret_environment_names(config))
+                 secrets=secret_environment_names(config), data_options=data_options_for(config, build))
     record = {'schema': 'connectome.catalog-lock/v1', 'pins': {k: pins[k] for k in ('artifacts', 'platform')},
               'descriptors': {n: descriptor_digest(e) for n, e in entries.items()},
               'recipe_sha256': sha256(build / 'cook-recipe.json'),
@@ -546,11 +669,11 @@ def preflights(config, build):
 def preflight_unit(config, build, cwd=None, platform=None):
     build = Path(build)
     state = Path(config['state_dir'])
-    cwd = state if cwd is None else cwd
+    cwd = build if cwd is None else cwd
     platform = {} if platform is None else platform
     lines = []
     for argv in preflights(config, build):
-        audit_argv(argv, cwd, build.parent.parent, state, platform)
+        audit_argv(argv, cwd, build, state, platform)
         need(Path(argv[0]).is_absolute(), 'preflight executable must be absolute')
         # No systemd specifiers or environment expansion in executable argv.
         need(all(not any(c in arg for c in '%$\n\r\\\"') for arg in argv), 'unsafe preflight unit argv')
@@ -558,10 +681,12 @@ def preflight_unit(config, build, cwd=None, platform=None):
     return '\n'.join(lines) + ('\n' if lines else '')
 
 
-def verify(config, pins, build, lock=None):
+def verify(config, pins, build, lock=None, *, immutable=True):
     build = Path(build)
-    root, state = build.parent.parent, Path(config['state_dir'])
+    root, state = build, Path(config['state_dir'])
     try:
+        if immutable:
+            check_immutable(build)
         record = json.loads((build / 'catalog.lock.json').read_text())
         expected = {'schema': 'connectome.catalog-lock/v1',
                     'pins': {k: pins[k] for k in ('artifacts', 'platform')},
@@ -570,13 +695,16 @@ def verify(config, pins, build, lock=None):
                     'files': tree_inventory(build / 'catalog')}
         need(record == expected, 'catalog installed inventory differs from lock')
         check_platform(pins)
+        audit_tree_code(build, state, pins['platform'])
         recipe = json.loads((build / 'cook-recipe.json').read_text())
         audit_descriptors(config, pins, build)
-        audit_recipe(recipe, build, state, pins['platform'], secrets=secret_environment_names(config))
+        audit_recipe(recipe, build, state, pins['platform'], secrets=secret_environment_names(config), data_options=data_options_for(config, build))
         audit(config.get('health', {}), root, state, pins['platform'])
         audit(preflight_unit(config, build, platform=pins['platform']), root, state, pins['platform'])
         if lock:
-            audit(lock, root, state, pins['platform'])
+            if 'command' in lock.get('health', {}):
+                audit_argv(lock['health']['command'], build, build, state, pins['platform'])
+            audit(lock, build.parent.parent, state, pins['platform'])
             need(lock['recipe']['sha256'] == record['recipe_sha256'], 'cook recipe digest mismatch')
             external = [{'name': n, 'command': s['command']} for n, s in sorted(recipe.get('mcpServers', {}).items())]
             need(lock.get('external', []) == external and not lock['components'] and not lock['localExtensions'],
@@ -596,15 +724,22 @@ def verify(config, pins, build, lock=None):
             path = build / lock['launch']['script']
             need(path.resolve().is_relative_to(build), 'launch path escapes build')
             audit(path.read_text(), root, state, pins['platform'])
-            for cwd, unit_body in working_dirs or [(state, None)]:
+            for cwd, unit_body in working_dirs or [(build, None)]:
                 for launch_cwd in audit_launcher(path.read_text(), cwd, root, state, pins['platform']):
-                    audit_recipe(recipe, build, state, pins['platform'], launch_cwd, secret_environment_names(config))
+                    audit_recipe(recipe, build, state, pins['platform'], launch_cwd, secret_environment_names(config), data_options=data_options_for(config, build))
                     if unit_body is not None:
                         audit_unit(unit_body, root, state, pins['platform'], env_cwd=launch_cwd)
     except ArchiveError:
         raise
     except (OSError, ValueError, KeyError, TypeError):
         raise ArchiveError('catalog lock or launch surface invalid', 'E_CATALOG_INVALID') from None
+
+
+def stage_checkout(source, target):
+    # Includes .git for the existing commit/tree/cleanliness verification.
+    tree_inventory(source)  # refuse aliases, links and special files before copying
+    shutil.copytree(source, target)
+    return target
 
 
 def input_paths(config, root):
@@ -631,7 +766,8 @@ def environment(config, pins, build, create=True):
         path = Path(value)
         target = tools / path.name
         need(not target.exists() and not target.is_symlink(), 'platform tool basename collision')
-        target.symlink_to(path)
+        shutil.copyfile(path, target)
+        target.chmod(0o555)
     paths = [str(Path(runtime(config, build, name)).parent) for name in ('bun', 'node')]
     paths.append(str(tools))
     return {'PATH': os.pathsep.join(paths), 'HOME': str(build / 'catalog-home'),
@@ -643,15 +779,28 @@ def environment(config, pins, build, create=True):
 # Trusted role code, not catalog command language. Node v24 execve preserves PID
 # and signal/exit semantics; secret values are copied in memory, never into argv.
 # The systemd bootstrap removes loader controls before starting this pinned Node.
+# Walk the entire tree on EVERY Exec (including automatic restarts), before
+# execve. No hashes here: full digest verification remains prepare/activation's job.
 EXEC_ENV = (
     "const s=JSON.parse(Buffer.from(process.argv[1],'base64').toString());"
+    "const fs=require('node:fs'),p=require('node:path');"
+    "function check(x){const t=fs.lstatSync(x);"
+    "if(t.isSymbolicLink()||(t.isFile()&&t.nlink!==1))throw Error('catalog symlink refused');"
+    "if((t.mode&0o222)||(!t.isFile()&&!t.isDirectory()))throw Error('catalog writable/special path');"
+    "if(t.isDirectory())for(const n of fs.readdirSync(x))check(p.join(x,n));}"
+    "if(fs.realpathSync(s.build)!==s.build)throw Error('catalog build alias');check(s.build);"
+    "for(const f of s.platform){let x=fs.realpathSync(f);for(;;){"
+    "try{fs.accessSync(x,fs.constants.W_OK);throw Error('catalog writable platform');}"
+    "catch(e){if(e.code!=='EACCES'&&e.code!=='EROFS')throw e;}"
+    "const y=p.dirname(x);if(y===x)break;x=y;}}"
     "const e=s.env;for(const n of s.secrets){if(Object.hasOwn(process.env,n))e[n]=process.env[n];}"
     "process.execve(s.argv[0],s.argv,e);"
 )
 
 
-def isolated_argv(config, build, argv, env):
-    payload = {'argv': argv, 'env': env, 'secrets': secret_environment_names(config)}
+def isolated_argv(config, build, argv, env, platform=()):
+    payload = {'argv': argv, 'env': env, 'secrets': secret_environment_names(config),
+               'build': str(build), 'platform': list(platform)}
     return [runtime(config, build, 'node'), '--eval', EXEC_ENV,
             base64.b64encode(canonical(payload)).decode('ascii')]
 
@@ -670,10 +819,10 @@ def isolated_unit(config, pins, build, body):
     The bootstrap may see non-loader ambient names, but the target never does.
     """
     build = Path(build)
-    state, root = Path(config['state_dir']), build.parent.parent
+    state, root = Path(config['state_dir']), build
     cwd = audit_unit(body, root, state, pins['platform'])
     base = environment(config, pins, build, create=False)
-    base['DATA_DIR'] = str(state)
+    base.update({'DATA_DIR': str(state), 'TMPDIR': str(state)})
     env, commands, section = {}, {}, None
     for line in body.splitlines():
         line = line.strip()
@@ -697,10 +846,10 @@ def isolated_unit(config, pins, build, body):
              'UnsetEnvironment=' + ' '.join(sorted(CODE_ENV))]
     # This is the only file supplying private runtime values; exported units
     # cannot add another one. Kept out of argv and serialized payloads.
-    lines.append('EnvironmentFile=' + systemd_words([str(build / 'secrets.env')]))
+    lines.append('EnvironmentFile=' + systemd_words([str(secret_env_path(build))]))
     for key, values in commands.items():
         lines.append(key + '=')
         for argv in values:
             audit_argv(argv, cwd, root, state, pins['platform'])
-            lines.append(key + '=' + systemd_words(isolated_argv(config, build, argv, env)))
+            lines.append(key + '=' + systemd_words(isolated_argv(config, build, argv, env, pins['platform'])))
     return '[Service]\n' + '\n'.join(lines) + '\n'
