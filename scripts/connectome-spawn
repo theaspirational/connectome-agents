@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Use the very same package shipped to Ansible, without importing Ansible."""
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'roles/connectome_agent/module_utils'))
+from connectome_spawn.cli import main
+
+sys.exit(main())

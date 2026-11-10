@@ -1,0 +1,14 @@
+schema: connectome.spawn-instance/v1
+instance: example-instance
+unixName: example-agent
+agent:
+  logicalName: ExampleAgent
+homeDirectory: /absolute/agent-home
+home:
+  transport: console
+  channel: primary
+rights:
+  administration: false
+target:
+  os: linux
+  architecture: x86_64

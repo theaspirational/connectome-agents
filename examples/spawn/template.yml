@@ -1,0 +1,15 @@
+schema: connectome.spawn-template/v1
+runtime: []
+agent:
+  provider: mock
+  model: example-model
+  systemPrompt: Help the creator with their work and ask when instructions are unclear.
+  contextBudgetTokens: 240000
+  proseRouting: disabled
+  strategy:
+    type: autobiographical
+    compressionModel: example-compression
+    recentWindowTokens: 80000
+connectors: []
+modules: [identity]
+seedPolicy: clean

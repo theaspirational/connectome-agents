@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "connectome-spawn"
+version = "0.1.0"
+description = "Offline data-only agent template planner"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6"]
+
+[project.scripts]
+connectome-spawn = "connectome_spawn.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "roles/connectome_agent/module_utils"}
+packages = ["connectome_spawn"]

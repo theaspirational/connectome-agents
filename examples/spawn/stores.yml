@@ -1,0 +1,3 @@
+runtime.cook: /absolute/object-stores/cook
+runtime.connectome-host: /absolute/object-stores/host
+runtime.agent-framework: /absolute/object-stores/framework

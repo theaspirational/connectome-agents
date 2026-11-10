@@ -168,3 +168,8 @@ root script does with the data remains the operator's responsibility. Commands
 and all other args remain unchanged. Declarations appear in the role lock view, plan and status;
 file contents are never recorded. Recipe/file-secret delivery are
 off by default; cook's run.sh, health checks and transactional rollback remain.
+
+Offline template planning is available through
+[`connectome-spawn validate|plan|dry-run`](docs/spawn.md). It shares one Python
+package with the role's module-utils namespace, reads the existing catalog, and
+never applies or activates a deployment. Start with `examples/spawn/`.
