@@ -875,7 +875,8 @@ class Deployment:
             stream.write(content)
 
     def _environment_path(self, build):
-        if catalog.active(self._config(build)):
+        config = self.config if build == self.build else self._config(build)
+        if catalog.active(config):
             return inside(self.state, catalog.secret_env_path(build))
         return inside(build, 'secrets.env')
 
