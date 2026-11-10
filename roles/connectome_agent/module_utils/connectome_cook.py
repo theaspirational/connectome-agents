@@ -18,7 +18,7 @@ from connectome_lock import read_lock, LockError, text, credential_shaped, repos
 from connectome_errors import SafeError, diagnostic, cook_code_from_stream
 from connectome_archive import FRAMEWORK, ArchiveError, framework_provenance, dependency_provenance, records_metadata
 
-COOK_COMMIT = '011d73bc6c6103e0124df80191885a6585409c56'
+COOK_COMMIT = '1b874d9dd55b529486b8029dd9814a6c0e2147e0'
 BASE_ENV = {'PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR'}
 
 
@@ -136,8 +136,8 @@ def recipe_from_spec(spec, recipe_bytes=None):
              'secret names overlap adapter-owned environment')
         return json.loads(content), names
     agent = config.get('agent')
-    need(isinstance(agent, dict) and isinstance(agent.get('systemPrompt'), str) and agent['systemPrompt'],
-         'agent.systemPrompt is required by cook')
+    need(isinstance(agent, dict) and (agent.get('systemPrompt') is None or isinstance(agent['systemPrompt'], str)),
+         'agent.systemPrompt must be a string when present')
     recipe = {'name': config['name'], 'agent': deepcopy(agent), 'modules': {},
               'mcpServers': {}, 'extensions': {}}
     if 'description' in config:

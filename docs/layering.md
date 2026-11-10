@@ -149,7 +149,7 @@ restores code/units/env, never data. Runtime/schema migrations remain operator r
 Effective `budgets` from all four layers are shown in the nonsecret `--check`
 plan, alongside `state_dir` and `secrets_file`. Host `src/recipe.ts` at the pinned
 `cef933981dc0699fc00e5189b129d854ff8d43f6` has no step/cost-limit fields (nor does
-the inspected local host); cook `011d73bc` exposes none. The adapter refuses any
+the inspected local host); cook `1b874d9d` exposes none. The adapter refuses any
 nonempty budgets with `not supported by host recipe schema at <host-pin>` before
 spawning tools. No fields are invented and no enforcement is implemented here.
 Public defaults retain example budgets for merge/plan visibility; deploying with
