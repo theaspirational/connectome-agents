@@ -76,8 +76,9 @@ def _state(value, agent):
 
 
 class Lifecycle:
-    def __init__(self, root, *, adapter=None, identity_provider=None, importer=None):
+    def __init__(self, root, *, adapter=None, identity_provider=None, importer=None, ingress_root=None):
         self.root = safe_path(root)
+        self.ingress_root = safe_path(ingress_root) if ingress_root is not None else None
         self.adapter, self.identity_provider, self.importer = adapter, identity_provider, importer
 
     def _paths(self, agent):
@@ -145,7 +146,7 @@ class Lifecycle:
     def transition(self, agent, target, operation_id, *, name_file=None, payload=None):
         need(target in STATES and target != 'planned', 'illegal lifecycle target')
         need(match(operation_id, r'[A-Za-z0-9_-]{1,128}'), 'invalid operation id')
-        record = read_name_record(name_file) if name_file is not None else None
+        record = read_name_record(name_file, ingress_root=self.ingress_root) if name_file is not None else None
         root, path, store, marker = self._paths(agent)
         with locked(root):
             value = self._read(agent)

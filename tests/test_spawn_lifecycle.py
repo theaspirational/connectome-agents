@@ -544,6 +544,79 @@ class LifecycleTests(unittest.TestCase):
                 self.restart().transition('example-agent', 'active', 'new-op', payload=PAYLOAD)
             self.assertEqual(self.importer.calls, count)
 
+    def test_name_ingress_component_boundary(self):
+        ingress = self.work / 'ingress'
+        nested = ingress / 'nested' / 'deeper'
+        nested.mkdir(parents=True)
+        outside = self.work / 'outside'
+        outside.mkdir()
+        write(outside / 'name.json', dict(IDENTITY, name='OutsideAgent'))
+        write(nested / 'name.json', IDENTITY)
+        (ingress / 'alias').symlink_to(outside, target_is_directory=True)
+        (ingress / 'nested' / 'alias').symlink_to(outside, target_is_directory=True)
+        alias_root = self.work / 'ingress-alias'
+        alias_root.symlink_to(ingress, target_is_directory=True)
+        self.life = Lifecycle(self.root, adapter=self.adapter, identity_provider=self.provider,
+                              ingress_root=ingress)
+        self.create()
+        self.move('initiation')
+        probes = [str(ingress) + '/../outside/name.json', ingress / 'alias/name.json',
+                  ingress / 'nested/alias/name.json', outside / 'name.json',
+                  alias_root / 'nested/deeper/name.json']
+        for path in probes:
+            with self.subTest(path=path), self.assertRaises(SpawnError):
+                self.move('named', name_file=path)
+            self.assertEqual(self.life.status('example-agent')['state'], 'initiation')
+            self.assertIsNone(self.life.status('example-agent')['pending'])
+        with self.assertRaises(SpawnError):
+            Lifecycle(self.root, ingress_root=alias_root)
+        with self.assertRaises(SpawnError):
+            read_name_record(alias_root / 'nested/deeper/name.json', ingress_root=alias_root)
+        for path in probes[:3]:
+            with self.assertRaises(SpawnError):
+                read_name_record(path)  # Compatibility API must be safe too.
+        self.assertEqual(self.move('named', name_file=nested / 'name.json')['identity'], IDENTITY)
+
+    def test_all_local_reads_refuse_traversal_symlinks_and_nonregular(self):
+        from connectome_spawn.sources import read_file
+        from connectome_spawn.seed import seed_payload
+        real = self.work / 'real'
+        real.mkdir()
+        write(real / 'data.json', IDENTITY)
+        alias = self.work / 'read-alias'
+        alias.symlink_to(real, target_is_directory=True)
+        final = real / 'link.json'
+        final.symlink_to(real / 'data.json')
+        fifo = real / 'fifo'
+        os.mkfifo(fifo)
+        for reader in (read_file, seed_payload, read, read_name_record):
+            for path in (alias / 'data.json', final, fifo, real,
+                         str(real) + '/../real/data.json'):
+                with self.subTest(reader=reader.__name__, path=path), self.assertRaises(SpawnError):
+                    reader(path)
+            self.assertTrue(reader(real / 'data.json'))
+        self.create('required')
+        self.move('active', payload=PAYLOAD)
+        agent_root = self.root / 'example-agent'
+        for relative in ('lifecycle.json', 'state/seed.consumed'):
+            path = agent_root / relative
+            raw = path.read_bytes()
+            saved = self.work / ('saved-' + path.name)
+            saved.write_bytes(raw)
+            path.unlink()
+            path.symlink_to(saved)
+            with self.assertRaises(SpawnError):
+                self.life.status('example-agent')
+            path.unlink()
+            path.write_bytes(raw)
+        state = agent_root / 'state'
+        state.rename(agent_root / 'original-state')
+        state.symlink_to(agent_root / 'original-state', target_is_directory=True)
+        with self.assertRaises(SpawnError):
+            self.life.status('example-agent')
+        with self.assertRaises(SpawnError):
+            Lifecycle(str(self.root) + '/../agents').status('example-agent')
+
     def test_symlinks_corrupt_state_and_migration_refused(self):
         self.create()
         alias = self.work / 'alias'

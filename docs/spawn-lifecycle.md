@@ -215,3 +215,28 @@ All provider requirements appear in plan/dry-run `lifecycle[].needsProvider` and
 Only intent/record bookkeeping is local; the fake is not a real transport.
 Tests exercise transitions, refusals, concurrent per-agent provisioning, restarts,
 process death, interrupted effects and atomic persistence without any service.
+
+### Local input path boundary
+
+`Lifecycle(..., ingress_root=...)` and
+`read_name_record(path, ingress_root=...)` optionally restrict name records to
+an explicitly configured ingress directory. Paths keep their existing meaning
+(relative to cwd, or absolute); an absolute path outside that root is refused,
+not rebased. Without an ingress root, the caller still selects the file as
+before, with its literal parent as the read boundary. Never derive the configured root from agent-provided input.
+
+All local file reads reject `..`, symlinks in **every** component (including
+the ingress root itself and its ancestors), and non-regular files. Legitimate
+nested paths work. Directory-fd traversal uses `O_NOFOLLOW`; Linux
+`/proc/self/fd` confirms containment of the opened regular file before reading.
+Symlinked roots are deliberately unsupported, even when their targets are
+inside the configured tree.
+
+This shared rule covers name records; opaque seed files; lifecycle/status
+`lifecycle.json` and `state/seed.consumed`; the fake identity provider's
+`identities.json`; and file-backed template, instance, stores, observed-state,
+catalog descriptor/versions and payload inputs. State-root/store path checks
+also continue to reject symlinks. Store contents belong to the injected adapter
+and are not read by the spawn core. Persistence writes retain the documented
+trusted same-uid caller assumption; this is not hostile concurrent-writer
+isolation or an authenticity check on regular-file contents.

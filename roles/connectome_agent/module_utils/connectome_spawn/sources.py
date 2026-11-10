@@ -27,17 +27,41 @@ def absolute(value):
     return value
 
 
-def read_file(path, limit=LIMIT):
-    """O_NOFOLLOW plus fstat avoids symlink/FIFO final-component reads."""
+def read_file(path, limit=LIMIT, *, root=None):
+    """Read a bounded regular file without following *any* symlink component.
+
+    Paths are literal: never normalize away '..'. An explicit root is a
+    containment boundary, not a base for interpreting relative input paths.
+    Linux dir-fd traversal pins each directory; /proc confirms the opened file
+    still resides beneath the boundary before any bytes are read.
+    """
+    path = Path(path).absolute()
+    boundary = Path(root).absolute() if root is not None else path.parent
+    need('..' not in path.parts and '..' not in boundary.parts, 'path traversal refused')
+    need(path != boundary and path.is_relative_to(boundary), 'input escapes root')
+    directory_fd = None
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        directory_fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for component in path.parts[1:-1]:
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=directory_fd)
         with os.fdopen(fd, 'rb') as stream:
             need(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), 'regular input file required')
+            resolved = Path(os.readlink('/proc/self/fd/' + str(stream.fileno())))
+            need(resolved.is_absolute() and resolved.is_relative_to(boundary) and
+                 not str(resolved).endswith(' (deleted)'), 'input escapes root')
             data = stream.read(limit + 1)
             need(len(data) <= limit, 'input size limit exceeded')
             return data
     except OSError:
         raise SpawnError('unreadable local file') from None
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def git(repo, *args, limit=LIMIT):

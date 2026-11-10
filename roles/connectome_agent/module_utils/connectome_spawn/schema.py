@@ -156,9 +156,10 @@ def name_record(value):
     return deepcopy(value)
 
 
-def read_name_record(path):
-    from .sources import load_source
-    return name_record(load_source(file=path))
+def read_name_record(path, *, ingress_root=None):
+    from .data import decode
+    from .sources import read_file
+    return name_record(decode(read_file(path, root=ingress_root)))
 
 
 def activation_identity(value, home):

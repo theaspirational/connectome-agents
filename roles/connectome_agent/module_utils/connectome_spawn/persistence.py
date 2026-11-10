@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 
 from .data import canonical, decode, need
+from .sources import read_file
 
 
 def safe_path(path):
@@ -39,8 +40,7 @@ def directory(path):
 
 def read(path):
     path = safe_path(path)
-    need(path.is_file() and path.stat().st_size <= 1024 * 1024, 'bounded state file required')
-    return decode(path.read_bytes())
+    return decode(read_file(path))
 
 
 def write(path, value):
