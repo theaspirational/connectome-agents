@@ -37,15 +37,19 @@ def validate_external_data_args(records):
     seen = set()
     for record in records if valid else ():
         if not (isinstance(record, dict) and
-                {'server', 'path', 'kind'} <= set(record) <= {'server', 'path', 'kind', 'flag'} and
+                {'server', 'command', 'args', 'path', 'kind'} <= set(record) <=
+                {'server', 'command', 'args', 'path', 'kind', 'flag'} and
                 isinstance(record['server'], str) and
                 re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', record['server']) and
+                external_data_path(record['command']) and
+                isinstance(record['args'], list) and
+                all(isinstance(arg, str) for arg in record['args']) and
                 external_data_path(record['path']) and
                 isinstance(record['kind'], str) and record['kind'] in ('file', 'dir') and
                 ('flag' not in record or external_data_flag(record['flag']))):
             valid = False
             break
-        key = (record['server'], record['path'])
+        key = record['server']
         if key in seen:
             valid = False
             break

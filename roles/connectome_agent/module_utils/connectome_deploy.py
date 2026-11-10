@@ -187,7 +187,7 @@ def check_external_data_arg(name, value, account=None, home=None, kind='file'):
 
 
 def external_paths(lock, recipe, data_args=()):
-    """(name, path, is_arg, private_data) with exact positional/flag binding."""
+    """(name, path, is_arg, private_data) with exact invocation and positional/flag binding."""
     try:
         inputs.validate_external_data_args(list(data_args))
     except inputs.ExternalDataArgError:
@@ -198,7 +198,8 @@ def external_paths(lock, recipe, data_args=()):
         server = servers.get(entry['server']) if isinstance(servers, dict) else None
         if not (entry['server'] in external and isinstance(server, dict) and
                 isinstance(server.get('source'), dict) and 'external' in server['source'] and
-                isinstance(server.get('args', []), list) and
+                server.get('command') == entry['command'] and
+                server.get('args', []) == entry['args'] and
                 entry['path'] != server.get('command') and
                 (entry['path'] in server.get('args', []) or
                  ('flag' in entry and entry['flag'] + '=' + entry['path'] in server.get('args', [])))):
@@ -215,13 +216,14 @@ def external_paths(lock, recipe, data_args=()):
         args = server.get('args', [])
         result.append((record['name'], record['command'], False, False))
         if any(entry['server'] == record['name'] for entry in data_args):
-            # No interpreter-option parsing: only args[0] can be the script.
+            # Data for the pinned interpreter, never an executable or option.
             script = args[0] if args else ''
             try:
-                if not (script.startswith('/') and path_like_arg(script) == script):
+                if not script.startswith('/'):
                     raise ValueError
                 checked = check_external_command(record['name'], script, True)
-                if not stat.S_ISREG(checked.lstat().st_mode):
+                mode = checked.lstat().st_mode
+                if not stat.S_ISREG(mode) or mode & 0o111:
                     raise ValueError
             except (ExternalCommandUnsafe, OSError, ValueError):
                 raise ExternalCommandUnsafe(record['name'], 'invalid first-argument script',

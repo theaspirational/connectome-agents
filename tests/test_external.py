@@ -39,6 +39,17 @@ def system_command():
     return None
 
 
+def system_script():
+    """Root-maintained, readable interpreter data with no execute bits."""
+    try:
+        path = check_external_command('probe', os.__file__, True)
+        if stat.S_ISREG(path.stat().st_mode) and not path.stat().st_mode & 0o111:
+            return str(path)
+    except DeployError:
+        pass
+    return None
+
+
 def fakeroot_base():
     """A directory whose ancestors fakeroot can present as root-owned and usable.
 
@@ -322,6 +333,80 @@ print(json.dumps(result))
                 self.assertEqual(result[label][0], code)
                 self.assertIn(reason, result[label][1])
 
+    @unittest.skipUnless(shutil.which('fakeroot'), 'fakeroot unavailable')
+    def test_fakeroot_pinned_node_file_and_python_directory(self):
+        """Real files and all production checks; fakeroot supplies root ownership."""
+        base = fakeroot_base()
+        if base is None:
+            self.skipTest('no safe fakeroot ancestors')
+        with tempfile.TemporaryDirectory(dir=base) as work:
+            script = r'''
+import json
+import os
+from pathlib import Path
+import sys
+from connectome_deploy import external_paths, check_external_command, check_external_data_arg
+work = Path(sys.argv[1])
+uid = int(sys.argv[2])
+account = (uid, set(json.loads(sys.argv[3])))
+os.umask(0o022)
+# Model a root-maintained /opt installation and a separate agent home.
+for parent in (work, *work.parents):
+    os.chown(parent, 0, os.getegid())
+work.chmod(0o755)
+opt = work / 'opt/example'
+opt.mkdir(parents=True)
+node = work / 'usr/bin/node'
+node.parent.mkdir(parents=True)
+node.write_text('#!/usr/bin/sh\nexit 0\n')
+node.chmod(0o755)
+js, py = opt / 'mcp.js', opt / 'slack_rt021.py'
+for path in (js, py):
+    path.write_text('# interpreter data fixture\n')
+    path.chmod(0o644)
+for path in work.rglob('*'):
+    os.chown(path, 0, os.getegid())
+home = work / 'home/agent'
+home.mkdir(parents=True)
+os.chown(home.parent, 0, os.getegid())
+os.chown(home, uid, os.getegid())
+home.chmod(0o700)
+data, state = home / 'registry.json', home / 'state'
+data.write_text('synthetic-private-data-canary')
+state.mkdir()
+for path, mode in ((data, 0o600), (state, 0o700)):
+    os.chown(path, uid, os.getegid())
+    path.chmod(mode)
+results = []
+for name, command, args, path, kind, flag in (
+    ('node', str(node), [str(js), str(data)], data, 'file', None),
+    ('python', '/usr/bin/python3', [str(py), '--verbose', 'word', '--state', str(state)],
+     state, 'dir', '--state'),
+    ('python-equals', '/usr/bin/python3', [str(py), '--state=' + str(state)],
+     state, 'dir', '--state'),
+):
+    entry = dict(server=name, command=command, args=args.copy(), path=str(path), kind=kind)
+    if flag:
+        entry['flag'] = flag
+    lock = {'external': [dict(name=name, command=command)]}
+    recipe = {'mcpServers': {name: dict(command=command, args=args, source={'external': True})}}
+    paths = external_paths(lock, recipe, [entry])
+    assert paths[-1] == (name, str(path), True, True)
+    for server, value, arg, private in paths:
+        if private:
+            check_external_data_arg(server, value, account=account, home=home, kind=kind)
+        else:
+            check_external_command(server, value, arg, account)
+    results.append(name)
+print(json.dumps(results))
+'''
+            groups = sorted({os.getegid(), *os.getgroups()})
+            output = subprocess.run(
+                ['fakeroot', sys.executable, '-c', script, work, str(os.geteuid()), json.dumps(groups)],
+                env=dict(os.environ, PYTHONPATH=str(MODULES)), cwd=work,
+                stdout=subprocess.PIPE, check=True).stdout
+            self.assertEqual(json.loads(output), ['node', 'python', 'python-equals'])
+
 
 class ExternalDeploymentTests(unittest.TestCase):
     setUp = test_deploy.DeployTests.setUp
@@ -398,7 +483,9 @@ class ExternalDataArgTests(unittest.TestCase):
         self.path = self.directory / 'registry.json'
         self.path.write_text('synthetic-private-data-canary')
         self.path.chmod(0o600)
-        self.entry = {'server': 'alpha', 'path': str(self.path), 'kind': 'file'}
+        self.entry = {'server': 'alpha', 'command': '/usr/bin/node',
+                      'args': ['/opt/example/mcp.js', str(self.path)],
+                      'path': str(self.path), 'kind': 'file'}
 
     def check(self, path=None, kind='file'):
         return check_external_data_arg('alpha', str(path or self.path), kind=kind)
@@ -507,6 +594,12 @@ class ExternalDataArgTests(unittest.TestCase):
     def test_closed_input_schema(self):
         inputs.validate({'external_data_args': [self.entry]})
         for records in (None, {}, '', [None], [{}], [dict(self.entry, extra=True)],
+                        *[[{k: v for k, v in self.entry.items() if k != field}]
+                          for field in ('command', 'args')],
+                        [dict(self.entry, command='node')], [dict(self.entry, command=1)],
+                        [dict(self.entry, args=None)], [dict(self.entry, args='arg')],
+                        [dict(self.entry, args=[1])],
+                        [self.entry, dict(self.entry, path='/different')],
                         [dict(self.entry, server='bad/name')], [dict(self.entry, server=1)],
                         [dict(self.entry, path=1)], [dict(self.entry, path='relative')],
                         [dict(self.entry, path='/a/../b')], [dict(self.entry, path='/a//b')],
@@ -523,7 +616,7 @@ class ExternalDataArgTests(unittest.TestCase):
 
     def test_binding_is_raw_argv_exact_server_and_path(self):
         command = '/usr/bin/node'
-        script = system_command()
+        script = system_script()
         if script is None:
             self.skipTest('no safe root-owned script path')
         recipe = {'mcpServers': {
@@ -531,6 +624,7 @@ class ExternalDataArgTests(unittest.TestCase):
             'beta': {'command': command, 'args': [script, str(self.path)], 'source': {'external': True}},
             'gamma': {'command': command, 'args': [str(self.path)], 'source': {'npm': 'example'}}}}
         lock = {'external': [{'name': name, 'command': command} for name in ('alpha', 'beta')]}
+        self.entry.update(command=command, args=recipe['mcpServers']['alpha']['args'].copy())
         paths = external_paths(lock, recipe, [self.entry])
         self.assertEqual(paths, [('alpha', command, False, False),
                                 ('alpha', script, True, False),
@@ -549,6 +643,7 @@ class ExternalDataArgTests(unittest.TestCase):
         # Even when the same path also occurs as bare argv, a flag value is
         # still a different arg and must use the root-owned check.
         recipe['mcpServers']['alpha']['args'].extend(['word', str(self.path)])
+        self.entry['args'] = recipe['mcpServers']['alpha']['args'].copy()
         paths = external_paths(lock, recipe, [self.entry])
         self.assertEqual([row[3] for row in paths[:4]], [False, False, False, True])
 
@@ -556,29 +651,33 @@ class ExternalDataArgTests(unittest.TestCase):
         command = system_command()
         if command is None:
             self.skipTest('no safe root-owned script path')
+        script = system_script()
         server = {'command': command, 'args': [], 'source': {'external': True}}
         recipe = {'mcpServers': {'alpha': server}}
         lock = {'external': [{'name': 'alpha', 'command': command}]}
         for kind, path in (('file', self.path), ('dir', self.directory)):
             entry = dict(self.entry, path=str(path), kind=kind, flag='--state')
             inputs.validate_external_data_args([entry])
-            for args in ([command, '--state', str(path)], [command, '--state=' + str(path)]):
+            for args in ([script, '--state', str(path)], [script, '--state=' + str(path)]):
                 server['args'] = args
+                entry.update(command=command, args=args.copy())
                 with self.subTest(kind=kind, args=args):
                     self.assertEqual(external_paths(lock, recipe, [entry])[-1],
                                      ('alpha', str(path), True, True))
                     self.assertEqual(self.check(path, kind), path)
-            for args in ([command, str(path)], [command, '--other', str(path)],
-                         [command, '--State', str(path)], [command, '--state', 'word', str(path)],
+            for args in ([script, str(path)], [script, '--other', str(path)],
+                         [script, '--State', str(path)], [script, '--state', 'word', str(path)],
                          ['--state', str(path)], ['--state=' + str(path)],
-                         ['word', '--state', str(path)], [command, '--other=' + str(path)]):
+                         ['word', '--state', str(path)], [script, '--other=' + str(path)]):
                 server['args'] = args
+                entry.update(command=command, args=args.copy())
                 with self.subTest(kind=kind, args=args):
                     self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
         # Deny comparisons are case-sensitive, but binding remains exact.
         for flag in ('--State', '--Require', '--IMPORT', '--Loader'):
             entry = dict(self.entry, flag=flag)
-            server['args'] = [command, flag, str(self.path)]
+            server['args'] = [script, flag, str(self.path)]
+            entry.update(command=command, args=server['args'].copy())
             self.assertTrue(external_paths(lock, recipe, [entry])[-1][3])
         denied = ('-e', '--eval', '-p', '--print', '-c', '-r', '--require', '--import',
                   '--loader', '--experimental-loader', '-x', '-m', '--require-extra',
@@ -588,18 +687,20 @@ class ExternalDataArgTests(unittest.TestCase):
             entry = dict(self.entry, flag=flag)
             with self.subTest(flag=flag), self.assertRaises(inputs.ExternalDataArgError):
                 inputs.validate_external_data_args([entry])
-            for args in ([command, flag, str(self.path)], [command, flag + '=' + str(self.path)]):
+            for args in ([script, flag, str(self.path)], [script, flag + '=' + str(self.path)]):
                 server['args'] = args
+                entry.update(command=command, args=args.copy())
                 with self.subTest(args=args):
                     self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
 
     def test_node_data_requires_root_owned_first_script(self):
         command = '/usr/bin/node'
-        script = '/opt/example/rootscript.js'
+        script = '/opt/example/mcp.js'
         server = {'command': command, 'args': [script, str(self.path)],
                   'source': {'external': True}}
         recipe = {'mcpServers': {'alpha': server}}
         lock = {'external': [{'name': 'alpha', 'command': command}]}
+        self.entry.update(command=command, args=server['args'].copy())
         # Only the script's metadata check is doubled; the private file is real.
         with patch('connectome_deploy.check_external_command', return_value=Path(__file__)) as check:
             paths = external_paths(lock, recipe, [self.entry])
@@ -614,16 +715,18 @@ class ExternalDataArgTests(unittest.TestCase):
         with patch('connectome_deploy.check_external_command', return_value=Path(__file__)):
             for args in cases:
                 server['args'] = args
+                self.entry['args'] = args.copy()
                 with self.subTest(args=args):
                     self.assert_data_error(lambda: external_paths(lock, recipe, [self.entry]))
         server['args'] = [script, str(self.path)]
+        self.entry['args'] = server['args'].copy()
         with patch('connectome_deploy.check_external_command',
                    side_effect=ExternalCommandUnsafe('alpha', 'not root-owned')):
             self.assert_data_error(lambda: external_paths(lock, recipe, [self.entry]))
 
     def test_no_options_or_option_values_before_script_for_any_data_form(self):
         command = '/usr/bin/python3'
-        script = system_command()
+        script = system_script()
         if script is None:
             self.skipTest('no safe root-owned script path')
         server = {'command': command, 'args': [], 'source': {'external': True}}
@@ -639,6 +742,7 @@ class ExternalDataArgTests(unittest.TestCase):
                     [flag, str(self.path)], [flag + '=' + str(self.path)]]
                 for tail in tails:
                     server['args'] = prefix + tail
+                    entry.update(command=command, args=server['args'].copy())
                     with self.subTest(args=server['args'], flag=flag):
                         self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
 
@@ -654,8 +758,54 @@ class ExternalDataArgTests(unittest.TestCase):
         check_external_command('alpha', directory, True)
         for script in (directory, str(self.path), str(self.directory / 'missing.py')):
             server['args'] = [script, str(self.path)]
+            self.entry.update(command=command, args=server['args'].copy())
             with self.subTest(script=script):
                 self.assert_data_error(lambda: external_paths(lock, recipe, [self.entry]))
+
+    def test_exact_invocation_pin_refuses_any_command_or_args_mismatch(self):
+        script = system_script()
+        if script is None:
+            self.skipTest('no safe root-owned script path')
+        command = '/usr/bin/python3'
+        args = [script, 'first', 'second', str(self.path)]
+        entry = dict(self.entry, command=command, args=args.copy())
+        server = {'command': command, 'args': args.copy(), 'source': {'external': True}}
+        recipe = {'mcpServers': {'alpha': server}}
+        lock = {'external': [{'name': 'alpha', 'command': command}]}
+        self.assertTrue(external_paths(lock, recipe, [entry])[-1][3])
+        for changed in (args + ['extra'], [script, 'second', 'first', str(self.path)],
+                        [script, 'First', 'second', str(self.path)]):
+            server['args'] = changed
+            with self.subTest(args=changed):
+                self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
+        server['args'] = args.copy()
+        # Update the lock too: this must be the declaration check, not lock drift.
+        for changed in ('/usr/local/bin/python3', '/usr/bin/Python3'):
+            server['command'] = lock['external'][0]['command'] = changed
+            with self.subTest(command=changed):
+                self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
+        server['command'] = lock['external'][0]['command'] = command
+        entry.update(flag='--state', args=[script, '--state', str(self.path)])
+        for changed in ([script, '--State', str(self.path)],
+                        [script, '--state=' + str(self.path)]):
+            server['args'] = changed
+            self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
+
+    def test_first_script_has_no_execute_bits_for_any_account(self):
+        script = system_script()
+        if script is None:
+            self.skipTest('no safe root-owned script path')
+        command = '/usr/bin/python3'
+        args = [script, str(self.path)]
+        entry = dict(self.entry, command=command, args=args.copy())
+        recipe = {'mcpServers': {'alpha': {
+            'command': command, 'args': args, 'source': {'external': True}}}}
+        lock = {'external': [{'name': 'alpha', 'command': command}]}
+        self.assertTrue(external_paths(lock, recipe, [entry])[-1][3])
+        for mode in (0o755, 0o744, 0o654, 0o645):
+            with self.subTest(mode=oct(mode)), self.metadata(
+                    Path(script), st_mode=stat.S_IFREG | mode):
+                self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
 
     def test_python_root_script_state_directory_accepted(self):
         command = '/usr/bin/python3'
@@ -666,6 +816,7 @@ class ExternalDataArgTests(unittest.TestCase):
         lock = {'external': [{'name': 'alpha', 'command': command}]}
         for tail in (['--state', str(self.directory)], ['--state=' + str(self.directory)]):
             server['args'] = [script, '--verbose', 'word'] + tail
+            entry.update(command=command, args=server['args'].copy())
             with self.subTest(args=server['args']), patch(
                     'connectome_deploy.check_external_command', return_value=Path(__file__)) as check:
                 self.assertEqual(external_paths(lock, recipe, [entry])[-1],
@@ -686,8 +837,13 @@ class ExternalDataDeploymentTests(unittest.TestCase):
         self.data = Path(self.tmp.name) / 'registry.json'
         self.data.write_text('synthetic-private-data-canary')
         self.data.chmod(0o600)
-        self.config['external_data_args'] = [{'server': 'alpha', 'path': str(self.data), 'kind': 'file'}]
-        self.recipe(self.command, [self.command, str(self.data)])
+        self.script = system_script()
+        if self.script is None:
+            self.skipTest('no safe root-owned non-executable script')
+        args = [self.script, str(self.data)]
+        self.config['external_data_args'] = [{'server': 'alpha', 'command': self.command,
+                                              'args': args, 'path': str(self.data), 'kind': 'file'}]
+        self.recipe(self.command, args)
 
     def test_positive_lock_plan_status_and_recheck(self):
         self.data_config()
@@ -717,18 +873,22 @@ class ExternalDataDeploymentTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
         other = self.data.with_name(self.data.name + '.js'); other.write_text('synthetic')
         other.chmod(0o600)
-        self.recipe(self.command, [self.command, str(self.data), str(other)])
+        args = [self.script, str(self.data), str(other)]
+        self.config['external_data_args'][0]['args'] = args
+        self.recipe(self.command, args)
         with self.assertRaises(DeployError) as error:
             self.deployment().prepare()
         self.assertEqual(error.exception.code, 'E_EXTERNAL_COMMAND')
-        self.recipe(self.command, [self.command, str(self.data), '--config=' + str(self.data)])
+        args = [self.script, str(self.data), '--config=' + str(self.data)]
+        self.config['external_data_args'][0]['args'] = args
+        self.recipe(self.command, args)
         with self.assertRaises(DeployError) as error:
             self.deployment().prepare()
         self.assertEqual(error.exception.code, 'E_EXTERNAL_COMMAND')
 
     def test_python_state_directory_flag_prepare_activate_and_recheck(self):
         self.data_config()
-        command, script = '/usr/bin/python3', os.__file__
+        command, script = '/usr/bin/python3', system_script()
         try:
             check_external_command('alpha', command)
             check_external_command('alpha', script, True)
@@ -738,6 +898,7 @@ class ExternalDataDeploymentTests(unittest.TestCase):
         self.data.mkdir(mode=0o700)
         self.config['external_data_args'][0].update(kind='dir', flag='--state')
         for args in ([script, '--state', str(self.data)], [script, '--state=' + str(self.data)]):
+            self.config['external_data_args'][0].update(command=command, args=args.copy())
             self.recipe(command, args)
             dep = self.deployment()
             result = dep.prepare()
@@ -766,6 +927,43 @@ class ExternalDataDeploymentTests(unittest.TestCase):
             self.deployment().prepare()
         self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
 
+    def test_env_shell_private_script_probe_refused(self):
+        self.data_config()
+        command, shell = '/usr/bin/env', '/usr/bin/sh'
+        for path in (command, shell):
+            check_external_command('alpha', path)
+        marker = self.data.with_name('executed')
+        self.data.write_text('printf executed > "' + str(marker) + '"\n')
+        args = [shell, str(self.data)]
+        subprocess.run([command] + args, check=True)
+        self.assertEqual(marker.read_text(), 'executed')
+        marker.unlink()
+        self.config['external_data_args'][0].update(command=command, args=args.copy())
+        self.recipe(command, args)
+        dep = self.deployment()
+        with self.assertRaises(DeployError) as error:
+            dep.prepare()
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+        self.assertFalse((dep.build / '.prepared').exists())
+        self.assertFalse(dep.current.is_symlink())
+        self.assertFalse((self.units / 'connectome-example.service').exists())
+        self.assertFalse(marker.exists())
+
+    def test_changed_invocation_refused_before_prepared_marker_or_units(self):
+        self.data_config()
+        pinned = self.config['external_data_args'][0]
+        pinned['args'] = [self.script, 'first', 'second', str(self.data)]
+        for args in (pinned['args'] + ['extra'],
+                     [self.script, 'second', 'first', str(self.data)]):
+            self.recipe(self.command, args)
+            dep = self.deployment()
+            with self.subTest(args=args), self.assertRaises(DeployError) as error:
+                dep.prepare()
+            self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+            self.assertFalse((dep.build / '.prepared').exists())
+            self.assertFalse(dep.current.is_symlink())
+            self.assertFalse((self.units / 'connectome-example.service').exists())
+
     def test_dash_private_script_probe_refused(self):
         self.data_config()
         command = '/usr/bin/dash'
@@ -779,6 +977,7 @@ class ExternalDataDeploymentTests(unittest.TestCase):
         self.assertEqual(marker.read_text(), 'executed')
         marker.unlink()
         for args in ([str(self.data)], ['-s', str(self.data)], ['-e', str(self.data)]):
+            self.config['external_data_args'][0].update(command=command, args=args.copy())
             self.recipe(command, args)
             dep = self.deployment()
             with self.subTest(args=args), self.assertRaises(DeployError) as error:
@@ -791,7 +990,7 @@ class ExternalDataDeploymentTests(unittest.TestCase):
 
     def test_python_option_value_private_script_probe_refused(self):
         self.data_config()
-        command, script = '/usr/bin/python3', os.__file__
+        command, script = '/usr/bin/python3', system_script()
         try:
             check_external_command('alpha', command)
             check_external_command('alpha', script, True)
@@ -808,6 +1007,7 @@ class ExternalDataDeploymentTests(unittest.TestCase):
             marker.unlink()
         for args in (['-X', script, str(self.data)], ['-X', '/etc/hosts', str(self.data)],
                      ['--', script, str(self.data)]):
+            self.config['external_data_args'][0].update(command=command, args=args.copy())
             self.recipe(command, args)
             dep = self.deployment()
             with self.subTest(args=args), self.assertRaises(DeployError) as error:

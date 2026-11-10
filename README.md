@@ -138,17 +138,28 @@ secret values through private files and EnvironmentFile path variables. A suppli
 recipe may use cook's host-installed [`source: {external: true}`](docs/lock-contract.md#host-installed-external-mcp-servers)
 MCP servers; their commands and path args must be root-owned, non-writable
 (`E_EXTERNAL_COMMAND`) and usable by the agent account (`E_EXTERNAL_ACCESS`).
-Agent-level `external_data_args: [{server: NAME, path: /absolute/private/file, kind: file}]`
-opts exact argv data into an agent-owned file 0600 or directory 0700 exception
-under the agent's home, with safe ancestry (`E_EXTERNAL_DATA_ARG`). Required
-`kind` is `file` or `dir`. Without optional `flag`, data must be positional,
-never first or immediately after a flag. With `flag: --state`, only exact
-`--state PATH` or `--state=PATH` is allowed; code-loading flags are denied.
-Both forms require `args[0]` to be an absolute path-like script arg that passes
-the normal root-owned checks as a regular file: no interpreter options before
-the script, not even `--`. Exempt args are allowed only at index 1 or later.
-What the root script does with the file is the operator's declared-data
-responsibility; only declare paths it reads as data. Commands and all other args
-remain unchanged. Declarations appear in the role lock view, plan and status;
+Agent-level [`external_data_args`](docs/lock-contract.md#host-installed-external-mcp-servers)
+is a closed list, one entry per server:
+```yaml
+external_data_args:
+  - server: alpha
+    command: /usr/bin/node
+    args: [/opt/example/mcp.js, /absolute/agent-home/registry.json]
+    path: /absolute/agent-home/registry.json
+    kind: file
+```
+Required `command` (absolute) and the full string-list `args` must match the
+recipe invocation byte-for-byte; any mismatch refuses the whole server with
+`E_EXTERNAL_DATA_ARG`. Required `kind` is `file` or `dir`: the exception permits
+an agent-owned file 0600 or directory 0700 under its home, with safe ancestry.
+Without optional `flag`, data must be positional, never first or immediately
+after a flag. With `flag: --state`, only exact `--state PATH` or `--state=PATH`
+is allowed; code-loading flags are denied. Both forms require `args[0]` to be
+an absolute root-owned regular file with **no execute bits** (`mode & 0o111 == 0`,
+e.g. a 0644 script), passing the normal ancestry/readability checks. No options
+may precede the script, not even `--`. `env /usr/bin/sh FILE` is refused.
+Only declare paths the script reads as data, never agent-owned code; what the
+root script does with the data remains the operator's responsibility. Commands
+and all other args remain unchanged. Declarations appear in the role lock view, plan and status;
 file contents are never recorded. Recipe/file-secret delivery are
 off by default; cook's run.sh, health checks and transactional rollback remain.
