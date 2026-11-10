@@ -38,7 +38,9 @@ def merge_layers(layers):
     for layer in layers:
         result = combine(result, layer, recursive=True)
     result = _prune(result)
-    for section in ('connectors', 'modules'):
+    for section in ('connectors', 'modules', 'catalog'):
+        if section == 'catalog' and section not in result:
+            continue
         entries = result.get(section, {})
         if not isinstance(entries, dict):
             raise ValueError('connectors and modules must be mappings')
@@ -47,6 +49,8 @@ def merge_layers(layers):
                 raise ValueError('entries must be mappings with boolean enabled')
         result[section] = {name: entry for name, entry in entries.items()
                            if entry.get('enabled', True)}
+    if not result.get('catalog'):
+        result.pop('catalog', None)
     return result
 
 
@@ -54,7 +58,10 @@ def public_catalog(defaults, catalog):
     result = deepcopy(defaults)
     if 'connectors' in result:
         raise ValueError('public connectors belong in the catalog')
-    result['connectors'] = deepcopy(catalog)
+    result['connectors'] = {n: deepcopy(e) for n, e in catalog.items() if e.get('kind', 'connector') == 'connector'}
+    artifacts = {n: deepcopy(e) for n, e in catalog.items() if e.get('kind', 'connector') != 'connector'}
+    if artifacts:
+        result['catalog'] = artifacts
     return result
 
 

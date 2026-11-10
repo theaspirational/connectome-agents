@@ -1,0 +1,8 @@
+# Opt-in digest-pinned local artifact; no automatic acquisition.
+bun:
+  enabled: false
+  kind: runtime
+  requires: []
+  exports:
+    bun: bin/bun
+  pin_ref: artifacts.bun

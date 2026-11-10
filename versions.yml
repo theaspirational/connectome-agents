@@ -1,15 +1,67 @@
-# bump one per commit
-# Default-branch HEADs supplied by the operator (2026-11-09).
-# Cook is the reviewed source revision; other pins are NOT verified-compatible releases.
-# No network verification here.
-# terminal-sessions-mcp is unresolved: deployment fails closed if enabled.
+# Runtime commit pins retained for the recipe-file bridge.
+# Catalog artifacts and connector releases require reviewed values; placeholders fail closed.
 runtime:
   connectome-host: cef933981dc0699fc00e5189b129d854ff8d43f6
   agent-framework: aa134e75fc19bc8cb3b73cb1ec53465dd9cf5c91
   cook: 1b874d9dd55b529486b8029dd9814a6c0e2147e0
 connectors:
-  slack-mcpl: df784a37f1a34074dea4139c587b37321f2afe05
-  telegram-bot-mcpl: 0cdbdd45daa9caaaab6c4dabf231a215f802e48f
-  zulip_mcp: cd4686e45d780a1b85848c7e3df0282798618700
-  github-mcpl: 781fe03a4aea79b1877ff083648b9d3dfb329f02
-  terminal-sessions-mcp: '0000000000000000000000000000000000000000'
+  slack-mcpl:
+    archive: inputs/slack-mcpl.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+    commit: PLACEHOLDER
+  telegram-bot-mcpl:
+    archive: inputs/telegram-bot-mcpl.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+    commit: PLACEHOLDER
+  zulip_mcp:
+    archive: inputs/zulip_mcp.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+    commit: PLACEHOLDER
+  github-mcpl:
+    archive: inputs/github-mcpl.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+    commit: PLACEHOLDER
+  terminal-sessions-mcp:
+    archive: inputs/terminal-sessions-mcp.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+    commit: PLACEHOLDER
+artifacts:
+  node:
+    archive: inputs/node.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+  bun:
+    archive: inputs/bun.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+  openai-codex-adapter:
+    archive: inputs/openai-codex-adapter.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+  inference-gate-check:
+    archive: inputs/inference-gate-check.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+  transport-readiness:
+    archive: inputs/transport-readiness.tar.gz
+    version: PLACEHOLDER
+    sha256: PLACEHOLDER
+    descriptor_sha256: PLACEHOLDER
+platform:
+  /bin/bash: PLACEHOLDER
+  /bin/sh: PLACEHOLDER
+  /usr/bin/git: PLACEHOLDER

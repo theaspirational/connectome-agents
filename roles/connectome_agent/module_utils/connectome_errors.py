@@ -4,6 +4,7 @@ import re
 
 MESSAGES = {
     'E_UNIT_VERIFY': 'Static user unit verification failed; systemd-analyze requires a usable user manager runtime.',
+    'E_CATALOG_INVALID': 'Catalog pin, installed closure or launch path validation failed.',
     'E_UNIT_ACTIVE': 'Install-only deployment refuses an active or transitioning unit; no instance is stopped.',
     'E_UNIT_EXCLUSIVE': 'A mutually exclusive unit is active or activating; stop it explicitly before starting this agent.',
     'E_ANCESTOR_WRITABLE': 'Existing ancestor is group/other-writable; inspect ancestor_path and repair explicitly; not changed.',

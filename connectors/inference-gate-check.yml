@@ -1,0 +1,13 @@
+# Opt-in digest-pinned local artifact; no automatic acquisition.
+inference-gate-check:
+  enabled: false
+  kind: preflight
+  requires:
+  - node
+  run:
+  - '{artifact:node}/bin/node'
+  - '{artifact:inference-gate-check}/check.mjs'
+  required_secrets:
+  - INFERENCE_GATE_TOKEN
+  - INFERENCE_GATE_URL
+  pin_ref: artifacts.inference-gate-check

@@ -1,0 +1,8 @@
+# Opt-in digest-pinned local artifact; no automatic acquisition.
+node:
+  enabled: false
+  kind: runtime
+  requires: []
+  exports:
+    node: bin/node
+  pin_ref: artifacts.node

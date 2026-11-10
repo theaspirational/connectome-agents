@@ -1,0 +1,11 @@
+# Opt-in digest-pinned local artifact; no automatic acquisition.
+transport-readiness:
+  enabled: false
+  kind: preflight
+  requires:
+  - node
+  run:
+  - '{artifact:node}/bin/node'
+  - '{artifact:transport-readiness}/check.mjs'
+  required_secrets: [TRANSPORT_READINESS_URL]
+  pin_ref: artifacts.transport-readiness

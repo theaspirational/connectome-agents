@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 
 import connectome_inputs as inputs
+import connectome_catalog as catalog
 from connectome_deploy import environment_names, validate_config, resolve_pins, DeployError
 from connectome_lock import read_lock, LockError, text, credential_shaped, repository
 from connectome_errors import SafeError, diagnostic, cook_code_from_stream
@@ -107,7 +108,7 @@ def source(entry, pin, target):
             'install': {'run': build_commands(entry), 'runtime': 'custom'}}
 
 
-def recipe_from_spec(spec, recipe_bytes=None):
+def recipe_from_spec(spec, recipe_bytes=None, build_dir=None):
     """Only the effective entries are translated. No discovery/catalog reads.
 
     settings are native cook/host settings, not a guessed connector launch API.
@@ -117,7 +118,7 @@ def recipe_from_spec(spec, recipe_bytes=None):
     config, pins = spec['config'], spec['pins']
     validate_config(config)
     # Revalidate full pins even when used without the Ansible role.
-    versions = {'runtime': pins['runtime'], 'connectors': pins['connectors']}
+    versions = dict(pins)
     for name, entry in ({} if 'recipe_file' in config else config.get('connectors', {})).items():
         need(entry.get('pin_ref') == 'connectors.' + name, 'connector pin_ref must name its resolved connector')
     need(resolve_pins(config, versions) == pins, 'normalized pins required')
@@ -143,7 +144,7 @@ def recipe_from_spec(spec, recipe_bytes=None):
     if 'description' in config:
         recipe['description'] = config['description']
     for section in ('connectors', 'modules'):
-        for name, entry in config.get(section, {}).items():
+        for name, entry in ({} if section == 'connectors' and catalog.active(config) else config.get(section, {})).items():
             need(entry.get('enabled', True) is True, 'adapter input must already exclude disabled entries')
             settings = deepcopy(entry.get('settings', {}))
             need(isinstance(settings, dict), 'descriptor settings must be a mapping')
@@ -163,6 +164,20 @@ def recipe_from_spec(spec, recipe_bytes=None):
                 # Empty settings enable a native module. Disabled entries never
                 # reach this loop; the role already pruned them.
                 recipe['modules'][name] = settings or True
+    if catalog.active(config):
+        need(build_dir is not None, 'catalog compilation requires the agent build path')
+        for name, entry in catalog.entries_for(config).items():
+            if catalog.kind(entry) == 'connector':
+                settings = catalog.expand(deepcopy(entry.get('settings', {})), build_dir, catalog.entries_for(config))
+                need(isinstance(settings, dict) and isinstance(settings.get('command'), str) and Path(settings['command']).is_absolute() and
+                     'source' not in settings, 'catalog connector requires launch settings without source')
+                need('token' not in settings or isinstance(settings['token'], str) and
+                     re.fullmatch(r'\$\{[A-Z_][A-Z0-9_]*\}', settings['token']),
+                     'catalog connector token must be a secret-name reference')
+                settings['source'] = {'external': True}
+                recipe['mcpServers'][name] = settings
+        recipe = catalog.expand(recipe, build_dir, catalog.entries_for(config))
+        catalog.audit(recipe, Path(build_dir).parent.parent, Path(config['state_dir']), pins['platform'])
     names = environment_names(config)
     need(not set(names) & BASE_ENV and not set(names) & {'DATA_DIR', 'WORKSPACE_DIR'},
          'secret names overlap adapter-owned environment')
@@ -199,8 +214,6 @@ def framework_input(config, pin):
 
 def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_path):
     build, state, spec_path = map(absolute_path, (build_dir, state_dir, spec_path))
-    for value in (runtime, entrypoint, bun_path, node_path):
-        absolute_path(value)
     need(all(path.is_absolute() and path.resolve() == path for path in (build, state, spec_path)),
          'adapter paths must be absolute without symlink aliases')
     need(build.is_dir() and spec_path.name == 'deployment.json', 'fresh deployment.json required')
@@ -208,9 +221,17 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     root = build.parent.parent
     need(not state.is_relative_to(root) and not root.is_relative_to(state),
          'state must be separate from deployment root/builds')
-    need(all(Path(p).is_absolute() and os.access(p, os.X_OK) for p in (runtime, bun_path, node_path)),
-         'absolute executable runtime, Bun and Node paths required')
     spec = json.loads(spec_path.read_text())
+    for value in ((entrypoint,) if catalog.active(spec.get('config', {})) else
+                  (runtime, entrypoint, bun_path, node_path)):
+        absolute_path(value)
+    if not catalog.active(spec.get('config', {})):
+        need(all(Path(p).is_absolute() and os.access(p, os.X_OK) for p in (runtime, bun_path, node_path)),
+             'absolute executable runtime, Bun and Node paths required')
+    else:
+        catalog.input_paths(spec['config'], root)
+        catalog.need(Path(entrypoint).is_relative_to(root) and Path(entrypoint).resolve() == Path(entrypoint),
+                     'cook checkout must belong to agent without aliases')
     staged = build / 'cook-recipe.json'
     supplied_recipe = 'recipe_file' in spec.get('config', {})
     allowed = {spec_path}
@@ -229,7 +250,7 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
             except (ValueError, TypeError, KeyError):
                 raise AdapterError('invalid recipe input') from None
     need(set(build.iterdir()) == allowed, 'cook requires a fresh build containing only deployment.json and optional recipe')
-    recipe, names = recipe_from_spec(spec, content)
+    recipe, names = recipe_from_spec(spec, content, build)
     config, pins = spec['config'], spec['pins']['runtime']
     need(config.get('state_dir') == str(state), 'adapter state must match configured state_dir')
     settings = config.get('cook', {})
@@ -264,6 +285,11 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
               'connectorState': settings['connector_state']}
     layout_path = build / 'cook-layout.json'
     layout_path.write_text(json.dumps(layout, sort_keys=True, indent=2) + '\n')
+    if catalog.active(config):
+        catalog.install(config, spec['pins'], build)
+        bun_path = catalog.runtime(config, build, 'bun')
+        node_path = catalog.runtime(config, build, 'node')
+        runtime = bun_path
     argv = [runtime, entrypoint, 'install', str(recipe_path)]
     flag_indices = []
     for flag, value in (
@@ -279,22 +305,24 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
             argv.append(value)
     # Validate all input before even the verification Git subprocesses spawn.
     validate_arguments(argv, flag_indices)
-    env = clean_environment()
+    env = (catalog.environment(config, spec['pins'], build) if catalog.active(config) else clean_environment())
     verify_cook(entrypoint, pins['cook'], env)
     command(argv, cwd=build, env=env, flag_indices=flag_indices)
     lock = read_lock(build / 'connectome.lock', host_pin=pins['connectome-host'], required_names=names)
     need(lock.get('layout') == layout and lock.get('state') == {'path': str(state)},
          'cook lock did not preserve the requested persistent layout', 'E_LOCK_STATE_PATH')
     expected = {(entry['repo'], spec['pins']['connectors'][name])
-                for name, entry in ({} if supplied_recipe else config.get('connectors', {})).items()}
+                for name, entry in ({} if supplied_recipe or catalog.active(config) else config.get('connectors', {})).items()}
     actual = {(entry.get('url'), entry.get('commit')) for entry in lock['components']}
-    if not supplied_recipe:
+    if not supplied_recipe and not catalog.active(config):
         need(actual == expected and 'external' not in lock and
              all(c['kind'] == 'git' and c['role'] == 'mcp' for c in lock['components']),
              'cook component provenance differs from enabled inputs')
     # External servers are not components: no commit is claimed. Bind the
     # recorded commands exactly to the reviewed top-level recipe, whose args
     # activation also checks; fleet-child external servers are refused.
+    if catalog.active(config):
+        need(not actual, 'catalog components must come from the digest-pinned closure')
     recorded = {server['name']: server['command'] for server in lock.get('external', [])}
     need(recorded == external, 'cook external servers differ from the recipe')
     # Validate cook's inventory before adding config-only provenance. Legacy
@@ -320,6 +348,8 @@ def adapt(spec_path, build_dir, state_dir, runtime, entrypoint, bun_path, node_p
     # so run.sh cannot override the role's runtime EnvironmentFile secrets.
     env_file = Path(layout['config']) / '.env'
     need(not env_file.exists() or not env_file.read_text().strip(), 'cook unexpectedly wrote runtime env values')
+    if catalog.active(config):
+        catalog.verify(config, spec['pins'], build, lock)
     return lock
 
 
@@ -331,7 +361,7 @@ class SafeParser(argparse.ArgumentParser):
 def main():
     parser = SafeParser(description=__doc__)
     for option in ('spec', 'out', 'state', 'runtime', 'entrypoint', 'bun-path', 'node-path'):
-        parser.add_argument('--' + option, required=True)
+        parser.add_argument('--' + option, required=option in ('spec', 'out', 'state', 'entrypoint'))
     args = parser.parse_args()
     try:
         adapt(args.spec, args.out, args.state, args.runtime, args.entrypoint, args.bun_path, args.node_path)

@@ -12,6 +12,7 @@ import tempfile
 
 try:
     from ansible.module_utils import connectome_inputs as inputs
+    from ansible.module_utils import connectome_catalog as catalog
     from ansible.module_utils.connectome_lock import read_lock, LockError
     from ansible.module_utils.connectome_errors import SafeError, adapter_diagnostic
     from ansible.module_utils.connectome_archive import (framework_provenance, validate_provenance,
@@ -19,6 +20,7 @@ try:
                                                         records_metadata, provenance_record)
 except ImportError:
     import connectome_inputs as inputs
+    import connectome_catalog as catalog
     from connectome_lock import read_lock, LockError
     from connectome_errors import SafeError, adapter_diagnostic
     from connectome_archive import (framework_provenance, validate_provenance,
@@ -351,7 +353,10 @@ def validate_config(config):
         raise DeployError(str(error)) from None
     identifier(config.get('name', 'example'))
     for name in config.get('connectors', {}):
-        identifier(name)
+        if not catalog.active(config):
+            identifier(name)
+        if not isinstance(name, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', name):
+            raise DeployError('invalid connector identifier')
     if 'host_dependencies' in config.get('cook', {}):
         # Shape/duplicate preflight only; archive IO remains in the plan/adapter.
         dependency_inputs(config, '1' * 40)
@@ -395,6 +400,8 @@ def run(argv, cwd=None, adapter=False, unit_verify=False):
 
 def direct_secret_names(config):
     entries = list(config.get('connectors', {}).values()) + list(config.get('modules', {}).values())
+    if catalog.active(config):
+        entries += list(config['catalog'].values())
     names = set(config.get('required_secrets', []))
     for entry in entries:
         names.update(entry.get('required_secrets', []))
@@ -422,7 +429,9 @@ def environment_names(config):
 def resolve_pins(config, versions):
     runtime = versions['runtime']
     result = {'runtime': runtime, 'connectors': {}}
-    for name, entry in ({} if 'recipe_file' in config else config.get('connectors', {})).items():
+    if catalog.active(config):
+        result.update(catalog.resolve(config, versions))
+    for name, entry in ({} if 'recipe_file' in config or catalog.active(config) else config.get('connectors', {})).items():
         value = versions
         try:
             for part in entry['pin_ref'].split('.'):
@@ -447,6 +456,8 @@ class Deployment:
         self.base = base_path(base if base is not None else root)
         self.root = inside(self.base, Path(os.path.abspath(Path(root).expanduser())))
         self.unit_dir = base_path(unit_dir)
+        if catalog.active(config):
+            catalog.input_paths(config, self.root)
         self.config = config
         self.activation = config.get('activation', 'start')
         self.operator_files = operator_files
@@ -676,6 +687,10 @@ class Deployment:
                              required_names=environment_names(config) if build == self.build else ())
         except LockError as error:
             raise DeployError(str(error), 'E_LOCK_INVALID') from None
+        if catalog.active(config):
+            catalog_pins = (self.pins if build == self.build else
+                            json.loads((build / 'deployment.json').read_text())['pins'])
+            catalog.verify(config, catalog_pins, build, data)
         state = data.get('state')
         if not state:
             raise DeployError('cook lock must declare configured external state_dir', 'E_LOCK_STATE_PATH')
@@ -1072,6 +1087,8 @@ class Deployment:
                     'DATA_DIR=' + self._systemd_path(self._config(build)['state_dir']) +
                     '\nEnvironmentFile=' +
                     self._systemd_path(str(inside(build, 'secrets.env'))) + '\n')
+            if catalog.active(self._config(build)):
+                body += catalog.preflight_unit(self._config(build), build)
             additions[self._dropin(name)] = (self._file_record(body), body)
             for path, artifact in additions.items():
                 if path in result and result[path] != artifact:
@@ -1117,10 +1134,10 @@ class Deployment:
 
     def _activation_plan(self):
         lock = self._lock()
-        # Host-installed servers are trusted only as root-maintained files
-        # (full chain check below); cook never fetched, built or pinned them.
-        # The selected bun/node runtimes only get an absolute-path + X_OK check.
-        if lock.get('external') or self.config.get('external_data_args'):
+        # The legacy bridge trusts host-installed servers as root-maintained
+        # files. Catalog mode instead verified its own digest-pinned inventory
+        # and exact engine/server paths in _lock above.
+        if not catalog.active(self.config) and (lock.get('external') or self.config.get('external_data_args')):
             try:
                 recipe = json.loads(inside(self.build, 'cook-recipe.json').read_text())
             except (OSError, ValueError):

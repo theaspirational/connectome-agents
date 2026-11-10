@@ -1,0 +1,16 @@
+# Opt-in digest-pinned local artifact; no automatic acquisition.
+openai-codex-adapter:
+  enabled: false
+  kind: adapter
+  requires:
+  - node
+  - bun
+  build:
+  - - '{artifact:bun}/bin/bun'
+    - build
+    - src/index.ts
+    - --target=node
+    - --outfile=dist/adapter.js
+  exports:
+    adapter: dist/adapter.js
+  pin_ref: artifacts.openai-codex-adapter

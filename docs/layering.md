@@ -249,3 +249,9 @@ checks. The role serializes each mutation with a per-agent file lock. Separate
 agents must not share unit names. Deployment is recoverable on task failure,
 not a crash-consistent multi-file transaction; after process/power loss, rerun
 and inspect the user service manager before removing any builds.
+
+## Digest-pinned runtime and connector catalog
+
+For agent-local Node v24, Bun, adapter builds and opt-in preflights, use the
+[catalog path](catalog.md). It shares `connectors/*.yml` and `versions.yml` with
+the legacy connector declarations; the recipe-file bridge is unchanged.
