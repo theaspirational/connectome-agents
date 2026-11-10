@@ -162,8 +162,9 @@ class CatalogTests(unittest.TestCase):
         alias.mkdir()
         (alias / 'link').symlink_to(self.work)
         for value in ('../outside.cjs', './link/outside.cjs', '--config=../outside.cjs',
-                      '--config=./link/outside.cjs', '~/.config', './a:./b',
-                      'https://example.invalid/config', 'x=../outside', '${UNDECLARED}', '-r../outside'):
+                      '--config=./link/outside.cjs', '~/.config', './a::./b',
+                      'https://example.invalid/config', 'x=../outside', '${UNDECLARED}', '-r../outside',
+                      'name%20encoded', 'name;command', 'name,other', 'name:', ':name'):
             self.config['connectors']['extra']['settings']['env'] = {'CONFIG_FILE': value}
             pins = self.repin()
             recipe = deepcopy(original)
@@ -174,12 +175,59 @@ class CatalogTests(unittest.TestCase):
                     with self.assertRaises(ArchiveError):
                         operation(self.config, pins, self.build)
 
+    def test_bare_environment_paths_and_lists_refused_fresh_and_digest_valid_reuse(self):
+        state = Path(self.config['state_dir'])
+        state.mkdir()
+        outside = self.work / 'outside'
+        outside.mkdir()
+        marker = outside / 'ran'
+        helper = outside / 'helper'
+        helper.write_text('#!/bin/sh\nprintf invoked > ' + shlex.quote(str(marker)) + '\n')
+        helper.chmod(0o755)
+        (state / 'escape').symlink_to(outside, target_is_directory=True)
+        (state / 'file').symlink_to(helper)
+        (state / 'two words').symlink_to(helper)
+        (state / 'option=local').symlink_to(helper)
+        (state / 'development:production').symlink_to(helper)
+        (state / 'loop').symlink_to('loop')
+        (state / 'local').mkdir()
+        cases = [('PATH', 'escape'), ('MANPATH', 'local'), ('CDPATH', 'local'),
+                 ('APP_PATH', 'local'), ('CUSTOMPATH', 'local'), ('path', 'local'),
+                 ('CONFIG', 'escape'), ('CONFIG', 'file'), ('CONFIG', 'two words'),
+                 ('CONFIG', 'option=local'), ('CONFIG', 'development:production'),
+                 ('CONFIG', 'loop'), ('CONFIG', 'local:escape'), ('CONFIG', 'escape:local'),
+                 ('CONFIG', 'local:file:development'), ('CONFIG', '--config=local:escape')]
+        settings = self.config['connectors']['extra']['settings']
+        for phase in ('fresh', 'reuse'):
+            if phase == 'reuse':
+                settings.pop('env')
+                self.repin()
+                _, original = self.install()
+            for name, value in cases:
+                settings['env'] = {name: value}
+                pins = self.repin()
+                if phase == 'reuse':
+                    recipe = deepcopy(original)
+                    recipe['mcpServers']['extra']['env'] = {name: value}
+                    self.reseal(pins, recipe)
+                with self.subTest(phase=phase, name=name, value=value), \
+                        patch.object(catalog.subprocess, 'run') as run:
+                    with self.assertRaises(ArchiveError):
+                        if phase == 'fresh':
+                            self.install()
+                        else:
+                            catalog.verify(self.config, pins, self.build)
+                    run.assert_not_called()
+                    self.assertFalse(marker.exists())
+                    if phase == 'fresh':
+                        self.assertFalse((self.build / 'catalog').exists())
+
     def test_environment_denials_cover_all_descriptor_unit_and_secret_surfaces(self):
         _, original = self.install()
         names = sorted(catalog.CODE_ENV) + ['DYLD_INSERT_LIBRARIES', 'DYLD_FUTURE',
             'GIT_CONFIG_COUNT', 'BUN_CONFIG_PRELOAD', 'BUN_CONFIG_PATH', 'BUN_CONFIG_FILE',
             'BUN_CONFIG', 'BUN_PRELOAD', 'BUN_OPTIONS', 'PYTHON3_OPTIONS', 'RUBY_VM_OPTIONS',
-            'CUSTOM_PRELOAD']
+            'CUSTOM_PRELOAD', 'PATH', 'MANPATH', 'CDPATH', 'APP_PATH', 'CUSTOMPATH', 'path']
         body = '[Service]\nWorkingDirectory=' + self.config['state_dir'] + '\n'
         for name in names:
             with self.subTest(name=name):
@@ -201,10 +249,39 @@ class CatalogTests(unittest.TestCase):
             with self.subTest(directive=directive), self.assertRaises(ArchiveError):
                 catalog.audit_unit(body + directive, self.root, Path(self.config['state_dir']), {})
 
+    def test_bare_environment_reuse_checks_recipe_and_unit_at_launcher_cwd(self):
+        spec, original = self.install()
+        cwd = self.root / 'workspace'
+        cwd.mkdir()
+        (cwd / 'escape').symlink_to(self.work, target_is_directory=True)
+        (self.build / 'run.sh').write_text('#!/bin/sh\ncd ' + str(cwd) + '\nexit 0\n')
+        body = ('[Service]\nWorkingDirectory=' + self.config['state_dir'] + '\n'
+                'ExecStart=/bin/sh ' + str(self.build / 'run.sh') + '\n')
+        for surface in ('recipe', 'unit'):
+            for name, value in (('PATH', 'escape'), ('CONFIG', 'escape'), ('CONFIG', 'local:escape')):
+                recipe, unit = deepcopy(original), body
+                if surface == 'recipe':
+                    recipe['agent']['provider'] = {'env': {name: value}}
+                else:
+                    unit += 'Environment=' + name + '=' + value + '\n'
+                self.reseal(spec['pins'], recipe)
+                (self.build / 'agent.service').write_text(unit)
+                lock = self.launch_lock(spec['pins'])
+                lock['units'] = [{'path': 'agent.service'}]
+                with self.subTest(surface=surface, name=name, value=value), self.assertRaises(ArchiveError):
+                    catalog.verify(self.config, spec['pins'], self.build, lock)
+
     def test_environment_literals_and_local_data_paths_are_accepted(self):
+        state = Path(self.config['state_dir'])
+        state.mkdir()
+        (state / 'local').mkdir()
+        (state / 'alias').symlink_to(state / 'local', target_is_directory=True)
+        (state / 'local.json').write_text('{}')
         settings = self.config['connectors']['extra']['settings']
         settings['env'] = {'MODE': 'development', 'COUNT': '4', 'LABEL': 'two words',
                            'DATA_FILE': './local.json', 'CONFIG': '--config=./local.json',
+                           'BARE_FILE': 'local.json', 'BARE_DIR': 'alias', 'EMPTY': '',
+                           'FILES': 'local:alias:development', 'RELATIVE_FILES': './a:./b',
                            'NODE_EXTRA_CA_CERTS': './certificate.pem',
                            'EXAMPLE_SECRET': '${EXAMPLE_SECRET}'}
         self.config['required_secrets'] = ['EXAMPLE_SECRET']
@@ -231,6 +308,9 @@ class CatalogTests(unittest.TestCase):
         self.assertFalse(ambient.keys() & cooked.keys())
         self.assertEqual(observed['NO_UPDATE_NOTIFIER'], '1')
         self.assertNotIn(os.environ['PATH'], cooked['PATH'])
+        self.assertEqual(cooked['PATH'].split(os.pathsep),
+                         [str(Path(catalog.runtime(self.config, self.build, name)).parent)
+                          for name in ('bun', 'node')] + [str(self.build / 'platform-bin')])
 
     def test_unit_bootstrap_execs_preflight_and_launch_with_closed_environment(self):
         node = shutil.which('node')

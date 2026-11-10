@@ -168,6 +168,8 @@ Catalog environment assignments are executable policy too. We **refuse**, rather
 than silently strip, these names, including declared-secret destinations and
 exported unit `Environment=` assignments (matching names case-insensitively):
 
+* `PATH`, `MANPATH`, `CDPATH`, and every name ending in `PATH` (including
+  `*_PATH`): search-path policy belongs to the role, not the descriptor;
 * `NODE_OPTIONS`, `NODE_PATH`, `NODE_REPL_EXTERNAL_MODULE`;
 * `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, all `DYLD_*`;
 * `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`, `PYTHONINSPECT`;
@@ -187,12 +189,16 @@ exported unit `Environment=` assignments (matching names case-insensitively):
 
 These names load code, redirect interpreter/module resolution, or enable
 interpreter control. `NODE_EXTRA_CA_CERTS` is **not** denied: certificates are
-data, but their paths are audited. Every other catalog env value containing `/`,
-starting with `.` or `~`, or having an option/value path operand is checked like
-argv against its execution cwd, resolving symlinks. Path lists, URLs, tilde
-expansion, attached short options, substitutions and other ambiguous path syntax
-fail closed. Use literal local paths and literal non-path strings. Only exact
-`${DECLARED_SECRET}` references for the matching declared destination are
+data, but their paths are audited. Every other nonempty catalog env value is
+checked as a potential path against its execution cwd, resolving symlinks,
+including bare words and literal words containing spaces. Colon lists are split
+and **every** element is checked; empty list elements fail closed. Whole values
+are also checked before option/list interpretation. Literal
+`--option=value`/`option=value` operands receive the same checks. Bare non-path
+words remain valid when their cwd-relative resolution stays inside the closure.
+URLs, tilde expansion, attached short options, substitutions and other
+unclassified syntax fail closed. Use literal local paths and literal non-path
+strings. Only exact `${DECLARED_SECRET}` references for the matching declared destination are
 accepted; private runtime secret values are not catalog literals and are never
 written into the generated command payload. All descriptor settings (including
 non-connector settings), nested recipe env mappings and reused locks are checked.

@@ -200,6 +200,11 @@ def audit_path(value, cwd, root, state, platform):
     """Resolve against the execution cwd, including existing symlink parents."""
     need(isinstance(value, str) and bool(re.fullmatch(r'[A-Za-z0-9_.+@/-]+', value)),
          'ambiguous command path')
+    return audit_location(value, cwd, root, state, platform)
+
+
+def audit_location(value, cwd, root, state, platform):
+    """Containment check shared by classified argv and environment literals."""
     path = Path(value)
     path = path if path.is_absolute() else Path(cwd) / path
     try:
@@ -263,7 +268,9 @@ def environment_name(name):
     need(isinstance(name, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name),
          'invalid catalog environment name')
     upper = name.upper()
-    denied = (upper in CODE_ENV or upper.startswith(('DYLD_', 'GIT_CONFIG_')) or
+    # Search lists are role-owned. Deny the whole *PATH family rather than
+    # trying to infer a particular consumer's list semantics from its value.
+    denied = (upper.endswith('PATH') or upper in CODE_ENV or upper.startswith(('DYLD_', 'GIT_CONFIG_')) or
               upper.endswith('_PRELOAD') or
               re.fullmatch(INTERPRETERS + r'(?:_.*)?_OPTIONS', upper) or
               re.fullmatch(r'BUN_.*(?:PRELOAD.*|CONFIG(?:_.*)?(?:PATH|FILE|DIR)|CONFIG)', upper))
@@ -279,14 +286,25 @@ def audit_environment(env, cwd, root, state, platform, secrets=()):
         if name in secrets and value == '${' + name + '}':
             continue  # Runtime-only private input, never a catalog literal.
         need(not any(c in value for c in '$`{}\\'), 'ambiguous catalog environment value')
-        if '/' in value or value.startswith(('.', '~')) or re.search(r'=[.~]', value):
-            operand = value
-            if '=' in value:
-                option, _, operand = value.partition('=')
-                need(bool(re.fullmatch(r'(?:--)?[A-Za-z0-9_-]+', option)),
-                     'ambiguous environment path option')
-            need(not operand.startswith(('-', '@')), 'ambiguous environment path operand')
-            audit_path(operand, cwd, root, state, platform)
+        # Delimiters can also be literal filename characters. Do not let
+        # option/list classification hide an existing whole-value symlink.
+        audit_location(value, cwd, root, state, platform)
+        # A bare word can be an existing cwd-relative symlink just as readily
+        # as ./word. Audit every literal, even nonexistent paths, and every
+        # element of a colon list. Empty list elements have consumer-dependent
+        # cwd/default semantics and are refused; a standalone empty value is OK.
+        if value == '':
+            continue
+        operand = value
+        if '=' in value:
+            option, _, operand = value.partition('=')
+            need(bool(re.fullmatch(r'(?:--)?[A-Za-z0-9_-]+', option)),
+                 'ambiguous environment path option')
+        for item in operand.split(':'):
+            need(bool(re.fullmatch(r'[A-Za-z0-9_.+@/ -]+', item)) and
+                 item == item.strip() and not item.startswith(('-', '@')),
+                 'ambiguous environment path operand')
+            audit_location(item, cwd, root, state, platform)
 
 
 def secret_environment_names(config):
