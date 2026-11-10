@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 from types import SimpleNamespace
 
 import test_cook
@@ -31,6 +31,19 @@ EXTERNAL = [{'name': 'alpha', 'command': '/opt/alpha/bin/server'},
 def system_command():
     """A root-maintained executable reached through the real filesystem, if any."""
     for candidate in ('/bin/sh', '/usr/bin/env', '/bin/true'):
+        try:
+            check_external_command('probe', candidate)
+            return candidate
+        except DeployError:
+            continue
+    return None
+
+
+def system_interpreter():
+    """A real allowlisted interpreter for private-data invocation fixtures."""
+    for candidate in ('/usr/bin/python3', '/usr/bin/node', shutil.which('node')):
+        if candidate is None:
+            continue
         try:
             check_external_command('probe', candidate)
             return candidate
@@ -345,7 +358,7 @@ import json
 import os
 from pathlib import Path
 import sys
-from connectome_deploy import external_paths, check_external_command, check_external_data_arg
+from connectome_deploy import DeployError, external_paths, check_external_command, check_external_data_arg
 work = Path(sys.argv[1])
 uid = int(sys.argv[2])
 account = (uid, set(json.loads(sys.argv[3])))
@@ -398,14 +411,43 @@ for name, command, args, path, kind, flag in (
         else:
             check_external_command(server, value, arg, account)
     results.append(name)
-print(json.dumps(results))
+# These pass the unchanged command and first-script ownership checks. The
+# private-data opt-in must still refuse every non-interpreter target.
+refused = []
+for basename in ('find', 'env', 'sh', 'dash', 'busybox', 'node2'):
+    command = node.with_name(basename)
+    command.write_bytes(Path('/usr/bin/find').read_bytes())
+    command.chmod(0o755)
+    os.chown(command, 0, os.getegid())
+    refused.append(command)
+alias = work / 'aliases/node'
+alias.parent.mkdir()
+os.chown(alias.parent, 0, os.getegid())
+alias.symlink_to('/usr/bin/find')
+os.chown(alias, 0, os.getegid(), follow_symlinks=False)
+refused.append(alias)
+for command in refused:
+    check_external_command('probe', str(command))
+    args = [str(js), str(data)]
+    entry = dict(server='probe', command=str(command), args=args.copy(), path=str(data), kind='file')
+    lock = {'external': [dict(name='probe', command=str(command))]}
+    recipe = {'mcpServers': {'probe': dict(command=str(command), args=args, source={'external': True})}}
+    try:
+        external_paths(lock, recipe, [entry])
+    except DeployError as error:
+        assert error.code == 'E_EXTERNAL_DATA_ARG', error
+        assert error.public()['external_server'] == 'probe'
+    else:
+        raise AssertionError('non-interpreter accepted: ' + str(command))
+print(json.dumps(dict(accepted=results, refused=len(refused))))
 '''
             groups = sorted({os.getegid(), *os.getgroups()})
             output = subprocess.run(
                 ['fakeroot', sys.executable, '-c', script, work, str(os.geteuid()), json.dumps(groups)],
                 env=dict(os.environ, PYTHONPATH=str(MODULES)), cwd=work,
                 stdout=subprocess.PIPE, check=True).stdout
-            self.assertEqual(json.loads(output), ['node', 'python', 'python-equals'])
+            self.assertEqual(json.loads(output), {
+                'accepted': ['node', 'python', 'python-equals'], 'refused': 7})
 
 
 class ExternalDeploymentTests(unittest.TestCase):
@@ -615,7 +657,9 @@ class ExternalDataArgTests(unittest.TestCase):
                 inputs.validate({'external_data_args': records})
 
     def test_binding_is_raw_argv_exact_server_and_path(self):
-        command = '/usr/bin/node'
+        command = system_interpreter()
+        if command is None:
+            self.skipTest('no safe root-owned interpreter')
         script = system_script()
         if script is None:
             self.skipTest('no safe root-owned script path')
@@ -647,8 +691,31 @@ class ExternalDataArgTests(unittest.TestCase):
         paths = external_paths(lock, recipe, [self.entry])
         self.assertEqual([row[3] for row in paths[:4]], [False, False, False, True])
 
+    def test_resolved_interpreter_basename_is_a_closed_allowlist(self):
+        # The command spelling is deliberately always node. Only the lstat
+        # walk's returned target decides; args[0] stays a non-executable file.
+        command, script = '/usr/bin/node', str(Path(__file__).resolve())
+        args = [script, str(self.path)]
+        entry = dict(self.entry, command=command, args=args.copy())
+        recipe = {'mcpServers': {'alpha': dict(command=command, args=args,
+                                              source={'external': True})}}
+        lock = {'external': [dict(name='alpha', command=command)]}
+        accepted = ('node', 'python3', 'bun', 'python3.0', 'python3.12', 'python3.123')
+        refused = ('find', 'env', 'sh', 'dash', 'busybox', 'node2', 'Node', 'Bun',
+                   'Python3', 'python', 'python2', 'python3.', 'python3.12m',
+                   'python3.12.exe', 'python3.12\n', 'python3.\u0661', 'nodejs', 'bunx')
+        for basename in accepted + refused:
+            target = Path('/resolved') / basename
+            with self.subTest(target=target), patch(
+                    'connectome_deploy.check_external_command',
+                    side_effect=lambda name, value, arg=False: Path(script) if arg else target):
+                if basename in accepted:
+                    self.assertTrue(external_paths(lock, recipe, [entry])[-1][3])
+                else:
+                    self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
+
     def test_declared_data_flag_exact_binding_and_code_flag_deny_set(self):
-        command = system_command()
+        command = system_interpreter()
         if command is None:
             self.skipTest('no safe root-owned script path')
         script = system_script()
@@ -694,7 +761,9 @@ class ExternalDataArgTests(unittest.TestCase):
                     self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
 
     def test_node_data_requires_root_owned_first_script(self):
-        command = '/usr/bin/node'
+        command = shutil.which('node')
+        if command is None:
+            self.skipTest('node unavailable')
         script = '/opt/example/mcp.js'
         server = {'command': command, 'args': [script, str(self.path)],
                   'source': {'external': True}}
@@ -702,9 +771,12 @@ class ExternalDataArgTests(unittest.TestCase):
         lock = {'external': [{'name': 'alpha', 'command': command}]}
         self.entry.update(command=command, args=server['args'].copy())
         # Only the script's metadata check is doubled; the private file is real.
-        with patch('connectome_deploy.check_external_command', return_value=Path(__file__)) as check:
+        with patch('connectome_deploy.check_external_command',
+                   side_effect=lambda name, value, arg=False: Path(__file__) if arg else
+                   check_external_command(name, value)) as check:
             paths = external_paths(lock, recipe, [self.entry])
-        check.assert_called_once_with('alpha', script, True)
+        self.assertEqual(check.call_args_list, [call('alpha', command),
+                                               call('alpha', script, True)])
         self.assertEqual(paths[-1], ('alpha', str(self.path), True, True))
         self.assertEqual(self.check(), self.path)
         cases = [[str(self.path)], ['word', str(self.path)],
@@ -712,7 +784,9 @@ class ExternalDataArgTests(unittest.TestCase):
                  [str(self.path), script]]
         for flag in ('-e', '-c', '--require', '-r', '--import', '--loader', '-x', '--config'):
             cases.extend(([flag, str(self.path)], [script, flag, str(self.path)]))
-        with patch('connectome_deploy.check_external_command', return_value=Path(__file__)):
+        with patch('connectome_deploy.check_external_command',
+                   side_effect=lambda name, value, arg=False: Path(__file__) if arg else
+                   check_external_command(name, value)):
             for args in cases:
                 server['args'] = args
                 self.entry['args'] = args.copy()
@@ -747,7 +821,7 @@ class ExternalDataArgTests(unittest.TestCase):
                         self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
 
     def test_first_script_must_pass_normal_checks_and_be_regular_file(self):
-        command = system_command()
+        command = system_interpreter()
         if command is None:
             self.skipTest('no safe root-owned script path')
         server = {'command': command, 'args': [], 'source': {'external': True}}
@@ -818,10 +892,13 @@ class ExternalDataArgTests(unittest.TestCase):
             server['args'] = [script, '--verbose', 'word'] + tail
             entry.update(command=command, args=server['args'].copy())
             with self.subTest(args=server['args']), patch(
-                    'connectome_deploy.check_external_command', return_value=Path(__file__)) as check:
+                    'connectome_deploy.check_external_command',
+                    side_effect=lambda name, value, arg=False: Path(__file__) if arg else
+                    check_external_command(name, value)) as check:
                 self.assertEqual(external_paths(lock, recipe, [entry])[-1],
                                  ('alpha', str(self.directory), True, True))
-                check.assert_called_once_with('alpha', script, True)
+                self.assertEqual(check.call_args_list, [call('alpha', command),
+                                                       call('alpha', script, True)])
                 self.assertEqual(self.check(self.directory, 'dir'), self.directory)
 
 
@@ -831,7 +908,7 @@ class ExternalDataDeploymentTests(unittest.TestCase):
     recipe = ExternalDeploymentTests.recipe
 
     def data_config(self):
-        self.command = system_command()
+        self.command = system_interpreter()
         if self.command is None:
             self.skipTest('no safe root-owned executable')
         self.data = Path(self.tmp.name) / 'registry.json'
@@ -948,6 +1025,48 @@ class ExternalDataDeploymentTests(unittest.TestCase):
         self.assertFalse(dep.current.is_symlink())
         self.assertFalse((self.units / 'connectome-example.service').exists())
         self.assertFalse(marker.exists())
+
+    def test_find_exec_private_python_probe_refused(self):
+        self.data_config()
+        command = '/usr/bin/find'
+        for path, arg in ((command, False), ('/etc/hosts', True), ('/usr/bin/python3', False)):
+            check_external_command('alpha', path, arg)
+        self.assertFalse(Path('/etc/hosts').stat().st_mode & 0o111)
+        marker = self.data.with_name('executed')
+        self.data.write_text('from pathlib import Path\nPath(' + repr(str(marker)) +
+                             ').write_text("executed")\n')
+        args = ['/etc/hosts', '-exec', '/usr/bin/python3', str(self.data), ';']
+        # Demonstrate the blocker: a non-executable root-owned args[0] alone
+        # does not mean this command treats the private file as data.
+        subprocess.run([command] + args, check=True)
+        self.assertEqual(marker.read_text(), 'executed')
+        marker.unlink()
+        self.config['external_data_args'][0].update(command=command, args=args.copy())
+        self.recipe(command, args)
+        dep = self.deployment()
+        with self.assertRaises(DeployError) as error:
+            dep.prepare()
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+        public = error.exception.public()
+        self.assertEqual(public['external_server'], 'alpha')
+        self.assertNotIn(str(self.data), json.dumps(public))
+        self.assertFalse((dep.build / '.prepared').exists())
+        self.assertFalse(dep.current.is_symlink())
+        self.assertFalse((self.units / 'connectome-example.service').exists())
+        self.assertFalse(marker.exists())
+
+    def test_interpreter_target_is_rechecked_before_activation(self):
+        self.data_config()
+        dep = self.deployment()
+        dep.prepare()
+        with patch('connectome_deploy.check_external_command',
+                   side_effect=lambda name, value, arg=False: Path('/usr/bin/find') if not arg else
+                   check_external_command(name, value, arg)):
+            with self.assertRaises(DeployError) as error:
+                dep.activate({})
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+        self.assertFalse(dep.current.is_symlink())
+        self.assertFalse((self.units / 'connectome-example.service').exists())
 
     def test_changed_invocation_refused_before_prepared_marker_or_units(self):
         self.data_config()

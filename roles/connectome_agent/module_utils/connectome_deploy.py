@@ -216,7 +216,19 @@ def external_paths(lock, recipe, data_args=()):
         args = server.get('args', [])
         result.append((record['name'], record['command'], False, False))
         if any(entry['server'] == record['name'] for entry in data_args):
-            # Data for the pinned interpreter, never an executable or option.
+            # Only these resolved interpreter targets consume args[0] as a
+            # script. Check the lstat-walk's real target, not a symlink alias.
+            try:
+                interpreter = check_external_command(record['name'], record['command'])
+                if (interpreter.name not in {'node', 'python3', 'bun'} and
+                        not re.fullmatch(r'python3\.[0-9]+', interpreter.name)):
+                    raise ValueError
+            except (ExternalCommandUnsafe, ValueError):
+                raise ExternalCommandUnsafe(record['name'], 'invalid private data interpreter',
+                                            'E_EXTERNAL_DATA_ARG') from None
+            # args[0] is immediately after the interpreter: no interpreter
+            # options (not even --) or option values can precede this script.
+            # It is non-executable data for the pinned interpreter.
             script = args[0] if args else ''
             try:
                 if not script.startswith('/'):

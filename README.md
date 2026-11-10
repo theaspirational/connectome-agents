@@ -158,6 +158,11 @@ is allowed; code-loading flags are denied. Both forms require `args[0]` to be
 an absolute root-owned regular file with **no execute bits** (`mode & 0o111 == 0`,
 e.g. a 0644 script), passing the normal ancestry/readability checks. No options
 may precede the script, not even `--`. `env /usr/bin/sh FILE` is refused.
+The command's fully resolved target basename must be exactly `node`, `python3`,
+`bun`, or match `^python3\.[0-9]+$`; this allowlist is not configurable.
+Symlink aliases do not count: `node -> /usr/bin/find` is refused, as are
+`find`, `env`, `sh`, `dash`, `busybox` and `node2`. Together these rules put the
+script immediately after a permitted interpreter, with no interpreter options.
 Only declare paths the script reads as data, never agent-owned code; what the
 root script does with the data remains the operator's responsibility. Commands
 and all other args remain unchanged. Declarations appear in the role lock view, plan and status;

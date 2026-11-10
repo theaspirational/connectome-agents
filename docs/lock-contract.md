@@ -325,7 +325,7 @@ explanation. CLI argument errors also use a fixed envelope without echoing argv.
 | `E_ANCESTOR_WRITABLE` | Existing group/other-writable ancestor; the deployment result names `ancestor_path`. No chmod or writes occur. |
 | `E_EXTERNAL_COMMAND` | An `external[]` command or path argument, a link in its chain or a traversed directory is missing, not root-owned, group/other-writable or not a regular file; names `external_server` only. Nothing is repaired or activated. |
 | `E_EXTERNAL_ACCESS` | The agent account cannot read/execute an external command or path argument, or read/traverse a directory above it; names `external_server` only. Grant access explicitly; nothing is changed. |
-| `E_EXTERNAL_DATA_ARG` | Invalid, stale or unsafe `external_data_args` opt-in; requires an exact command/full-args pin, a root-owned regular-file script with no execute bits at `args[0]`, and an exact data path at index >= 1, with matching kind (file 0600 or directory 0700), safe position/flag and ancestry under the agent home. No content or path in the error; nothing is repaired. |
+| `E_EXTERNAL_DATA_ARG` | Invalid, stale or unsafe `external_data_args` opt-in; requires an exact command/full-args pin, a root-owned regular-file script with no execute bits at `args[0]`, an allowlisted resolved interpreter target (`node`, `python3`, `bun` or `python3.[0-9]+`), and an exact data path at index >= 1, with matching kind (file 0600 or directory 0700), safe position/flag and ancestry under the agent home. No content or path in the error; nothing is repaired. |
 | `E_SYSTEMD_PATH` | Use literal absolute paths without whitespace, specifiers, globs or escapes. |
 | `E_ENVIRONMENT_FILE` | Manager did not accept the required non-optional environment file. |
 | `E_UNIT_ACTIVE` | Install-only would replace an active/transitioning unit; names `unit` and `scope`. Stop it explicitly first. |
@@ -623,7 +623,8 @@ byte-for-byte**: no aliases, normalization, case folding, extra args or reorderi
 Matching is literal: no globbing or prefix path matching. The server must be
 external and the path must occur in its args in the declared form, never equal
 its command. Any invocation mismatch, unknown/non-external server, stale
-declaration or unsafe binding refuses the whole server with `E_EXTERNAL_DATA_ARG`.
+declaration or unsafe binding refuses the whole server with `E_EXTERNAL_DATA_ARG`
+(rule A: exact invocation pin).
 
 For either form, **`args[0]` must be an absolute path to a root-owned regular
 file with no execute bits at all (`mode & 0o111 == 0`)**, passing the normal
@@ -634,7 +635,22 @@ are not parsed. If this rule fails, every `external_data_args` entry for that
 server is refused with `E_EXTERNAL_DATA_ARG`. Exempt args may occur only at
 index 1 or later. An option's path value or some later positional path cannot
 serve as the script: `python3 -X /etc/hosts FILE` and `python3 -- SCRIPT FILE`
-are refused. So is `env /usr/bin/sh FILE`: the shell has execute bits.
+are refused. So is `env /usr/bin/sh FILE`: the shell has execute bits
+(rule B: non-executable first-argument script).
+
+**The command's fully resolved target basename must be exactly `node`, `python3`
+or `bun`, or match `^python3\.[0-9]+$`** (rule C). This fixed, case-sensitive
+allowlist is not configurable. Resolution uses the same component-by-component
+`lstat` walk and ownership/access checks as the normal command check, including
+every symlink and traversed directory; the returned real target, not the command's
+spelling, decides. Thus `/usr/bin/python3 -> python3.12` is allowed, but an alias
+named `node` pointing to `/usr/bin/find` is not. `find`, `env`, `sh`, `dash`,
+`busybox` and `node2` targets are refused, even with a valid rule-B first arg.
+In particular, `find /etc/hosts -exec /usr/bin/python3 FILE ';'` is refused despite
+its non-executable, root-owned first arg and exact pin. Any failure of rule C
+refuses the whole server with `E_EXTERNAL_DATA_ARG`. Rules B and C together put
+the script immediately after an allowed interpreter, so there are **no interpreter
+options**; later options belong to the script, not the interpreter.
 
 - **Without `flag`:** the exemption is for data passed positionally to a
   root-owned script. Only an exact raw argv element matches, never a
@@ -668,8 +684,8 @@ the role's derived lock view, plan and activation status expose
 Cook's raw `connectome.lock` and build identity are unchanged. Operators must only declare
 paths the program reads as data, not agent-owned executable code; mode 0600 does
 not prevent interpretation. What the root script does with the file is the
-operator's declared-data responsibility. The invocation pin, non-executable
-first-script and positional/flag rules are not a sandbox or a semantic check of
+operator's declared-data responsibility. The invocation pin, interpreter allowlist,
+non-executable first-script and positional/flag rules are not a sandbox or a semantic check of
 the root-owned program.
 
 Nothing is chowned or chmodded. This trusts the host's root-maintained
