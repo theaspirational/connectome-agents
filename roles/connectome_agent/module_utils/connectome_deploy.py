@@ -149,9 +149,52 @@ def check_external_command(name, command, arg=False, account=None):
     return current
 
 
-def external_paths(lock, recipe):
-    """(name, path, is_arg) for each recorded command and absolute path-like arg."""
+def check_external_data_arg(name, value, account=None, home=None):
+    """Private argv data only; never read content, follow links or repair modes."""
+    def unsafe():
+        raise ExternalCommandUnsafe(name, 'invalid private data argument', 'E_EXTERNAL_DATA_ARG')
+
+    if not inputs.external_data_path(value):
+        unsafe()
+    path = Path(value)
+    uid, groups = account or (os.geteuid(), {os.getegid(), *os.getgroups()})
+    try:
+        info = path.lstat()
+        # Root-maintained paths never use the private-file exception.
+        if info.st_uid == 0:
+            return check_external_command(name, value, True, account)
+        home = Path(home if home is not None else pwd.getpwuid(uid).pw_dir)
+        if (not home.is_absolute() or not path.is_relative_to(home) or path == home or
+                not stat.S_ISREG(info.st_mode) or info.st_uid != uid or
+                stat.S_IMODE(info.st_mode) != 0o600):
+            unsafe()
+        for parent in reversed(path.parents):
+            ancestor = parent.lstat()
+            owners = {0, uid} if parent.is_relative_to(home) else {0}
+            if (not stat.S_ISDIR(ancestor.st_mode) or ancestor.st_uid not in owners or
+                    ancestor.st_mode & 0o022):
+                unsafe()
+            shift = 6 if ancestor.st_uid == uid else 3 if ancestor.st_gid in groups else 0
+            if (ancestor.st_mode >> shift) & 0o5 != 0o5:
+                raise ExternalCommandUnsafe(name, 'ancestor denies agent access', 'E_EXTERNAL_ACCESS')
+        # Owner read is guaranteed by the exact 0600 requirement above.
+        return path
+    except (OSError, KeyError):
+        unsafe()
+
+
+def external_paths(lock, recipe, data_args=()):
+    """(name, path, is_arg, private_data) with exact, raw argv opt-in binding."""
     servers = recipe.get('mcpServers') if isinstance(recipe, dict) else None
+    external = {record['name'] for record in lock.get('external', [])}
+    for entry in data_args:
+        server = servers.get(entry['server']) if isinstance(servers, dict) else None
+        if not (entry['server'] in external and isinstance(server, dict) and
+                isinstance(server.get('source'), dict) and 'external' in server['source'] and
+                isinstance(server.get('args', []), list) and
+                entry['path'] != server.get('command') and entry['path'] in server.get('args', [])):
+            raise ExternalCommandUnsafe(entry['server'], 'unbound data argument', 'E_EXTERNAL_DATA_ARG')
+    exemptions = {(entry['server'], entry['path']) for entry in data_args}
     result = []
     for record in lock.get('external', []):
         server = servers.get(record['name']) if isinstance(servers, dict) else None
@@ -161,11 +204,14 @@ def external_paths(lock, recipe):
                 all(isinstance(arg, str) for arg in server.get('args', []))):
             raise DeployError('external server differs from the installed recipe', 'E_LOCK_INVALID')
         args = server.get('args', [])
-        result.append((record['name'], record['command'], False))
-        for value in filter(None, map(path_like_arg, args)):
+        result.append((record['name'], record['command'], False, False))
+        for raw in args:
+            value = path_like_arg(raw)
+            if value is None:
+                continue
             if not value.startswith('/'):
                 raise ExternalCommandUnsafe(record['name'], 'relative path argument')
-            result.append((record['name'], value, True))
+            result.append((record['name'], value, True, (record['name'], raw) in exemptions))
     return result
 
 
@@ -225,6 +271,8 @@ def identifier(value):
 def validate_config(config):
     try:
         inputs.validate(config)
+    except inputs.ExternalDataArgError as error:
+        raise DeployError(str(error), 'E_EXTERNAL_DATA_ARG') from None
     except ValueError as error:
         raise DeployError(str(error)) from None
     identifier(config.get('name', 'example'))
@@ -433,6 +481,8 @@ class Deployment:
             result['activation'] = self.activation
         if self.config.get('exclusive_with'):
             result['exclusive_with'] = self.config['exclusive_with']
+        if self.config.get('external_data_args'):
+            result['external_data_args'] = [dict(entry) for entry in self.config['external_data_args']]
         if 'recipe_file' in self.config:
             result['recipe_file'] = dict(self.config['recipe_file'])
         if self.config.get('secret_files'):
@@ -518,6 +568,8 @@ class Deployment:
         return path.exists()
 
     def _status(self, result):
+        if self.config.get('external_data_args'):
+            result['external_data_args'] = [dict(entry) for entry in self.config['external_data_args']]
         if self.activation == 'install_only' and not self.check:
             result.update(activation='install_only', unit_state='inactive')
             if self.config.get('exclusive_with'):
@@ -575,6 +627,10 @@ class Deployment:
             inputs.installed(build, config)
         except ValueError as error:
             raise DeployError(str(error), 'E_LOCK_INVALID') from None
+        # Role lock view; the request's deployment.json retains this opt-in.
+        # Do not claim cook emitted it or rewrite cook's build identity.
+        if config.get('external_data_args'):
+            data['external_data_args'] = [dict(entry) for entry in config['external_data_args']]
         return data
 
     def prepare(self):
@@ -979,13 +1035,17 @@ class Deployment:
         # Host-installed servers are trusted only as root-maintained files
         # (full chain check below); cook never fetched, built or pinned them.
         # The selected bun/node runtimes only get an absolute-path + X_OK check.
-        if lock.get('external'):
+        if lock.get('external') or self.config.get('external_data_args'):
             try:
                 recipe = json.loads(inside(self.build, 'cook-recipe.json').read_text())
             except (OSError, ValueError):
                 raise DeployError('external servers require the installed recipe', 'E_LOCK_INVALID') from None
-            for name, path, arg in external_paths(lock, recipe):
-                check_external_command(name, path, arg)
+            for name, path, arg, private_data in external_paths(
+                    lock, recipe, self.config.get('external_data_args', [])):
+                if private_data:
+                    check_external_data_arg(name, path)
+                else:
+                    check_external_command(name, path, arg)
         units = self._units(self.build, lock)
         previous = self.current.resolve() if self.current.is_symlink() else None
         previous_lock = self._lock(previous) if previous else None

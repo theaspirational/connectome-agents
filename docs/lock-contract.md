@@ -325,6 +325,7 @@ explanation. CLI argument errors also use a fixed envelope without echoing argv.
 | `E_ANCESTOR_WRITABLE` | Existing group/other-writable ancestor; the deployment result names `ancestor_path`. No chmod or writes occur. |
 | `E_EXTERNAL_COMMAND` | An `external[]` command or path argument, a link in its chain or a traversed directory is missing, not root-owned, group/other-writable or not a regular file; names `external_server` only. Nothing is repaired or activated. |
 | `E_EXTERNAL_ACCESS` | The agent account cannot read/execute an external command or path argument, or read/traverse a directory above it; names `external_server` only. Grant access explicitly; nothing is changed. |
+| `E_EXTERNAL_DATA_ARG` | Invalid, stale or unsafe `external_data_args` opt-in; requires an exact external-server argv file, agent-owned mode 0600 under its home with safe ancestry. No content or path in the error; nothing is repaired. |
 | `E_SYSTEMD_PATH` | Use literal absolute paths without whitespace, specifiers, globs or escapes. |
 | `E_ENVIRONMENT_FILE` | Manager did not accept the required non-optional environment file. |
 | `E_UNIT_ACTIVE` | Install-only would replace an active/transitioning unit; names `unit` and `scope`. Stop it explicitly first. |
@@ -595,6 +596,36 @@ server already installed on the target at a literal absolute
   and passes the same root-owned ancestry and agent-access checks; its target
   may be a readable regular file or a readable, traversable directory. Args
   naming not-yet-existing paths are therefore refused.
+
+**Private argv data (opt-in).** The effective agent config accepts a closed,
+replacement-merged list (default absent/empty):
+
+```yaml
+external_data_args:
+  - server: alpha
+    path: /absolute/agent-home/.config/example/registry.json
+```
+
+Only an exact string match of both server name and **raw argv element** is
+eligible: no globbing, prefix matching or `--flag=/path` extraction. The server
+must be external and the path must occur in its args, never equal its command;
+unknown/non-external servers and stale paths fail with `E_EXTERNAL_DATA_ARG`.
+For a non-root-owned match, `lstat` must find a regular, non-symlink file owned
+by the agent uid, mode **exactly 0600**, strictly under that account's passwd
+home. Paths must be absolute and lexically normal (no `..`, `.`, `//` or trailing
+slash). Every directory from home down must be owned by root or the agent;
+above home, root only. All must be real directories, not group/other-writable,
+and pass the same agent read/traverse check (`E_EXTERNAL_ACCESS`). Symlink
+ancestors are refused. Root-owned matches use the normal root-maintained rule,
+not this exception. Commands and every other arg keep their existing checks.
+Checks repeat at prepare and activation; no content is read or copied.
+
+`BUILD/deployment.json` records the declarations as part of the hashed request;
+the role's derived lock view, plan and activation status expose
+`external_data_args: [{server, path}]`, never content. Cook's raw
+`connectome.lock` and build identity are unchanged. This permits mutable private
+data, not agent-owned executable code; opt in only for adapters that treat the
+argument as data.
 
 Nothing is chowned or chmodded. This trusts the host's root-maintained
 installation; it is not a content pin or a review of the server.

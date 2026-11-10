@@ -4,18 +4,23 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import test_cook
 import test_deploy
 from test_cook import fixture, adapter
 from connectome_lock import read_lock, LockError
-from connectome_deploy import DeployError, check_external_command
+import connectome_inputs as inputs
+from connectome_deploy import (DeployError, check_external_command, check_external_data_arg,
+                               external_paths)
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = ROOT / 'roles/connectome_agent/module_utils'
@@ -381,6 +386,223 @@ class ExternalDeploymentTests(unittest.TestCase):
             dep.activate({})
         self.assertEqual(error.exception.code, 'E_LOCK_INVALID')
         self.assertEqual(dep.current.resolve(), dep.build)
+
+
+class ExternalDataArgTests(unittest.TestCase):
+    """Real private files, with targeted metadata changes for foreign uid cases."""
+    def setUp(self):
+        self.home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        self.tmp = tempfile.TemporaryDirectory(dir=self.home)
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name)
+        self.path = self.directory / 'registry.json'
+        self.path.write_text('synthetic-private-data-canary')
+        self.path.chmod(0o600)
+        self.entry = {'server': 'alpha', 'path': str(self.path)}
+
+    def check(self, path=None):
+        return check_external_data_arg('alpha', str(path or self.path))
+
+    def assert_data_error(self, call):
+        with self.assertRaises(DeployError) as error:
+            call()
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+        public = json.dumps(error.exception.public())
+        self.assertNotIn(str(self.path), public)
+        self.assertNotIn('synthetic-private-data-canary', public)
+
+    def metadata(self, target, **changes):
+        original = Path.lstat
+        def changed(path, *args, **kwargs):
+            info = original(path, *args, **kwargs)
+            if path == target:
+                return SimpleNamespace(**dict({'st_uid': info.st_uid, 'st_gid': info.st_gid,
+                                               'st_mode': info.st_mode}, **changes))
+            return info
+        return patch.object(Path, 'lstat', changed)
+
+    def test_real_private_file_accepted_without_reading_content(self):
+        with patch.object(Path, 'read_bytes', side_effect=AssertionError('data was read')), \
+                patch.object(Path, 'read_text', side_effect=AssertionError('data was read')):
+            self.assertEqual(self.check(), self.path)
+
+    def test_file_kind_mode_and_missing_refusals(self):
+        for mode in (0o644, 0o700, 0o660, 0o1600, 0o4600):
+            self.path.chmod(mode)
+            with self.subTest(mode=oct(mode)):
+                self.assert_data_error(self.check)
+        self.path.unlink()
+        self.assert_data_error(self.check)
+        self.path.mkdir(mode=0o700)
+        self.assert_data_error(self.check)
+        self.path.rmdir()
+        self.path.symlink_to('/etc/passwd')
+        self.assert_data_error(self.check)
+        self.path.unlink()
+        os.mkfifo(self.path, 0o600)
+        self.assert_data_error(self.check)
+
+    def test_foreign_uid_and_root_owned_fallback(self):
+        with self.metadata(self.path, st_uid=54321):
+            self.assert_data_error(self.check)
+        with self.metadata(self.path, st_uid=0), \
+                patch('connectome_deploy.check_external_command', return_value=self.path) as normal:
+            self.assertEqual(self.check(), self.path)
+            normal.assert_called_once_with('alpha', str(self.path), True, None)
+        # In reality the agent-owned home prevents a root-owned leaf from
+        # passing the unchanged normal rule; declaring it cannot rescue it.
+        with self.metadata(self.path, st_uid=0), self.assertRaises(DeployError) as error:
+            self.check()
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_COMMAND')
+
+    def test_ancestor_owner_mode_symlink_and_access_refusals(self):
+        for mode in (0o770, 0o707):
+            self.directory.chmod(mode)
+            self.assert_data_error(self.check)
+        self.directory.chmod(0o700)
+        with self.metadata(self.directory, st_uid=54321):
+            self.assert_data_error(self.check)
+        with self.metadata(self.home.parent, st_uid=os.geteuid()):
+            self.assert_data_error(self.check)
+        for parent in (self.directory, self.home.parent):
+            with self.metadata(parent, st_mode=stat.S_IFDIR | 0o777):
+                self.assert_data_error(self.check)
+        alias = self.directory / 'alias'
+        alias.symlink_to(self.directory, target_is_directory=True)
+        self.assert_data_error(lambda: self.check(alias / self.path.name))
+        for parent, mode in ((self.directory, 0o300), (self.home.parent, 0o711)):
+            with self.metadata(parent, st_mode=stat.S_IFDIR | mode), \
+                    self.assertRaises(DeployError) as error:
+                self.check()
+            self.assertEqual(error.exception.code, 'E_EXTERNAL_ACCESS')
+        with self.metadata(self.directory, st_uid=0, st_mode=stat.S_IFDIR | 0o755):
+            self.assertEqual(self.check(), self.path)
+
+    def test_outside_home_and_lexical_alias_refusals(self):
+        self.assert_data_error(lambda: check_external_data_arg(
+            'alpha', str(self.path), home=self.directory / 'different-home'))
+        for path in ('relative.json', str(self.directory) + '/../registry.json',
+                     str(self.directory) + '//registry.json', str(self.path) + '/',
+                     '/' + str(self.path), str(self.directory) + '/./registry.json'):
+            with self.subTest(path=path):
+                self.assert_data_error(lambda: self.check(path))
+
+    def test_closed_input_schema(self):
+        inputs.validate({'external_data_args': [self.entry]})
+        for records in (None, {}, '', [None], [{}], [dict(self.entry, extra=True)],
+                        [dict(self.entry, server='bad/name')], [dict(self.entry, server=1)],
+                        [dict(self.entry, path=1)], [dict(self.entry, path='relative')],
+                        [dict(self.entry, path='/a/../b')], [dict(self.entry, path='/a//b')],
+                        [dict(self.entry, path='/a/')], [dict(self.entry, path='//a/b')],
+                        [dict(self.entry, path='/a\n')], [self.entry] * 2):
+            with self.subTest(records=records), self.assertRaises(inputs.ExternalDataArgError):
+                inputs.validate({'external_data_args': records})
+
+    def test_binding_is_raw_argv_exact_server_and_path(self):
+        command = '/usr/bin/node'
+        recipe = {'mcpServers': {
+            'alpha': {'command': command, 'args': [str(self.path)], 'source': {'external': True}},
+            'beta': {'command': command, 'args': [str(self.path)], 'source': {'external': True}},
+            'gamma': {'command': command, 'args': [str(self.path)], 'source': {'npm': 'example'}}}}
+        lock = {'external': [{'name': name, 'command': command} for name in ('alpha', 'beta')]}
+        paths = external_paths(lock, recipe, [self.entry])
+        self.assertEqual(paths, [('alpha', command, False, False),
+                                ('alpha', str(self.path), True, True),
+                                ('beta', command, False, False),
+                                ('beta', str(self.path), True, False)])
+        for entry in (dict(self.entry, server='unknown'), dict(self.entry, server='gamma'),
+                      dict(self.entry, path=command), dict(self.entry, path=str(self.path)[:-1]),
+                      dict(self.entry, path=str(self.path) + '*'),
+                      dict(self.entry, path=str(self.path) + '.stale')):
+            with self.subTest(entry=entry):
+                self.assert_data_error(lambda: external_paths(lock, recipe, [entry]))
+        recipe['mcpServers']['alpha']['args'] = ['--config=' + str(self.path)]
+        self.assert_data_error(lambda: external_paths(lock, recipe, [self.entry]))
+        # Even when the same path also occurs as bare argv, a flag value is
+        # still a different arg and must use the root-owned check.
+        recipe['mcpServers']['alpha']['args'].append(str(self.path))
+        paths = external_paths(lock, recipe, [self.entry])
+        self.assertEqual([row[3] for row in paths[:3]], [False, False, True])
+
+
+class ExternalDataDeploymentTests(unittest.TestCase):
+    setUp = test_deploy.DeployTests.setUp
+    deployment = test_deploy.DeployTests.deployment
+    recipe = ExternalDeploymentTests.recipe
+
+    def data_config(self):
+        self.command = system_command()
+        if self.command is None:
+            self.skipTest('no safe root-owned executable')
+        self.data = Path(self.tmp.name) / 'registry.json'
+        self.data.write_text('synthetic-private-data-canary')
+        self.data.chmod(0o600)
+        self.config['external_data_args'] = [{'server': 'alpha', 'path': str(self.data)}]
+        self.recipe(self.command, [str(self.data)])
+
+    def test_positive_lock_plan_status_and_recheck(self):
+        self.data_config()
+        dep = self.deployment()
+        result = dep.prepare()
+        self.assertEqual(result['plan']['external_data_args'], self.config['external_data_args'])
+        self.assertEqual(dep._lock()['external_data_args'], self.config['external_data_args'])
+        recorded = json.loads((dep.build / 'deployment.json').read_text())
+        self.assertEqual(recorded['config']['external_data_args'], self.config['external_data_args'])
+        status = dep.activate({})
+        self.assertEqual(status['external_data_args'], self.config['external_data_args'])
+        self.assertNotIn('synthetic-private-data-canary', json.dumps([result, status, dep._lock()]))
+        for mode in (0o644, 0o700):
+            self.data.chmod(mode)
+            for operation in (dep.prepare, lambda: dep.activate({})):
+                with self.subTest(mode=oct(mode)):
+                    with self.assertRaises(DeployError) as error:
+                        operation()
+                    self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+        self.assertEqual(dep.current.resolve(), dep.build)
+
+    def test_opt_in_does_not_exempt_command_or_other_args(self):
+        self.data_config()
+        self.recipe(str(self.data), [str(self.data)])
+        with self.assertRaises(DeployError) as error:
+            self.deployment().prepare()
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+        other = self.data.with_name(self.data.name + '.js'); other.write_text('synthetic')
+        other.chmod(0o600)
+        self.recipe(self.command, [str(self.data), str(other)])
+        with self.assertRaises(DeployError) as error:
+            self.deployment().prepare()
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_COMMAND')
+        self.recipe(self.command, [str(self.data), '--config=' + str(self.data)])
+        with self.assertRaises(DeployError) as error:
+            self.deployment().prepare()
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_COMMAND')
+
+    def test_unknown_nonexternal_and_stale_before_activation(self):
+        self.data_config()
+        for server in ('unknown', 'alpha'):
+            self.config['external_data_args'][0]['server'] = server
+            if server == 'alpha':
+                self.recipe(self.command, [])
+            dep = self.deployment()
+            with self.subTest(server=server), self.assertRaises(DeployError) as error:
+                dep.prepare()
+            self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+            self.assertFalse(dep.current.is_symlink())
+            self.assertFalse((dep.build / '.prepared').exists())
+        # No external inventory at all must not silently discard the opt-in.
+        path = Path(self.tmp.name) / 'operator.json'
+        path.write_text('{"name":"example","agent":{"systemPrompt":"Verbatim"}}')
+        self.config['recipe_file']['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaises(DeployError) as error:
+            self.deployment().prepare()
+        self.assertEqual(error.exception.code, 'E_EXTERNAL_DATA_ARG')
+
+    def test_invalid_input_has_typed_error_before_writes(self):
+        self.config['external_data_args'] = [{'server': 'alpha', 'path': '/a/../b'}]
+        with self.assertRaises(DeployError) as error:
+            self.deployment()
+        self.assertEqual(error.exception.public()['error_code'], 'E_EXTERNAL_DATA_ARG')
+        self.assertFalse(self.root.exists())
 
 
 if __name__ == '__main__':

@@ -13,7 +13,37 @@ def need(condition, message='invalid operator input'):
         raise ValueError(message)
 
 
+class ExternalDataArgError(ValueError):
+    """Closed input failure, distinguishable at the deployment boundary."""
+
+
+def external_data_path(value):
+    return (isinstance(value, str) and value.startswith('/') and not value.startswith('//') and
+            value != '/' and value == str(Path(value)) and '..' not in Path(value).parts and
+            not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value))
+
+
+def validate_external_data_args(records):
+    valid = isinstance(records, list)
+    seen = set()
+    for record in records if valid else ():
+        if not (isinstance(record, dict) and set(record) == {'server', 'path'} and
+                isinstance(record['server'], str) and
+                re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', record['server']) and
+                external_data_path(record['path'])):
+            valid = False
+            break
+        key = (record['server'], record['path'])
+        if key in seen:
+            valid = False
+            break
+        seen.add(key)
+    if not valid:
+        raise ExternalDataArgError('invalid external_data_args')
+
+
 def validate(config):
+    validate_external_data_args(config.get('external_data_args', []))
     need(isinstance(config.get('activation', 'start'), str) and
          config.get('activation', 'start') in ('start', 'install_only'),
          'activation must be start or install_only')

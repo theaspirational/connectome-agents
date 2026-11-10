@@ -137,5 +137,10 @@ regenerating connector/module recipes. Optional
 secret values through private files and EnvironmentFile path variables. A supplied
 recipe may use cook's host-installed [`source: {external: true}`](docs/lock-contract.md#host-installed-external-mcp-servers)
 MCP servers; their commands and path args must be root-owned, non-writable
-(`E_EXTERNAL_COMMAND`) and usable by the agent account (`E_EXTERNAL_ACCESS`). Both are
+(`E_EXTERNAL_COMMAND`) and usable by the agent account (`E_EXTERNAL_ACCESS`).
+Agent-level `external_data_args: [{server: NAME, path: /absolute/private/file}]`
+opts exact bare argv files into an agent-owned 0600 exception under the agent's
+home, with safe ancestry (`E_EXTERNAL_DATA_ARG`); commands and all other args
+remain unchanged. Declarations appear in the role lock view, plan and status;
+file contents are never recorded. Recipe/file-secret delivery are
 off by default; cook's run.sh, health checks and transactional rollback remain.

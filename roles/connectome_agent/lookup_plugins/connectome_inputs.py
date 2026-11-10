@@ -14,5 +14,7 @@ class LookupModule(LookupBase):
     def run(self, terms, variables=None, **kwargs):
         try:
             return [_inputs.collect(config) for config in terms]
+        except _inputs.ExternalDataArgError:
+            raise AnsibleError('E_EXTERNAL_DATA_ARG: invalid external data argument input (content redacted)') from None
         except Exception:
             raise AnsibleError('operator input validation failed (content redacted)') from None
