@@ -8,6 +8,7 @@ import shlex
 from .catalog import (artifact_relative, local_roots, pin, resolve, resolve_runtime, select, validate_catalog)
 from .data import BUILD_BINDING, canonical, digest, fields, json_data, match, need
 from .schema import concrete, instance, template
+from .seed import seed_intent, lifecycle_steps
 
 ARTIFACT_TOKEN = re.compile(r'\{artifact:([a-z0-9][a-z0-9_-]{0,62})\}')
 
@@ -113,7 +114,7 @@ def connector_recipe(name, entry, record, selected, state):
     return settings
 
 
-def make_plan(template_value, instance_value, catalog, stores, *, observed=None):
+def make_plan(template_value, instance_value, catalog, stores, *, observed=None, seed_payload=None):
     """Shared API: explicit role catalog, local stores and observation only.
 
     No Ansible vars/facts/become, secrets, target probes, network, or writes.
@@ -121,6 +122,8 @@ def make_plan(template_value, instance_value, catalog, stores, *, observed=None)
     pins; a self-hash does not authenticate a publisher or qualify a runtime.
     """
     spec, declaration = template(template_value), instance(instance_value)
+    seed = seed_intent(spec['seed'], seed_payload)
+    steps = lifecycle_steps(seed['branch'])
     trusted = validate_catalog(catalog)
     stores = local_roots(stores)
     observed = deepcopy(observed) if observed is not None else {'deploymentHash': None}
@@ -184,13 +187,15 @@ def make_plan(template_value, instance_value, catalog, stores, *, observed=None)
             'catalogHash': digest(selection), 'catalogSelection': selection, 'instance': declaration,
             'identity': {'instance': name, 'unixName': declaration['unixName'],
                          'logicalName': logical, 'participantNamespace': 'agents/' + logical,
-                         'summaryParticipant': logical},
+                         'summaryParticipant': logical,
+                         'temporaryNameTemplate': spec['identity']['temporaryNameTemplate'],
+                         'supportsRename': None},
             'runtimeSources': runtime_sources, 'artifacts': artifacts, 'recipe': recipe, 'layout': layout,
             'exports': exports, 'preflights': preflights, 'platformPins': platform,
-            'seedPolicy': spec['seedPolicy'], 'home': declaration['home'], 'rights': declaration['rights'],
-            'providerActions': [], 'files': files, 'observed': observed,
+            'seed': seed, 'lifecycle': steps, 'home': declaration['home'], 'rights': declaration['rights'],
+            'providerActions': [s['step'] for s in steps if s['needsProvider']], 'files': files, 'observed': observed,
             'activationAllowed': False, 'filesWritten': False,
-            'limitations': ['planning-only', 'seed-policy-not-enforced', 'home-binding-not-provisioned',
+            'limitations': ['planning-only', 'provider-adapters-not-implemented', 'home-binding-not-provisioned',
                             'rights-not-authorized', 'runtime-closure-not-qualified', 'platform-not-probed']}
     # Fixed symbolic token, never a guessed role request hash. File hashes
     # describe these draft bytes, NOT the eventual bound/installed recipe.

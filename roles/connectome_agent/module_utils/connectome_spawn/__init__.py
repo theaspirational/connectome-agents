@@ -7,3 +7,11 @@ from .sources import load_source
 
 __all__ = ['SpawnError', 'canonical', 'decode', 'digest', 'load_catalog', 'make_plan', 'require_bound',
            'instance', 'template', 'load_source']
+
+from .lifecycle import Lifecycle, LifecycleAdapter
+from .identity import FileIdentityProvider, IdentityProvider
+from .seed import SeedImporter
+from .schema import name_record, read_name_record
+
+__all__ += ["Lifecycle", "LifecycleAdapter", "FileIdentityProvider", "IdentityProvider",
+            "SeedImporter", "name_record", "read_name_record"]

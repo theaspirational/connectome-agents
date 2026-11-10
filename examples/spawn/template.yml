@@ -1,4 +1,4 @@
-schema: connectome.spawn-template/v1
+schema: connectome.spawn-template/v2
 runtime: []
 agent:
   provider: mock
@@ -12,4 +12,7 @@ agent:
     recentWindowTokens: 80000
 connectors: []
 modules: [identity]
-seedPolicy: clean
+seed:
+  mode: clean
+identity:
+  temporaryNameTemplate: ConnectomeNewborn{timestamp}

@@ -4,6 +4,7 @@ import re
 
 from .data import BUILD_BINDING, canonical, fields, json_data, match, need
 from .sources import absolute
+from .seed import seed_policy
 
 NAME = r'[a-z][a-z0-9-]{0,62}'
 CATALOG_NAME = r'[a-z0-9][a-z0-9_-]{0,62}'
@@ -58,14 +59,19 @@ def positive(value):
 
 
 def template(value):
+    need(not (type(value) is dict and value.get('schema') == 'connectome.spawn-template/v1'),
+         'migrate template v1 to v2: replace seedPolicy with seed.mode')
     data_only(value)
-    fields(value, ('schema', 'runtime', 'agent', 'connectors', 'modules', 'seedPolicy'), ('preflights',))
-    need(value['schema'] == 'connectome.spawn-template/v1', 'unsupported template schema')
+    fields(value, ('schema', 'runtime', 'agent', 'connectors', 'modules', 'seed'), ('preflights', 'identity'))
+    need(value['schema'] == 'connectome.spawn-template/v2', 'unsupported template schema')
     names(value['runtime'])
     names(value.get('preflights', []))
     names(value['connectors'])
     names(value['modules'], MODULES)
-    need(value['seedPolicy'] in ('required', 'clean', 'optional'), 'unknown seed policy')
+    seed_policy(value['seed'])
+    from .identity import identity_policy
+    need('identity' not in value or type(value['identity']) is dict, 'identity policy must be an object')
+    identity_policy(value.get('identity'))
     agent = value['agent']
     fields(agent, ('provider', 'model', 'systemPrompt', 'strategy'),
            ('contextBudgetTokens', 'maxStreamTokens', 'responses', 'codex', 'proseRouting'))
@@ -108,7 +114,9 @@ def template(value):
             positive(agent[key])
     if 'proseRouting' in agent:
         need(agent['proseRouting'] in ('locus', 'explicit', 'hybrid', 'disabled'), 'invalid prose routing')
-    return deepcopy(value)
+    result = deepcopy(value)
+    result['identity'] = identity_policy(value.get('identity'))
+    return result
 
 
 def instance(value):
@@ -129,3 +137,36 @@ def instance(value):
     need(value['target']['os'] == 'linux' and value['target']['architecture'] in ('x86_64', 'aarch64'),
          'unsupported target')
     return deepcopy(value)
+
+
+def name_record(value):
+    """Agent-written data, not an owner approval or executable configuration."""
+    import unicodedata
+    json_data(value)
+    fields(value, ('name', 'displayName', 'systemPrompt', 'summaryParticipant'))
+    for key, limit in (('name', 63), ('displayName', 128), ('systemPrompt', 65536),
+                       ('summaryParticipant', 63)):
+        concrete(value[key])
+        need(len(value[key]) <= limit and not any(
+            unicodedata.category(c).startswith('C') and not (key == 'systemPrompt' and c in '\n\t')
+            for c in value[key]), 'unsafe name record value')
+    need(match(value['name'], LOGICAL) and match(value['summaryParticipant'], LOGICAL),
+         'unsafe identity identifier')
+    need(match(value['displayName'], r'[\w .-]+'), 'unsafe display name')
+    return deepcopy(value)
+
+
+def read_name_record(path):
+    from .sources import load_source
+    return name_record(load_source(file=path))
+
+
+def activation_identity(value, home):
+    record = name_record(value)
+    fields(home, ('transport', 'channel'))
+    concrete(home['transport'])
+    concrete(home['channel'])
+    need(match(home['transport'], CATALOG_NAME) and
+         match(home['channel'], r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}') and
+         '..' not in home['channel'].split('/'), 'unsafe home binding')
+    return record

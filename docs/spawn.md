@@ -1,6 +1,6 @@
-# Offline spawn planning (v1)
+# Offline spawn planning and lifecycle
 
-`connectome-spawn validate|plan|dry-run` is read-only. It does not install,
+`connectome-spawn validate|plan|dry-run|status` is read-only. It does not install,
 extract archives, run catalog commands, acquire dependencies, contact providers,
 read credentials, inspect target services, apply, seed, or activate anything.
 All plans say `activationAllowed: false`. A plan is not authorization, an
@@ -20,7 +20,9 @@ not runtime dependencies.
 This layout permits Ansible's module-utils dependency bundling without requiring
 an independently installed target package. The existing deployment module is
 **not rewired**: a future frontend must explicitly call this API, without
-reimplementing validation or compilation. No variable merging, `become`, ambient
+reimplementing validation or compilation. The shared module-utils lifecycle API
+adds offline persistence and adapter contracts; see
+[seed modes and initiation](spawn-lifecycle.md). No variable merging, `become`, ambient
 Ansible facts, environment defaults or private inventory enter the CLI.
 
 ```python
@@ -84,7 +86,12 @@ stdout as protected configuration, not as a public receipt. `dry-run` includes
 the identical plan plus `wouldWrite`, an explicit list of paths, modes, contents
 and tool-computed SHA-256 values. Neither command writes those files.
 
-## Template schema: `connectome.spawn-template/v1`
+## Template schema: `connectome.spawn-template/v2`
+
+Migration is explicit: v1 templates are refused with a migration message. Change
+`schema` to v2 and replace `seedPolicy: MODE` with `seed: {mode: MODE}`. No mode
+is inferred. Instance and plan envelope versions remain v1; template hashes bind
+the v2 intent.
 
 Every object is closed: unspecified fields are refused, never silently dropped.
 There are no template commands, hooks, shell, build instructions, executable
@@ -100,7 +107,12 @@ Required fields:
 | `connectors` | Unique list of connector catalog names; may be empty |
 | `modules` | Unique list of the builtin module names below; enables each with `true` |
 | `agent` | Required `provider`, `model`, `systemPrompt`, `strategy` |
-| `seedPolicy` | `required`, `clean`, or `optional`; recorded only, no seed behavior |
+| `seed` | Closed `{mode: required\|clean\|optional}`; no default. Required needs `--seed-file`; clean refuses it; optional explicitly plans seeded if supplied, otherwise clean |
+
+Optional `identity.temporaryNameTemplate` defaults to
+`ConnectomeNewborn{timestamp}`; see [temporary identity naming and provider
+capabilities](spawn-lifecycle.md#clean-initiation). This is a naming convention,
+not an executable interpolation hook.
 
 Optional `preflights` is a unique list of catalog names of kind `preflight`.
 `requires` dependencies are expanded transitively by the catalog reader;
@@ -134,7 +146,7 @@ and nonempty. Optional agent fields:
 * `foldingStrategy`: `kv-unified`, `kv-stable`, `flat-profile`, `oldest-first`.
 
 `agent.name` and `summaryParticipant` are not template inputs. The compiler
-always derives them from the instance's exact-case logical identity. Template
+derives bootstrap values from the instance's exact-case logical identity. Template
 values such as empty strings, TODO/TBD/CHANGEME, `${...}`, `{{...}}`, angle-bracket
 placeholders, or bare field-name placeholders are refused, including prompt,
 identity and home channel values. This is a conservative syntactic check, not
@@ -142,7 +154,10 @@ proof that a human approved a prompt or that every possible placeholder was foun
 
 ## Instance schema: `connectome.spawn-instance/v1`
 
-All fields in `examples/spawn/instance.yml` are required; no optional fields:
+All fields in `examples/spawn/instance.yml` are required; no optional fields.
+For clean initiation, logicalName and systemPrompt describe the bootstrap agent,
+not a permanently assigned name. The agent-written name record replaces them
+before permanent deployment.
 
 * `instance` and `unixName` are separate lowercase identifiers matching
   `[a-z][a-z0-9-]{0,62}`. No NSS lookup, account creation or collision detection.
@@ -266,6 +281,14 @@ Repeated equivalent inputs produce identical plans. Any meaningful selected
 input change changes the hash/key. Apply/reconcile must later bind a reviewed
 plan to current target observations and authorization; a key alone does not
 make effects safe to retry.
+
+Plans include `seed.mode`, the explicit `seed.branch`, a computed digest (never
+seed bytes), ordered `lifecycle` steps with `needsProvider`, and `providerActions`.
+`--seed-file` is a bounded local nonsymlink file; its opaque format is not parsed.
+No seed receipt or name record is fabricated in `wouldWrite`. `validate` checks
+template/instance shapes only, not seed availability. See the
+[lifecycle API and T4 contract](spawn-lifecycle.md) for execution ordering,
+recovery and `status <agent> --state-root PATH`.
 
 Run `scripts/test.sh` for offline regression tests, including source equivalence,
 strict refusals, catalog fixture compatibility, symbolic admission, CLI

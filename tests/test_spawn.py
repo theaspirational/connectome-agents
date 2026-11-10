@@ -24,12 +24,12 @@ from connectome_spawn.planner import BUILD_BINDING, symbolic_fields
 
 
 def example_template():
-    return {'schema': 'connectome.spawn-template/v1', 'runtime': ['node'],
+    return {'schema': 'connectome.spawn-template/v2', 'runtime': ['node'],
             'agent': {'provider': 'mock', 'model': 'example-model',
                       'systemPrompt': 'Help the creator with their work.', 'contextBudgetTokens': 240000,
                       'proseRouting': 'disabled', 'strategy': {'type': 'autobiographical',
                       'compressionModel': 'example-compression', 'recentWindowTokens': 80000}},
-            'connectors': ['example-connector'], 'modules': ['identity'], 'seedPolicy': 'clean'}
+            'connectors': ['example-connector'], 'modules': ['identity'], 'seed': {'mode': 'clean'}}
 
 
 def example_instance():
@@ -147,7 +147,7 @@ class SpawnTests(unittest.TestCase):
         old = self.plan()
         for mutate in (
             lambda s, i, c: s['agent'].update(systemPrompt='A different approved instruction.'),
-            lambda s, i, c: s.update(seedPolicy='required'),
+            lambda s, i, c: s.update(seed={'mode': 'optional'}),
             lambda s, i, c: i['agent'].update(logicalName='DifferentAgent'),
             lambda s, i, c: i['home'].update(channel='secondary'),
             lambda s, i, c: i['rights'].update(administration=True),
@@ -411,6 +411,71 @@ class SpawnTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             outputs.append(json.loads(result.stdout))
         self.assertTrue(all(p == outputs[0] for p in outputs))
+
+    def test_seed_plans_cli_and_v1_migration(self):
+        spec = deepcopy(self.spec)
+        for mode in ('required', 'optional', 'clean'):
+            spec['seed'] = {'mode': mode}
+            for payload in (None, b'opaque seed bytes'):
+                if mode == 'required' and payload is None or mode == 'clean' and payload is not None:
+                    with self.assertRaises(SpawnError):
+                        self.plan(spec, seed_payload=payload)
+                    continue
+                result = self.plan(spec, seed_payload=payload)['plan']
+                self.assertEqual(result['seed']['mode'], mode)
+                self.assertEqual(result['seed']['branch'], 'seeded' if payload else 'clean')
+                steps = result['lifecycle']
+                self.assertEqual(result['providerActions'], [s['step'] for s in steps if s['needsProvider']])
+                self.assertFalse(result['activationAllowed'])
+                if payload:
+                    self.assertEqual([s['step'] for s in steps],
+                                     ['build', 'hold', 'ingest', 'seed.consumed', 'activate'])
+                    self.assertEqual(result['seed']['digest'], hashlib.sha256(payload).hexdigest())
+        spec['seed'] = {'mode': 'optional'}
+        (self.work / 'template.json').write_text(json.dumps(spec))
+        seed = self.work / 'seed.bin'
+        seed.write_bytes(b'opaque seed bytes')
+        result = self.cli(extra=['--seed-file', str(seed)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['plan']['seed']['branch'], 'seeded')
+        self.assertEqual(json.loads(self.cli().stdout)['plan']['seed']['branch'], 'clean')
+        dry = self.cli('dry-run', extra=['--seed-file', str(seed)])
+        self.assertEqual(json.loads(dry.stdout)['plan'], json.loads(result.stdout)['plan'])
+        legacy = deepcopy(self.spec)
+        legacy['schema'] = 'connectome.spawn-template/v1'
+        legacy['seedPolicy'] = legacy.pop('seed')['mode']
+        (self.work / 'template.json').write_text(json.dumps(legacy))
+        refused = self.cli('validate')
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn('migrate template v1 to v2', refused.stderr)
+        for invalid in ({}, {'mode': 'invalid'}, {'mode': 'clean', 'extra': True}):
+            with self.assertRaises(SpawnError):
+                template(dict(self.spec, seed=invalid))
+        missing = deepcopy(self.spec)
+        missing.pop('seed')
+        with self.assertRaises(SpawnError):
+            template(missing)
+
+    def test_temporary_name_template_plans_and_capability_branches(self):
+        default = self.plan()
+        spec = deepcopy(self.spec)
+        spec['identity'] = {'temporaryNameTemplate': 'ConnectomeNewborn{timestamp}'}
+        self.assertEqual(self.plan(spec), default)
+        spec['identity'] = {'temporaryNameTemplate': 'NewAgent{timestamp}'}
+        changed = self.plan(spec)
+        self.assertNotEqual(changed['planHash'], default['planHash'])
+        self.assertEqual(changed['plan']['identity']['temporaryNameTemplate'], 'NewAgent{timestamp}')
+        self.assertIsNone(changed['plan']['identity']['supportsRename'])
+        steps = {step['step']: step for step in changed['plan']['lifecycle']}
+        self.assertEqual(steps['rename']['when'], 'provider.supports_rename')
+        self.assertEqual(steps['provision-permanent']['when'], 'not provider.supports_rename')
+        self.assertEqual(steps['retire-temporary']['when'], 'not provider.supports_rename')
+        self.assertIn('home-channel-conversation', steps)
+        self.assertNotIn('lease', steps)
+        for bad in (None, {'temporaryNameTemplate': 'NoToken'}, {'unknown': 'value'},
+                    {'temporaryNameTemplate': 'Bad{timestamp}{timestamp}'}):
+            with self.assertRaises(SpawnError):
+                template(dict(self.spec, identity=bad))
 
     def test_same_package_under_ansible_namespace(self):
         # Load precisely as module_utils does, not a copied implementation.
