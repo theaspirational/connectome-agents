@@ -325,7 +325,7 @@ explanation. CLI argument errors also use a fixed envelope without echoing argv.
 | `E_ANCESTOR_WRITABLE` | Existing group/other-writable ancestor; the deployment result names `ancestor_path`. No chmod or writes occur. |
 | `E_EXTERNAL_COMMAND` | An `external[]` command or path argument, a link in its chain or a traversed directory is missing, not root-owned, group/other-writable or not a regular file; names `external_server` only. Nothing is repaired or activated. |
 | `E_EXTERNAL_ACCESS` | The agent account cannot read/execute an external command or path argument, or read/traverse a directory above it; names `external_server` only. Grant access explicitly; nothing is changed. |
-| `E_EXTERNAL_DATA_ARG` | Invalid, stale or unsafe `external_data_args` opt-in; requires an exact external-server argv data path after a root-owned script, with matching kind (file 0600 or directory 0700), safe position/flag and ancestry under the agent home. No content or path in the error; nothing is repaired. |
+| `E_EXTERNAL_DATA_ARG` | Invalid, stale or unsafe `external_data_args` opt-in; requires a root-owned regular-file script at `args[0]` and an exact data path at index >= 1, with matching kind (file 0600 or directory 0700), safe position/flag and ancestry under the agent home. No content or path in the error; nothing is repaired. |
 | `E_SYSTEMD_PATH` | Use literal absolute paths without whitespace, specifiers, globs or escapes. |
 | `E_ENVIRONMENT_FILE` | Manager did not accept the required non-optional environment file. |
 | `E_UNIT_ACTIVE` | Install-only would replace an active/transitioning unit; names `unit` and `scope`. Stop it explicitly first. |
@@ -617,16 +617,23 @@ The server must be external and the path must occur in its args in the declared
 form, never equal its command; unknown/non-external servers, stale declarations
 and unsafe bindings fail closed with `E_EXTERNAL_DATA_ARG`.
 
+For either form, **`args[0]` must be an absolute path-like script argument that
+passes the normal root-owned checks as a regular file**, not a directory.
+No interpreter options may precede the script, not even `--`; interpreter options
+are not parsed. If this rule fails, every `external_data_args` entry for that
+server is refused with `E_EXTERNAL_DATA_ARG`. Exempt args may occur only at
+index 1 or later. An option's path value or some later positional path cannot
+serve as the script: `python3 -X /etc/hosts FILE` and `python3 -- SCRIPT FILE`
+are refused.
+
 - **Without `flag`:** the exemption is for data passed positionally to a
   root-owned script. Only an exact raw argv element matches, never a
-  `--flag=PATH` value. It must not be `args[0]`, must follow an earlier
-  positional (non-flag) path-like arg that passes the normal root-owned checks,
-  and must not immediately follow any arg starting with `-`. Thus `-e FILE`,
+  `--flag=PATH` value. It must not immediately follow any arg starting with `-`.
+  Thus `-e FILE`,
   `-c FILE`, `--require FILE`, `-r FILE`, `--import FILE`, `--loader FILE`,
   `-x FILE` and even `rootscript.js --config FILE` are refused.
 - **With `flag`:** only exactly `FLAG PATH` (adjacent separate args) or
-  `FLAG=PATH` matches. An earlier positional root-owned script path that passes
-  the normal checks is still required. The declaration must be a literal option
+  `FLAG=PATH` matches. The declaration must be a literal option
   (`-` or `--` followed by letters/digits/underscore/hyphen, starting with a
   letter), without a value. Code-loading options are denied case-sensitively:
   `-e`, `--eval`, `-p`, `--print`, `-c`, `-r`, `--require`, `--import`,
@@ -650,8 +657,9 @@ the role's derived lock view, plan and activation status expose
 `external_data_args: [{server, path, kind, flag?}]`, never content. Cook's raw
 `connectome.lock` and build identity are unchanged. Operators must only declare
 paths the program reads as data, not agent-owned executable code; mode 0600 does
-not prevent interpretation. The positional/flag rules are not a sandbox or a
-semantic check of the root-owned program.
+not prevent interpretation. What the root script does with the file is the
+operator's declared-data responsibility. The first-script and positional/flag
+rules are not a sandbox or a semantic check of the root-owned program.
 
 Nothing is chowned or chmodded. This trusts the host's root-maintained
 installation; it is not a content pin or a review of the server.

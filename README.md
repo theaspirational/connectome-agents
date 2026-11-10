@@ -144,8 +144,11 @@ under the agent's home, with safe ancestry (`E_EXTERNAL_DATA_ARG`). Required
 `kind` is `file` or `dir`. Without optional `flag`, data must be positional,
 never first or immediately after a flag. With `flag: --state`, only exact
 `--state PATH` or `--state=PATH` is allowed; code-loading flags are denied.
-Both forms require an earlier root-owned positional script path. Operators must
-only declare paths the program reads as data. Commands and all other args
+Both forms require `args[0]` to be an absolute path-like script arg that passes
+the normal root-owned checks as a regular file: no interpreter options before
+the script, not even `--`. Exempt args are allowed only at index 1 or later.
+What the root script does with the file is the operator's declared-data
+responsibility; only declare paths it reads as data. Commands and all other args
 remain unchanged. Declarations appear in the role lock view, plan and status;
 file contents are never recorded. Recipe/file-secret delivery are
 off by default; cook's run.sh, health checks and transactional rollback remain.

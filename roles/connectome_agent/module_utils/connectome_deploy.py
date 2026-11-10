@@ -214,7 +214,18 @@ def external_paths(lock, recipe, data_args=()):
             raise DeployError('external server differs from the installed recipe', 'E_LOCK_INVALID')
         args = server.get('args', [])
         result.append((record['name'], record['command'], False, False))
-        positional_paths = []
+        if any(entry['server'] == record['name'] for entry in data_args):
+            # No interpreter-option parsing: only args[0] can be the script.
+            script = args[0] if args else ''
+            try:
+                if not (script.startswith('/') and path_like_arg(script) == script):
+                    raise ValueError
+                checked = check_external_command(record['name'], script, True)
+                if not stat.S_ISREG(checked.lstat().st_mode):
+                    raise ValueError
+            except (ExternalCommandUnsafe, OSError, ValueError):
+                raise ExternalCommandUnsafe(record['name'], 'invalid first-argument script',
+                                            'E_EXTERNAL_DATA_ARG') from None
         for index, raw in enumerate(args):
             value = path_like_arg(raw)
             if value is None:
@@ -231,13 +242,9 @@ def external_paths(lock, recipe, data_args=()):
                              (index > 0 and args[index - 1] == flag))
                 else:
                     bound = index > 0 and not args[index - 1].startswith('-')
-                if not positional_paths or not bound:
+                if index < 1 or not bound:
                     raise ExternalCommandUnsafe(record['name'], 'unbound data position or flag',
                                                 'E_EXTERNAL_DATA_ARG')
-                # Even an explicitly named data flag cannot replace the script.
-                check_external_command(record['name'], positional_paths[0], True)
-            elif not raw.startswith('-'):
-                positional_paths.append(value)
             result.append((record['name'], value, True, private_data))
     return result
 
