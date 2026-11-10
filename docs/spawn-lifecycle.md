@@ -226,8 +226,12 @@ not rebased. Without an ingress root, the caller still selects the file as
 before, with its literal parent as the read boundary. Never derive the configured root from agent-provided input.
 
 All local file reads reject `..`, symlinks in **every** component (including
-the ingress root itself and its ancestors), and non-regular files. Legitimate
-nested paths work. Directory-fd traversal uses `O_NOFOLLOW`; Linux
+the ingress root itself and its ancestors), non-regular files, and regular files
+whose opened-fd `st_nlink` is not exactly one. Hard links are refused because
+another name for the same inode may be outside the read boundary. This applies
+to every input served by the shared reader, including role-written catalog
+payloads: tools must materialize single-link files, not hard-link extractions.
+Legitimate single-link nested paths work. Directory-fd traversal uses `O_NOFOLLOW`; Linux
 `/proc/self/fd` confirms containment of the opened regular file before reading.
 Symlinked roots are deliberately unsupported, even when their targets are
 inside the configured tree.

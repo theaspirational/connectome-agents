@@ -577,6 +577,49 @@ class LifecycleTests(unittest.TestCase):
                 read_name_record(path)  # Compatibility API must be safe too.
         self.assertEqual(self.move('named', name_file=nested / 'name.json')['identity'], IDENTITY)
 
+    def test_hard_linked_name_record_refused_before_named_transition(self):
+        ingress = self.work / 'ingress'
+        ingress.mkdir()
+        linked = ingress / 'name.json'
+        os.link(self.name_file, linked)
+        self.life = Lifecycle(self.root, adapter=self.adapter, identity_provider=self.provider,
+                              ingress_root=ingress)
+        self.create()
+        self.move('initiation')
+        with self.assertRaisesRegex(SpawnError, 'single-link'):
+            read_name_record(linked, ingress_root=ingress)
+        with self.assertRaisesRegex(SpawnError, 'single-link'):
+            self.move('named', name_file=linked)
+        self.assertEqual(self.life.status('example-agent')['state'], 'initiation')
+        self.assertIsNone(self.life.status('example-agent')['pending'])
+        linked.unlink()
+        write(linked, IDENTITY)
+        self.assertEqual(read_name_record(linked, ingress_root=ingress), IDENTITY)
+        self.assertEqual(self.move('named', name_file=linked)['identity'], IDENTITY)
+
+    def test_hard_linked_seed_and_lifecycle_refused(self):
+        from connectome_spawn.seed import seed_payload
+        outside = self.work / 'outside'
+        outside.mkdir()
+        seed = outside / 'seed.bin'
+        seed.write_bytes(PAYLOAD)
+        linked = self.work / 'seed.bin'
+        os.link(seed, linked)
+        with self.assertRaisesRegex(SpawnError, 'single-link'):
+            seed_payload(linked)
+        linked.unlink()
+        linked.write_bytes(PAYLOAD)
+        self.assertEqual(seed_payload(linked), PAYLOAD)
+        self.create('required')
+        path = self.root / 'example-agent/lifecycle.json'
+        saved = outside / 'lifecycle.json'
+        path.rename(saved)
+        os.link(saved, path)
+        with self.assertRaisesRegex(SpawnError, 'single-link'):
+            self.life.status('example-agent')
+        saved.unlink()
+        self.assertEqual(self.life.status('example-agent')['state'], 'planned')
+
     def test_all_local_reads_refuse_traversal_symlinks_and_nonregular(self):
         from connectome_spawn.sources import read_file
         from connectome_spawn.seed import seed_payload
