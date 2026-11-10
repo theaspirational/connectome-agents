@@ -377,12 +377,12 @@ def inside(root, value):
     return path
 
 
-def run(argv, cwd=None, adapter=False, unit_verify=False):
+def run(argv, cwd=None, adapter=False, unit_verify=False, env=None):
     # Only prepare may accept the adapter's closed JSON envelope. Systemctl and
     # health output cannot impersonate adapter diagnostics.
     with tempfile.TemporaryFile() as errors:
         try:
-            result = subprocess.run(argv, cwd=cwd, stdout=subprocess.DEVNULL,
+            result = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.DEVNULL,
                                     stderr=errors if adapter else subprocess.DEVNULL, check=False)
         except OSError:
             if unit_verify:
@@ -423,7 +423,10 @@ def secret_names(config):
 def environment_names(config):
     if config.get('secret_files'):
         secret_names(config)  # Also reject direct/file destination collisions in standalone adapters.
-    return sorted(set(direct_secret_names(config)) | {record['env'] for record in config.get('secret_files', [])})
+    names = sorted(set(direct_secret_names(config)) | {record['env'] for record in config.get('secret_files', [])})
+    if catalog.active(config):
+        catalog.secret_environment_names(config)
+    return names
 
 
 def resolve_pins(config, versions):
@@ -774,7 +777,11 @@ class Deployment:
             self._write_input(self.build / 'cook-recipe.json', payloads['cook-recipe.json'], 0o600)
         substitutions = {'recipe': str(recipe),
                          'build_dir': str(self.build), 'state_dir': str(self.state_dir)}
-        run([arg.format_map(substitutions) for arg in self.cook_command], cwd=self.build, adapter=True)
+        options = {}
+        if catalog.active(self.config):
+            options['env'] = {'PATH': '/usr/bin:/bin', 'HOME': str(self.build),
+                              'LANG': 'C.UTF-8', 'NO_UPDATE_NOTIFIER': '1'}
+        run([arg.format_map(substitutions) for arg in self.cook_command], cwd=self.build, adapter=True, **options)
         # Surface safe ownership diagnostics before Ansible's no_log secret
         # activation task, and before creating env/current/service state.
         self._activation_plan()
@@ -879,7 +886,12 @@ class Deployment:
         if health.get('command'):
             if not isinstance(health['command'], list):
                 raise DeployError('health command must be argv')
-            run(health['command'], cwd=build)
+            options = {}
+            config = self._config(build)
+            if catalog.active(config):
+                pins = json.loads(inside(build, 'deployment.json').read_text())['pins']
+                options['env'] = catalog.environment(config, pins, build, create=False)
+            run(health['command'], cwd=build, **options)
 
     def _secret_file_path(self, env):
         return self.state / 'secret-files' / env
@@ -1093,8 +1105,7 @@ class Deployment:
                 unit_body = self.rendered_units.get(source, None)
                 if unit_body is None:
                     unit_body = source.read_text()
-                cwd = catalog.audit_unit(unit_body, self.root, Path(config['state_dir']), pins['platform'])
-                body += catalog.preflight_unit(config, build, cwd, pins['platform'])
+                body = catalog.isolated_unit(config, pins, build, unit_body)
             additions[self._dropin(name)] = (self._file_record(body), body)
             for path, artifact in additions.items():
                 if path in result and result[path] != artifact:

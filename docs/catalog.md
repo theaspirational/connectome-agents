@@ -158,6 +158,73 @@ remain prerequisites. Reviewed payloads must not conceal dependencies; stronger
 execution confinement and effective-unit probing belong to later apply/verify
 work. Unrelated state and credentials are never copied into archives or locks.
 
+## Closed catalog environment
+
+This tightening applies **only to catalog mode**. The `recipe_file` bridge is
+out of scope: its input bytes, generated recipe, invocation and environment
+behavior remain unchanged (covered by the baseline golden comparison).
+
+Catalog environment assignments are executable policy too. We **refuse**, rather
+than silently strip, these names, including declared-secret destinations and
+exported unit `Environment=` assignments (matching names case-insensitively):
+
+* `NODE_OPTIONS`, `NODE_PATH`, `NODE_REPL_EXTERNAL_MODULE`;
+* `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, all `DYLD_*`;
+* `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`, `PYTHONINSPECT`;
+* `PERL5LIB`, `PERL5OPT`, `PERLLIB`, `RUBYOPT`, `RUBYLIB`;
+* `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`;
+* `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`, `GIT_CONFIG`, all
+  `GIT_CONFIG_*`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS`, `SSH_ASKPASS`;
+* `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`;
+* `OPENSSL_CONF`, `OPENSSL_MODULES` (configuration can load native providers);
+* all names ending in `_PRELOAD`; `BUN_*` names containing `PRELOAD`, or
+  ending in `CONFIG`, or containing `CONFIG` followed by an optional
+  underscore-prefixed suffix and `PATH`, `FILE`, or `DIR`;
+* names beginning with `NODE`, `NODEJS`, `PYTHON` (optionally digits), `PERL`,
+  `RUBY`, `BUN`, `BASH`, `SH`, `ZSH`, `DENO`, `LUA`, `PHP`, `JAVA`, `JVM`, or
+  `JDK`, followed by `_OPTIONS` or an underscore-delimited suffix ending in
+  `_OPTIONS`.
+
+These names load code, redirect interpreter/module resolution, or enable
+interpreter control. `NODE_EXTRA_CA_CERTS` is **not** denied: certificates are
+data, but their paths are audited. Every other catalog env value containing `/`,
+starting with `.` or `~`, or having an option/value path operand is checked like
+argv against its execution cwd, resolving symlinks. Path lists, URLs, tilde
+expansion, attached short options, substitutions and other ambiguous path syntax
+fail closed. Use literal local paths and literal non-path strings. Only exact
+`${DECLARED_SECRET}` references for the matching declared destination are
+accepted; private runtime secret values are not catalog literals and are never
+written into the generated command payload. All descriptor settings (including
+non-connector settings), nested recipe env mappings and reused locks are checked.
+Per-build/per-preflight env overrides are not a descriptor feature: command
+objects or additional descriptor fields fail closed instead of creating another
+environment channel. Exported units cannot supply `EnvironmentFile`,
+`PassEnvironment`, `UnsetEnvironment`, or PAM environment indirection.
+
+Builds/cook receive a constructed environment, never `os.environ` plus removals:
+private HOME/temp/cache, fixed `LANG=C.UTF-8`, offline/no-notifier settings,
+installed runtimes and individually pinned platform aliases on PATH. There is
+no ambient locale or shell PATH inheritance. Only the control-plane Python
+adapter bootstrap uses fixed `/usr/bin:/bin`; application PATH is stricter and
+contains no unpinned system directories. Health commands use the same clean
+catalog environment. Secret values are never passed to builds.
+
+For service preflights and every exported Exec command, the role writes a
+closed-environment exec bootstrap using the pinned Node v24 `process.execve`.
+This preserves the command's PID, signals and exit status. Simply resetting
+systemd `Environment=`/`PassEnvironment=` is insufficient for user services:
+they also inherit their manager's environment. The drop-in resets those lists
+and EnvironmentFile inputs, removes the explicit loader/control names above
+before the Node bootstrap starts, then that bootstrap constructs the **target**
+environment from fixed role values, audited unit literals, DATA_DIR and exactly
+the declared secrets from the role-owned secrets file. Other manager/operator
+variables never reach the target. Secret values remain in memory/environment,
+not command-line arguments. Pattern-denied names cannot enter through catalog
+assignments; ambient names irrelevant to the Linux Node bootstrap (such as
+`DYLD_*` or `BUN_*`) are not copied to targets either. This bootstrap relies on
+the Linux/systemd OS boundary, not a shell wrapper or a general code sandbox.
+
+
 ## Opt-in preflights
 
 Each selected `preflight.run` becomes a quoted `ExecStartPre` in the role-owned

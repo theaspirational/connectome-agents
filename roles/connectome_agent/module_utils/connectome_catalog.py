@@ -4,6 +4,7 @@ Catalogs are trusted executable policy, not user templates. Archives must contai
 all build inputs. The path audit is a launch-surface check, not a code sandbox.
 """
 from copy import deepcopy
+import base64
 import hashlib
 import json
 import os
@@ -242,6 +243,66 @@ def audit_argv(argv, cwd, root, state, platform):
         audit_path(arg, cwd, root, state, platform)
 
 
+# Code-loading and interpreter control are not configuration data. Refuse, never
+# strip, catalog-supplied names (including declared-secret destinations).
+CODE_ENV = frozenset({
+    'NODE_OPTIONS', 'NODE_PATH', 'NODE_REPL_EXTERNAL_MODULE',
+    'LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT',
+    'PYTHONPATH', 'PYTHONSTARTUP', 'PYTHONHOME', 'PYTHONINSPECT',
+    'PERL5LIB', 'PERL5OPT', 'PERLLIB', 'RUBYOPT', 'RUBYLIB',
+    'BASH_ENV', 'ENV', 'SHELLOPTS', 'BASHOPTS',
+    'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_EXEC_PATH', 'GIT_CONFIG',
+    'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'GIT_ASKPASS', 'SSH_ASKPASS',
+    'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS',
+    'OPENSSL_CONF', 'OPENSSL_MODULES',
+})
+INTERPRETERS = r'(?:NODE|NODEJS|PYTHON[0-9]*|PERL|RUBY|BUN|BASH|SH|ZSH|DENO|LUA|PHP|JAVA|JVM|JDK)'
+
+
+def environment_name(name):
+    need(isinstance(name, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name),
+         'invalid catalog environment name')
+    upper = name.upper()
+    denied = (upper in CODE_ENV or upper.startswith(('DYLD_', 'GIT_CONFIG_')) or
+              upper.endswith('_PRELOAD') or
+              re.fullmatch(INTERPRETERS + r'(?:_.*)?_OPTIONS', upper) or
+              re.fullmatch(r'BUN_.*(?:PRELOAD.*|CONFIG(?:_.*)?(?:PATH|FILE|DIR)|CONFIG)', upper))
+    need(not denied, 'code-loading/interpreter-control environment refused: ' + name)
+
+
+def audit_environment(env, cwd, root, state, platform, secrets=()):
+    need(isinstance(env, dict), 'catalog environment must be a mapping')
+    for name, value in env.items():
+        environment_name(name)
+        need(isinstance(value, str) and not any(ord(c) < 32 for c in value),
+             'catalog environment values must be literal strings')
+        if name in secrets and value == '${' + name + '}':
+            continue  # Runtime-only private input, never a catalog literal.
+        need(not any(c in value for c in '$`{}\\'), 'ambiguous catalog environment value')
+        if '/' in value or value.startswith(('.', '~')) or re.search(r'=[.~]', value):
+            operand = value
+            if '=' in value:
+                option, _, operand = value.partition('=')
+                need(bool(re.fullmatch(r'(?:--)?[A-Za-z0-9_-]+', option)),
+                     'ambiguous environment path option')
+            need(not operand.startswith(('-', '@')), 'ambiguous environment path operand')
+            audit_path(operand, cwd, root, state, platform)
+
+
+def secret_environment_names(config):
+    names = set(config.get('required_secrets', []))
+    for entry in entries_for(config).values():
+        names.update(entry.get('required_secrets', []))
+    for entry in config.get('modules', {}).values():
+        names.update(entry.get('required_secrets', []))
+    names.update(record['env'] for record in config.get('secret_files', []))
+    for name in names:
+        environment_name(name)
+    need(not names & {'PATH', 'HOME', 'TMPDIR', 'DATA_DIR', 'WORKSPACE_DIR', 'LANG', 'LC_ALL'},
+         'secret names overlap constructed environment')
+    return sorted(names)
+
+
 def build_argv(config, build, argv):
     argv = expand(argv, build, entries_for(config))
     if argv[0] in ('bun', 'node'):
@@ -249,7 +310,7 @@ def build_argv(config, build, argv):
     return argv
 
 
-def audit_recipe(recipe, build, state, platform, cwd=None):
+def audit_recipe(recipe, build, state, platform, cwd=None, secrets=()):
     root = Path(build).parent.parent
     audit(recipe, root, Path(state), platform)
     # Native command/args objects can also occur in provider/adapter settings.
@@ -257,6 +318,8 @@ def audit_recipe(recipe, build, state, platform, cwd=None):
         if isinstance(value, dict):
             if 'cwd' in value:
                 cwd = audit_path(value['cwd'], cwd, root, state, platform)
+            if 'env' in value:
+                audit_environment(value['env'], cwd, root, state, platform, secrets)
             if 'command' in value:
                 command, args = value['command'], value.get('args', [])
                 need(isinstance(command, str) and isinstance(args, list), 'ambiguous launch command')
@@ -274,8 +337,11 @@ def audit_recipe(recipe, build, state, platform, cwd=None):
 def audit_descriptors(config, pins, build):
     build = Path(build)
     root, state = build.parent.parent, Path(config['state_dir'])
+    secrets = secret_environment_names(config)
     for name, entry in entries_for(config).items():
         cwd = build / 'catalog' / name
+        audit_recipe(expand(entry.get('settings', {}), build, entries_for(config)),
+                     build, state, pins['platform'], secrets=secrets)
         for argv in entry.get('build', []):
             audit_argv(build_argv(config, build, argv), cwd, root, state, pins['platform'])
         for value in entry.get('exports', {}).values():
@@ -295,9 +361,9 @@ def literal_words(value):
         need(False, 'invalid launch quoting')
 
 
-def audit_unit(body, root, state, platform):
+def audit_unit(body, root, state, platform, env_cwd=None):
     """Only literal Service commands with an explicit execution directory."""
-    section, commands, cwd = None, [], None
+    section, commands, cwd, environments = None, [], None, []
     for line in body.splitlines():
         line = line.strip()
         if not line or line.startswith(('#', ';')):
@@ -311,12 +377,23 @@ def audit_unit(body, root, state, platform):
             continue
         need(bool(sep), 'ambiguous unit directive')
         need(key not in ('RootDirectory', 'RootImage', 'ExecSearchPath'), 'unit execution remapping refused')
+        need(key not in ('EnvironmentFile', 'PassEnvironment', 'UnsetEnvironment', 'PAMName'),
+             'unit environment indirection refused')
+        if key == 'Environment':
+            for assignment in literal_words(value):
+                name, sep, item = assignment.partition('=')
+                need(bool(sep), 'unit environment requires literal assignments')
+                # Audit even assignments later overwritten/reset.
+                environment_name(name)
+                environments.append({name: item})
         if key == 'WorkingDirectory':
             need(cwd is None and Path(value).is_absolute(), 'ambiguous unit working directory')
             cwd = audit_path(value, root, root, state, platform)
         if key.startswith('Exec'):
             commands.append(literal_words(value))
     need(cwd is not None, 'unit requires explicit working directory')
+    for env in environments:
+        audit_environment(env, cwd if env_cwd is None else env_cwd, root, state, platform)
     for argv in commands:
         need(argv and Path(argv[0]).is_absolute(), 'unit requires a literal absolute executable')
         audit_argv(argv, cwd, root, state, platform)
@@ -397,11 +474,12 @@ def install(config, pins, build):
     entries = entries_for(config)
     check_platform(pins)
     audit_descriptors(config, pins, build)
-    audit_recipe(json.loads((build / 'cook-recipe.json').read_text()), build, state, pins['platform'])
+    audit_recipe(json.loads((build / 'cook-recipe.json').read_text()), build, state, pins['platform'],
+                 secrets=secret_environment_names(config))
     directory = build / 'catalog'
     directory.mkdir()
     env = {'HOME': str(build / 'catalog-home'), 'TMPDIR': str(build / 'catalog-tmp'),
-           'PATH': '', 'NO_UPDATE_NOTIFIER': '1', 'npm_config_offline': 'true',
+           'PATH': '', 'LANG': 'C.UTF-8', 'NO_UPDATE_NOTIFIER': '1', 'npm_config_offline': 'true',
            'npm_config_cache': str(build / 'catalog-cache')}
     for key in ('HOME', 'TMPDIR', 'npm_config_cache'):
         Path(env[key]).mkdir()
@@ -426,7 +504,8 @@ def install(config, pins, build):
             audit_path(value, directory / name, root, state, pins['platform'])
             need((directory / name / value).is_file(), 'artifact export missing after build')
     audit_descriptors(config, pins, build)
-    audit_recipe(json.loads((build / 'cook-recipe.json').read_text()), build, state, pins['platform'])
+    audit_recipe(json.loads((build / 'cook-recipe.json').read_text()), build, state, pins['platform'],
+                 secrets=secret_environment_names(config))
     record = {'schema': 'connectome.catalog-lock/v1', 'pins': {k: pins[k] for k in ('artifacts', 'platform')},
               'descriptors': {n: descriptor_digest(e) for n, e in entries.items()},
               'recipe_sha256': sha256(build / 'cook-recipe.json'),
@@ -475,7 +554,7 @@ def verify(config, pins, build, lock=None):
         check_platform(pins)
         recipe = json.loads((build / 'cook-recipe.json').read_text())
         audit_descriptors(config, pins, build)
-        audit_recipe(recipe, build, state, pins['platform'])
+        audit_recipe(recipe, build, state, pins['platform'], secrets=secret_environment_names(config))
         audit(config.get('health', {}), root, state, pins['platform'])
         audit(preflight_unit(config, build, platform=pins['platform']), root, state, pins['platform'])
         if lock:
@@ -495,13 +574,17 @@ def verify(config, pins, build, lock=None):
                 audit(path.read_text(), root, state, pins['platform'])
                 cwd = audit_unit(path.read_text(), root, state, pins['platform'])
                 preflight_unit(config, build, cwd, pins['platform'])
-                working_dirs.append(cwd)
+                working_dirs.append((cwd, path.read_text()))
             path = build / lock['launch']['script']
             need(path.resolve().is_relative_to(build), 'launch path escapes build')
             audit(path.read_text(), root, state, pins['platform'])
-            for cwd in working_dirs or [state]:
+            for cwd, unit_body in working_dirs or [(state, None)]:
                 for launch_cwd in audit_launcher(path.read_text(), cwd, root, state, pins['platform']):
-                    audit_recipe(recipe, build, state, pins['platform'], launch_cwd)
+                    audit_recipe(recipe, build, state, pins['platform'], launch_cwd, secret_environment_names(config))
+                    if unit_body is not None:
+                        audit_unit(unit_body, root, state, pins['platform'], env_cwd=launch_cwd)
+    except ArchiveError:
+        raise
     except (OSError, ValueError, KeyError, TypeError):
         raise ArchiveError('catalog lock or launch surface invalid', 'E_CATALOG_INVALID') from None
 
@@ -520,12 +603,13 @@ def input_paths(config, root):
              '..' not in path.parts, 'cook input is outside the agent tree')
 
 
-def environment(config, pins, build):
+def environment(config, pins, build, create=True):
     """Only installed runtimes and individually pinned platform tools on PATH."""
     build = Path(build)
     tools = build / 'platform-bin'
-    tools.mkdir()
-    for value in pins['platform']:
+    if create:
+        tools.mkdir()
+    for value in pins['platform'] if create else ():
         path = Path(value)
         target = tools / path.name
         need(not target.exists() and not target.is_symlink(), 'platform tool basename collision')
@@ -533,6 +617,72 @@ def environment(config, pins, build):
     paths = [str(Path(runtime(config, build, name)).parent) for name in ('bun', 'node')]
     paths.append(str(tools))
     return {'PATH': os.pathsep.join(paths), 'HOME': str(build / 'catalog-home'),
-            'TMPDIR': str(build / 'catalog-tmp'), 'NO_UPDATE_NOTIFIER': '1',
+            'TMPDIR': str(build / 'catalog-tmp'), 'LANG': 'C.UTF-8', 'NO_UPDATE_NOTIFIER': '1',
             'npm_config_offline': 'true', 'npm_config_cache': str(build / 'catalog-cache'),
             'BUN_INSTALL_CACHE_DIR': str(build / 'catalog-cache')}
+
+
+# Trusted role code, not catalog command language. Node v24 execve preserves PID
+# and signal/exit semantics; secret values are copied in memory, never into argv.
+# The systemd bootstrap removes loader controls before starting this pinned Node.
+EXEC_ENV = (
+    "const s=JSON.parse(Buffer.from(process.argv[1],'base64').toString());"
+    "const e=s.env;for(const n of s.secrets){if(Object.hasOwn(process.env,n))e[n]=process.env[n];}"
+    "process.execve(s.argv[0],s.argv,e);"
+)
+
+
+def isolated_argv(config, build, argv, env):
+    payload = {'argv': argv, 'env': env, 'secrets': secret_environment_names(config)}
+    return [runtime(config, build, 'node'), '--eval', EXEC_ENV,
+            base64.b64encode(canonical(payload)).decode('ascii')]
+
+
+def systemd_words(argv):
+    # Unit syntax, not shell syntax. No environment expansion in generated argv.
+    return ' '.join('"' + word.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$') + '"'
+                    for word in argv)
+
+
+def isolated_unit(config, pins, build, body):
+    """Replace every exported Exec command and preflight with a closed-env exec.
+
+    systemd user managers inherit their own environment even with an empty
+    PassEnvironment. Resetting Environment alone is therefore NOT isolation.
+    The bootstrap may see non-loader ambient names, but the target never does.
+    """
+    build = Path(build)
+    state, root = Path(config['state_dir']), build.parent.parent
+    cwd = audit_unit(body, root, state, pins['platform'])
+    base = environment(config, pins, build, create=False)
+    base['DATA_DIR'] = str(state)
+    env, commands, section = {}, {}, None
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            section = line
+        if section != '[Service]' or not line or line.startswith(('#', ';')):
+            continue
+        key, _, value = line.partition('=')
+        key, value = key.strip(), value.strip()
+        if key == 'Environment':
+            if not value:
+                env.clear()
+            env.update(word.split('=', 1) for word in literal_words(value))
+        elif key.startswith('Exec'):
+            commands.setdefault(key, []).append(literal_words(value))
+    # Catalog assignments cannot replace the role's runtime/cache/state policy.
+    need(not env.keys() & base.keys(), 'unit environment overlaps constructed environment')
+    env.update(base)
+    commands.setdefault('ExecStartPre', []).extend(preflights(config, build))
+    lines = ['Environment=', 'PassEnvironment=', 'EnvironmentFile=',
+             'UnsetEnvironment=' + ' '.join(sorted(CODE_ENV))]
+    # This is the only file supplying private runtime values; exported units
+    # cannot add another one. Kept out of argv and serialized payloads.
+    lines.append('EnvironmentFile=' + systemd_words([str(build / 'secrets.env')]))
+    for key, values in commands.items():
+        lines.append(key + '=')
+        for argv in values:
+            audit_argv(argv, cwd, root, state, pins['platform'])
+            lines.append(key + '=' + systemd_words(isolated_argv(config, build, argv, env)))
+    return '[Service]\n' + '\n'.join(lines) + '\n'

@@ -177,7 +177,8 @@ def recipe_from_spec(spec, recipe_bytes=None, build_dir=None):
                 settings['source'] = {'external': True}
                 recipe['mcpServers'][name] = settings
         recipe = catalog.expand(recipe, build_dir, catalog.entries_for(config))
-        catalog.audit_recipe(recipe, build_dir, config['state_dir'], pins['platform'])
+        catalog.audit_recipe(recipe, build_dir, config['state_dir'], pins['platform'],
+                             secrets=catalog.secret_environment_names(config))
     names = environment_names(config)
     need(not set(names) & BASE_ENV and not set(names) & {'DATA_DIR', 'WORKSPACE_DIR'},
          'secret names overlap adapter-owned environment')

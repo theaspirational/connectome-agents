@@ -1,11 +1,13 @@
 """Catalog closure tests use local synthetic payloads, never upstream releases."""
 from copy import deepcopy
+import base64
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -110,6 +112,177 @@ class CatalogTests(unittest.TestCase):
         config = deepcopy(self.config)
         del config['catalog']['readiness']
         self.assertEqual(catalog.preflight_unit(config, self.build), '')
+
+    def test_environment_controls_fail_at_install_and_digest_valid_reuse(self):
+        spec, original = self.install()
+        bad = {'NODE_OPTIONS': '--require=../outside.cjs', 'PYTHONPATH': '../outside',
+               'LD_PRELOAD': '../outside.so'}
+        for name, value in bad.items():
+            self.config['connectors']['extra']['settings']['env'] = {name: value}
+            pins = self.repin()
+            recipe = deepcopy(original)
+            recipe['mcpServers']['extra']['env'] = {name: value}
+            self.reseal(pins, recipe)
+            for operation in (catalog.install, catalog.verify):
+                with self.subTest(name=name, operation=operation.__name__), \
+                        patch.object(catalog.subprocess, 'run') as run:
+                    with self.assertRaisesRegex(ArchiveError, 'environment refused: ' + name):
+                        operation(self.config, pins, self.build)
+                    run.assert_not_called()
+
+    def test_reused_lock_audits_recipe_only_and_unit_environment(self):
+        spec, recipe = self.install()
+        altered = deepcopy(recipe)
+        altered['agent']['provider'] = {'env': {'NODE_OPTIONS': '--require=../outside.cjs'}}
+        self.reseal(spec['pins'], altered)
+        with self.assertRaisesRegex(ArchiveError, 'environment refused: NODE_OPTIONS'):
+            catalog.verify(self.config, spec['pins'], self.build)
+        self.reseal(spec['pins'], recipe)
+        (self.build / 'run.sh').write_text('#!/bin/sh\nexit 0\n')
+        lock = self.launch_lock(spec['pins'])
+        lock['units'] = [{'path': 'agent.service'}]
+        body = ('[Service]\nWorkingDirectory=' + self.config['state_dir'] + '\n'
+                'ExecStart=/bin/sh ' + str(self.build / 'run.sh') + '\n')
+        for name in ('NODE_OPTIONS', 'PYTHONPATH', 'LD_PRELOAD'):
+            (self.build / 'agent.service').write_text(body + 'Environment=' + name + '=yes\n')
+            with self.subTest(name=name), self.assertRaisesRegex(ArchiveError, 'environment refused: ' + name):
+                catalog.verify(self.config, spec['pins'], self.build, lock)
+        (self.build / 'agent.service').write_text(body + 'Environment=CONFIG=./file\n')
+        catalog.verify(self.config, spec['pins'], self.build, lock)
+        # Relative environment paths must also be safe after launcher chdir.
+        (self.build / 'agent.service').write_text(body.replace(self.config['state_dir'], str(self.build)) +
+                                                 'Environment=CONFIG=../../outside\n')
+        (self.build / 'run.sh').write_text('#!/bin/sh\ncd ' + str(self.root) + '\nexit 0\n')
+        with self.assertRaisesRegex(ArchiveError, 'outside agent tree'):
+            catalog.verify(self.config, spec['pins'], self.build, lock)
+
+    def test_environment_path_escape_and_ambiguity_at_install_and_reuse(self):
+        _, original = self.install()
+        alias = Path(self.config['state_dir'])
+        alias.mkdir()
+        (alias / 'link').symlink_to(self.work)
+        for value in ('../outside.cjs', './link/outside.cjs', '--config=../outside.cjs',
+                      '--config=./link/outside.cjs', '~/.config', './a:./b',
+                      'https://example.invalid/config', 'x=../outside', '${UNDECLARED}', '-r../outside'):
+            self.config['connectors']['extra']['settings']['env'] = {'CONFIG_FILE': value}
+            pins = self.repin()
+            recipe = deepcopy(original)
+            recipe['mcpServers']['extra']['env'] = {'CONFIG_FILE': value}
+            self.reseal(pins, recipe)
+            for operation in (catalog.install, catalog.verify):
+                with self.subTest(value=value, operation=operation.__name__):
+                    with self.assertRaises(ArchiveError):
+                        operation(self.config, pins, self.build)
+
+    def test_environment_denials_cover_all_descriptor_unit_and_secret_surfaces(self):
+        _, original = self.install()
+        names = sorted(catalog.CODE_ENV) + ['DYLD_INSERT_LIBRARIES', 'DYLD_FUTURE',
+            'GIT_CONFIG_COUNT', 'BUN_CONFIG_PRELOAD', 'BUN_CONFIG_PATH', 'BUN_CONFIG_FILE',
+            'BUN_CONFIG', 'BUN_PRELOAD', 'BUN_OPTIONS', 'PYTHON3_OPTIONS', 'RUBY_VM_OPTIONS',
+            'CUSTOM_PRELOAD']
+        body = '[Service]\nWorkingDirectory=' + self.config['state_dir'] + '\n'
+        for name in names:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ArchiveError, 'environment refused'):
+                    catalog.audit_unit(body + 'Environment="' + name + '=yes"\nEnvironment=\n',
+                                       self.root, Path(self.config['state_dir']), {})
+                self.config['required_secrets'] = [name]
+                with self.assertRaisesRegex(ArchiveError, 'environment refused'):
+                    catalog.secret_environment_names(self.config)
+        self.config.pop('required_secrets')
+        for name in ('node', 'readiness'):
+            self.config['catalog'][name]['settings'] = {'env': {'NODE_OPTIONS': 'yes'}}
+            pins = self.repin()
+            with self.assertRaisesRegex(ArchiveError, 'environment refused'):
+                catalog.audit_descriptors(self.config, pins, self.build)
+            del self.config['catalog'][name]['settings']
+        for directive in ('EnvironmentFile=local.env', 'PassEnvironment=NODE_OPTIONS',
+                          'PAMName=login', 'Environment=CONFIG=../outside.cjs'):
+            with self.subTest(directive=directive), self.assertRaises(ArchiveError):
+                catalog.audit_unit(body + directive, self.root, Path(self.config['state_dir']), {})
+
+    def test_environment_literals_and_local_data_paths_are_accepted(self):
+        settings = self.config['connectors']['extra']['settings']
+        settings['env'] = {'MODE': 'development', 'COUNT': '4', 'LABEL': 'two words',
+                           'DATA_FILE': './local.json', 'CONFIG': '--config=./local.json',
+                           'NODE_EXTRA_CA_CERTS': './certificate.pem',
+                           'EXAMPLE_SECRET': '${EXAMPLE_SECRET}'}
+        self.config['required_secrets'] = ['EXAMPLE_SECRET']
+        self.repin()
+        spec, _ = self.install()
+        catalog.verify(self.config, spec['pins'], self.build)
+        body = '[Service]\nWorkingDirectory=' + self.config['state_dir'] + '\nEnvironment="MODE=development"'
+        catalog.audit_unit(body, self.root, Path(self.config['state_dir']), {})
+
+    def test_build_and_cook_environment_never_copy_operator_environment(self):
+        entry = deepcopy(self.config['connectors']['extra'])
+        self.add('extra', entry, {'build.py': (
+            'import os,json\nfrom pathlib import Path\n'
+            'Path("observed.json").write_text(json.dumps(dict(os.environ)))\n'
+            'Path("server.py").write_text("print(42)\\n")\n').encode()})
+        ambient = {'NODE_OPTIONS': '--require=../outside.cjs', 'PYTHONPATH': '../outside',
+                   'LD_PRELOAD': '../outside.so', 'OPERATOR_ONLY': 'not-allowed',
+                   'GIT_CONFIG_COUNT': '99', 'BASH_ENV': '../outside.sh'}
+        with patch.dict(os.environ, ambient):
+            spec, _ = self.install()
+            observed = json.loads((self.build / 'catalog/extra/observed.json').read_text())
+            cooked = catalog.environment(self.config, spec['pins'], self.build)
+        self.assertFalse(ambient.keys() & observed.keys())
+        self.assertFalse(ambient.keys() & cooked.keys())
+        self.assertEqual(observed['NO_UPDATE_NOTIFIER'], '1')
+        self.assertNotIn(os.environ['PATH'], cooked['PATH'])
+
+    def test_unit_bootstrap_execs_preflight_and_launch_with_closed_environment(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('local Node with process.execve is unavailable')
+        supported = subprocess.run([node, '-p', 'typeof process.execve'],
+                                   env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True)
+        if supported.stdout.strip() != 'function':
+            self.skipTest('local Node lacks process.execve (pinned production runtime is v24)')
+        spec, _ = self.install()
+        self.config['required_secrets'] = ['EXAMPLE_SECRET']
+        state = Path(self.config['state_dir'])
+        state.mkdir()
+        script = state / 'observe.py'
+        script.write_text('import os,json\nprint(json.dumps(dict(os.environ)))\n')
+        command = [catalog.runtime(self.config, self.build, 'node'), str(script)]
+        self.config['catalog']['readiness']['run'] = command
+        body = ('[Service]\nWorkingDirectory=' + str(state) + '\nEnvironment="MODE=development"\n'
+                'ExecStart=' + ' '.join(command) + '\n')
+        dropin = catalog.isolated_unit(self.config, spec['pins'], self.build, body)
+        analyzer = shutil.which('systemd-analyze')
+        if analyzer:
+            unit = state / 'closed-env.service'
+            unit.write_text(body + dropin)
+            checked = subprocess.run([analyzer, '--user', 'verify', str(unit)],
+                                     capture_output=True, text=True)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+        unset = next(line.split('=', 1)[1].split() for line in dropin.splitlines()
+                     if line.startswith('UnsetEnvironment='))
+        ambient = {'NODE_OPTIONS': '--require=../outside.cjs', 'PYTHONPATH': '../outside',
+                   'LD_PRELOAD': '../outside.so', 'OPERATOR_ONLY': 'not-allowed',
+                   'DYLD_FUTURE': 'not-allowed', 'EXAMPLE_SECRET': 'synthetic-answer'}
+        # Emulate systemd's documented UnsetEnvironment before the pinned Node
+        # bootstrap. Both preflight and launch targets must see only the allowlist.
+        manager_env = {key: value for key, value in ambient.items() if key not in unset}
+        count = 0
+        for line in dropin.splitlines():
+            if not line.startswith(('ExecStart=', 'ExecStartPre=')) or line.endswith('='):
+                continue
+            argv = shlex.split(line.split('=', 1)[1])
+            self.assertEqual(argv[0], catalog.runtime(self.config, self.build, 'node'))
+            argv[0] = node  # Fixture runtimes are Python; use local Node only for bootstrap.
+            self.assertNotIn('synthetic-answer', line)
+            result = subprocess.run(argv, cwd=state, env=manager_env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observed = json.loads(result.stdout)
+            self.assertFalse((ambient.keys() - {'EXAMPLE_SECRET'}) & observed.keys())
+            self.assertEqual(observed['EXAMPLE_SECRET'], 'synthetic-answer')
+            self.assertEqual(observed['MODE'], 'development')
+            self.assertEqual(observed['DATA_DIR'], str(state))
+            count += 1
+        self.assertEqual(count, 2)
 
     def test_placeholder_and_zero_pins_fail_before_io(self):
         for section, name in (('artifacts', 'node'), ('connectors', 'extra')):
@@ -418,7 +591,10 @@ class CatalogTests(unittest.TestCase):
             artifacts = dep._activation_plan()[-1]
             body = artifacts[dep._dropin('connectome-example-agent.service')][1]
             self.assertIn('ExecStartPre=', body)
-            self.assertIn(str(dep.build / 'catalog/readiness/check.py'), body)
+            commands = [shlex.split(line.split('=', 1)[1]) for line in body.splitlines()
+                        if line.startswith('ExecStartPre=') and line != 'ExecStartPre=']
+            payload = json.loads(base64.b64decode(commands[-1][-1]))
+            self.assertIn(str(dep.build / 'catalog/readiness/check.py'), payload['argv'])
             self.assertFalse(dep.prepare()['changed'])
             (dep.build / 'catalog/extra/server.py').write_text('modified')
             with self.assertRaises(ArchiveError):
