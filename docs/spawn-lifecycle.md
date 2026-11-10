@@ -15,8 +15,8 @@ and change the template schema to `connectome.spawn-template/v2`.
 * **required**: supply opaque seed bytes (`--seed-file` for planning). Steps are
   build, hold **without activation**, ingest, durably write `state/seed.consumed`
   containing computed SHA-256 `digest` and UTC ISO-8601 `timestamp`, then activate.
-  Activation checks concrete name, summaryParticipant, systemPrompt and home
-  channel. Nothing starts the seeded agent before the receipt is committed.
+  Activation checks concrete name, summaryParticipant and home
+  channel, plus a concrete systemPrompt when present. Nothing starts the seeded agent before the receipt is committed.
 * **clean**: rejects seed bytes; follows the initiation flow below.
 * **optional**: explicitly reports `branch: seeded` when seed bytes are supplied,
   otherwise `branch: clean`. Seeded takes the required ordering; clean takes
@@ -45,10 +45,14 @@ The normal clean path is `planned -> initiation -> named -> active`:
 2. Join the home channel in topic **`initiation`**, then start on its own
    temporary identity. Any members of the home channel may participate in the
    dialogue, including the creator; there is no creator-only speaker restriction.
-3. The **agent itself** writes `name-record.json`. The role/frontend reads it
-   using shared module-utils `read_name_record(path)` (also used by the lifecycle
-   transition). No extra owner approval is required. `named` persists the validated
-   record, rather than depending on later changes to that file.
+3. Normally the **initiator agent** writes the name record and commits it in the
+   agents config repository. The new agent may write its own record **only when
+   explicitly asked during initiation and granted write access to that repo**.
+   Write access is what makes self-naming possible; there is **no extra approval
+   step by design**. The role/frontend reads a specific pinned commit through
+   shared module-utils `read_name_record(source)` (also used by the lifecycle
+   transition), never the repository working tree. `named` persists the validated
+   record and provenance, not a dependency on later repo/file availability.
 4. Check the provider's `supports_rename` capability:
    * **replace** (`false`): provision a distinct permanent identity using the
      chosen name, redeploy with the same memory store, then retire the temporary
@@ -81,7 +85,8 @@ refused. Name collisions are refused, never resolved by sharing an account or si
 Plans list conditional rename/replace steps; no provider capability is assumed
 by the offline planner (`identity.supportsRename: null`).
 
-The closed name record has exactly these fields (JSON or strict YAML):
+The closed name record requires name, displayName and summaryParticipant;
+systemPrompt is optional (JSON or strict YAML):
 
 ```json
 {
@@ -94,14 +99,64 @@ The closed name record has exactly these fields (JSON or strict YAML):
 
 Name and summaryParticipant use `[A-Za-z][A-Za-z0-9_-]{0,62}`. Display name is
 at most 128 characters, letters/digits/underscore, spaces, periods and hyphens.
-Prompt is at most 65,536 characters, may include newline/tab, and is data, never
-executed. All fields reject empty/trimmed-away values, template placeholders,
+If present, the prompt is at most 65,536 characters, may include newline/tab,
+and is data, never executed. **Absent means no system prompt**: no placeholder,
+null value, empty string or bootstrap-prompt fallback is inserted. All supplied
+fields reject empty/trimmed-away values, template placeholders,
 control/format characters (except prompt newline/tab); identifiers reject path
-traversal, shell punctuation and unsafe separators. Unknown/missing fields,
+traversal, shell punctuation and unsafe separators. Unknown fields or missing
+required fields,
 symlink files, oversized input, and malformed/duplicate-key input are refused.
 Placeholder detection is conservative syntax, not semantic approval of a prompt.
-The agent's write path must be authenticated by the future runtime adapter;
-this offline API does not authenticate who authored a file.
+The future runtime adapter must enforce config-repo write access. Commit author
+and committer are informational provenance, **not** authentication or a permission
+check; neither a commit identity nor a plan grants write access.
+
+### Recording and pinning a name
+
+The initiator writes the above JSON (omit systemPrompt entirely when not wanted)
+to, for example, `names/example-agent.json` in its local agents config repo, then:
+
+```sh
+git -C "$CONFIG_REPO" add -- names/example-agent.json
+git -C "$CONFIG_REPO" commit -m 'Record agent name'
+git -C "$CONFIG_REPO" rev-parse HEAD
+```
+
+Pass that full lowercase 40-hex commit, not HEAD or a branch/tag, to the role's
+single name-record ingress:
+
+```python
+source = {"kind": "repo", "repo": "/absolute/agents-config",
+          "commit": full_commit, "path": "names/example-agent.json"}
+record = read_name_record(source)
+lifecycle.transition("example-agent", "named", "record-name", name_source=source)
+```
+
+The commit must already exist locally. Only local Git plumbing reads the commit,
+tree and blob: no checkout, network, fetch, filters or working-tree reads. Missing
+commits/paths, non-commit pins, non-blob entries, symlink mode 120000, submodules,
+non-full SHAs and paths containing `..` components are refused. Repo identity is
+the canonical absolute local repository path, not a remote URL. The receipt
+`nameRecord` contains `recordHash` (canonical validated-record SHA-256) and
+`source: {kind, repo, commit, path, blob, author, committer}`. Author/committer
+are the commit headers, including identity and timestamp/offset. Source metadata
+is bound into operation intent separately from the content-only record hash;
+identical file and repo records have identical recordHash values.
+
+`read_name_record(source, with_provenance=True)` returns `{record, recordHash,
+source}`. The existing `read_name_record(file_path)` and transition `name_file=`
+remain supported; explicit `{kind: "file", path: ...}` works too. File provenance
+has only kind and absolute path. `ingress_root` applies to file inputs; a repo
+source with a file ingress root is refused, not silently authorized by that root.
+Callers must explicitly select trusted repo locations.
+
+For plan/dry-run, pass `--name-repo "$CONFIG_REPO+names/example-agent.json@$FULL_COMMIT"`
+(or `--name-file PATH`), or `make_plan(..., name_source=source)`. The optional
+`plan.nameRecord` shows the pinned record, recordHash and provenance. It describes
+the future named input, **not** a replacement of the bootstrap recipe or an
+activation grant. Dry-run never proposes writing a fabricated name record.
+Status shows the persisted receipt even if the original repository is unavailable.
 
 Seeded agents instead use `planned -> active`, with the required seed sequence.
 Any nonterminal state except `failed` can be marked `failed`; any state except
@@ -117,11 +172,11 @@ the now-permanent handle.
 `Lifecycle(state_root, adapter=..., identity_provider=..., importer=...)` exposes:
 
 * `create(agent, seed=..., identity=..., home=..., operation_id=..., payload=None, identity_config=None)`
-  persists `planned`; identity uses the four-field name-record shape;
+  persists `planned`; identity uses the name-record shape (optional systemPrompt);
   identity_config is the validated template `identity` object (or its default).
-* `transition(agent, target, operation_id, name_file=None, payload=None)` enforces
-  ordering. Only `named` accepts/requires a name file. Seeded `active` requires
-  bytes matching the planned digest. Clean activation does not accept a seed.
+* `transition(agent, target, operation_id, name_file=None, name_source=None, payload=None)`
+  enforces ordering. Only `named` accepts/requires exactly one name source.
+  Seeded `active` requires bytes matching the planned digest. Clean activation does not accept a seed.
 * `status(agent)` reads without creating anything.
 
 The same functions are importable as `ansible.module_utils.connectome_spawn`.
@@ -203,7 +258,8 @@ T4 must supply, **Zulip first**:
   redeploy acknowledges completion; never retire a successfully renamed identity
   as part of promotion. Identity creation/rename/retirement use the separate
   IdentityProvider interface, not deployment callback return values.
-* Authenticated agent name-record production during home-channel dialogue,
+* Initiator name-record commits (self-naming only on explicit request with repo
+  write access) during home-channel dialogue,
   routing and subscriptions open to channel members, runtime memory binding,
   external observations/reconciliation, and durable seed import adapters.
 * Existing role safeguards: concrete symbolic build binding, authorization,

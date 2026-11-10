@@ -12,5 +12,7 @@ with the required locally available catalog artifacts. Selecting a connector
 alone does not implement identity provisioning, channel/topic routing or seed
 import. Do not substitute a shared bot identity for per-agent provisioning.
 
-Any members of the home channel can join the initiation dialogue. The agent
-writes its own name record. See [lifecycle and T4 contracts](../../docs/spawn-lifecycle.md).
+Any members of the home channel can join the initiation dialogue. The initiator
+normally commits the name record to the agents config repo; the new agent may do
+so only when explicitly asked and granted repo write access. See
+[lifecycle and T4 contracts](../../docs/spawn-lifecycle.md).

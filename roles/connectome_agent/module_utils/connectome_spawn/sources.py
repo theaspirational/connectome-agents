@@ -121,12 +121,44 @@ def entries(repo, commit):
 
 
 def blob(repo, commit, path, limit=LIMIT):
+    entry = regular_blob(repo, commit, path)
+    return git(repo, 'cat-file', 'blob', entry[2], limit=limit)
+
+
+def regular_blob(repo, commit, path):
     relative(path)
     _, inventory = entries(repo, commit)
     entry = inventory.get(path)
     need(entry is not None and entry[0] in ('100644', '100755') and entry[1] == 'blob',
          'pinned regular blob required (no symlinks or submodules)')
-    return git(repo, 'cat-file', 'blob', entry[2], limit=limit)
+    return entry
+
+
+def pinned_blob(repo, commit, path, limit=LIMIT):
+    """Read a pinned regular blob and informational commit provenance locally."""
+    entry = regular_blob(repo, commit, path)
+    identity = absolute(str(Path(repo).resolve()))
+    headers = git(repo, 'cat-file', 'commit', commit).split(b'\n\n', 1)[0].split(b'\n')
+    provenance = {}
+    for key in ('author', 'committer'):
+        rows = [line[len(key) + 1:] for line in headers if line.startswith(key.encode() + b' ')]
+        need(len(rows) == 1, 'commit author and committer required')
+        try:
+            provenance[key] = rows[0].decode('utf-8')
+        except UnicodeError:
+            raise SpawnError('invalid commit provenance') from None
+    return git(repo, 'cat-file', 'blob', entry[2], limit=limit), {
+        'kind': 'repo', 'repo': identity, 'commit': commit,
+        'path': path, 'blob': entry[2], **provenance}
+
+
+def parse_repo_source(value):
+    try:
+        location, commit = value.rsplit('@', 1)
+        directory, path = location.rsplit('+', 1)
+    except (ValueError, AttributeError):
+        raise SpawnError('expected local repo + path @ full-commit') from None
+    return {'kind': 'repo', 'repo': directory, 'commit': commit, 'path': path}
 
 
 def load_source(*, inline=None, file=None, repo=None):
@@ -136,12 +168,8 @@ def load_source(*, inline=None, file=None, repo=None):
         return decode(inline)
     if file is not None:
         return decode(read_file(file))
-    try:
-        location, commit = repo.rsplit('@', 1)
-        directory, path = location.rsplit('+', 1)
-    except (ValueError, AttributeError):
-        raise SpawnError('expected local repo + path @ full-commit') from None
-    return decode(blob(directory, commit, path))
+    source = parse_repo_source(repo)
+    return decode(blob(source['repo'], source['commit'], source['path']))
 
 
 def resolve_artifact(entry):

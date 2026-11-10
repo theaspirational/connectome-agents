@@ -5,6 +5,7 @@ import sys
 
 from .lifecycle import Lifecycle
 from .seed import seed_payload
+from .sources import parse_repo_source
 from . import SpawnError, digest, instance, load_catalog, load_source, make_plan, template
 
 
@@ -20,6 +21,9 @@ def main(argv=None):
     parser.add_argument('agent', nargs='?', help='persisted agent identifier for status')
     parser.add_argument('--state-root', help='explicit lifecycle state root for status')
     parser.add_argument('--seed-file', help='opaque local seed payload for planning')
+    naming = parser.add_mutually_exclusive_group()
+    naming.add_argument('--name-file', help='local name record for planning')
+    naming.add_argument('--name-repo', help='name record: absolute local repository + path @ full-commit')
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--inline', help='inline template JSON or YAML')
     source.add_argument('--file', help='template file')
@@ -32,7 +36,7 @@ def main(argv=None):
         args = parser.parse_args(argv)
         if args.command == 'status':
             if not args.agent or not args.state_root or any(value is not None for value in (args.inline, args.file, args.repo,
-                    args.instance, args.catalog, args.stores, args.observed, args.seed_file)):
+                    args.instance, args.catalog, args.stores, args.observed, args.seed_file, args.name_file, args.name_repo)):
                 raise SpawnError('status requires agent and state root only')
             print(json.dumps(Lifecycle(args.state_root).status(args.agent), sort_keys=True, indent=2))
             return 0
@@ -41,7 +45,7 @@ def main(argv=None):
         spec = template(load_source(inline=args.inline, file=args.file, repo=args.repo))
         declaration = instance(load_source(file=args.instance))
         if args.command == 'validate':
-            if args.catalog or args.stores or args.observed or args.seed_file:
+            if args.catalog or args.stores or args.observed or args.seed_file or args.name_file or args.name_repo:
                 raise SpawnError('validate accepts template and instance only')
             result = {'valid': True, 'templateHash': digest(spec), 'instanceHash': digest(declaration),
                       'catalogResolved': False}
@@ -50,7 +54,8 @@ def main(argv=None):
                 raise SpawnError('planning requires a role catalog and local stores')
             result = make_plan(spec, declaration, load_catalog(args.catalog), load_source(file=args.stores),
                                observed=load_source(file=args.observed) if args.observed else None,
-                               seed_payload=seed_payload(args.seed_file) if args.seed_file else None)
+                               seed_payload=seed_payload(args.seed_file) if args.seed_file else None,
+                               name_source=parse_repo_source(args.name_repo) if args.name_repo is not None else args.name_file)
             if args.command == 'dry-run':
                 result['wouldWrite'] = result['plan']['files']
         print(json.dumps(result, sort_keys=True, ensure_ascii=False, indent=2))

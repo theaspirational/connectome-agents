@@ -156,8 +156,8 @@ proof that a human approved a prompt or that every possible placeholder was foun
 
 All fields in `examples/spawn/instance.yml` are required; no optional fields.
 For clean initiation, logicalName and systemPrompt describe the bootstrap agent,
-not a permanently assigned name. The agent-written name record replaces them
-before permanent deployment.
+not a permanently assigned name. The pinned initiator-written name record replaces
+them before permanent deployment (with no prompt if omitted).
 
 * `instance` and `unixName` are separate lowercase identifiers matching
   `[a-z][a-z0-9-]{0,62}`. No NSS lookup, account creation or collision detection.
@@ -284,6 +284,12 @@ make effects safe to retry.
 
 Plans include `seed.mode`, the explicit `seed.branch`, a computed digest (never
 seed bytes), ordered `lifecycle` steps with `needsProvider`, and `providerActions`.
+Optional `--name-repo "$CONFIG_REPO+names/example-agent.json@$FULL_COMMIT"` or
+`--name-file PATH` adds `plan.nameRecord` with the validated record, content-only
+recordHash and pinned provenance. The bootstrap recipe is unchanged; these are
+inputs for the later named transition, not an activation grant. See the lifecycle
+document for initiator commits and the explicitly requested, write-access-gated
+self-naming exception. Name provenance is included in planHash, not recordHash.
 `--seed-file` is a bounded local nonsymlink file; its opaque format is not parsed.
 No seed receipt or name record is fabricated in `wouldWrite`. `validate` checks
 template/instance shapes only, not seed availability. See the

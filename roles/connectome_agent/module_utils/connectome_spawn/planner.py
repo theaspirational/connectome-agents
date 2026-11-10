@@ -7,7 +7,7 @@ import shlex
 
 from .catalog import (artifact_relative, local_roots, pin, resolve, resolve_runtime, select, validate_catalog)
 from .data import BUILD_BINDING, canonical, digest, fields, json_data, match, need
-from .schema import concrete, instance, template
+from .schema import concrete, instance, read_name_record, template
 from .seed import seed_intent, lifecycle_steps
 
 ARTIFACT_TOKEN = re.compile(r'\{artifact:([a-z0-9][a-z0-9_-]{0,62})\}')
@@ -114,7 +114,7 @@ def connector_recipe(name, entry, record, selected, state):
     return settings
 
 
-def make_plan(template_value, instance_value, catalog, stores, *, observed=None, seed_payload=None):
+def make_plan(template_value, instance_value, catalog, stores, *, observed=None, seed_payload=None, name_source=None):
     """Shared API: explicit role catalog, local stores and observation only.
 
     No Ansible vars/facts/become, secrets, target probes, network, or writes.
@@ -122,6 +122,7 @@ def make_plan(template_value, instance_value, catalog, stores, *, observed=None,
     pins; a self-hash does not authenticate a publisher or qualify a runtime.
     """
     spec, declaration = template(template_value), instance(instance_value)
+    named = read_name_record(name_source, with_provenance=True) if name_source is not None else None
     seed = seed_intent(spec['seed'], seed_payload)
     steps = lifecycle_steps(seed['branch'])
     trusted = validate_catalog(catalog)
@@ -197,6 +198,9 @@ def make_plan(template_value, instance_value, catalog, stores, *, observed=None,
             'activationAllowed': False, 'filesWritten': False,
             'limitations': ['planning-only', 'provider-adapters-not-implemented', 'home-binding-not-provisioned',
                             'rights-not-authorized', 'runtime-closure-not-qualified', 'platform-not-probed']}
+    if named is not None:
+        # This is the future named transition's input, not the bootstrap recipe.
+        plan['nameRecord'] = named
     # Fixed symbolic token, never a guessed role request hash. File hashes
     # describe these draft bytes, NOT the eventual bound/installed recipe.
     plan['symbolicFields'] = symbolic_fields(plan)

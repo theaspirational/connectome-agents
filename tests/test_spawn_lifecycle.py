@@ -91,6 +91,117 @@ class LifecycleTests(unittest.TestCase):
     def move(self, target, op=None, **kwargs):
         return self.life.transition('example-agent', target, op or target, **kwargs)
 
+    def repo_name_source(self, record=IDENTITY):
+        repo = self.work / 'config-repo'
+        repo.mkdir()
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(repo), *args], stderr=subprocess.DEVNULL).decode().strip()
+        git('init', '-q')
+        (repo / 'names').mkdir()
+        (repo / 'names/agent.json').write_text(json.dumps(record))
+        (repo / 'link.json').symlink_to('names/agent.json')
+        git('add', '.')
+        git('-c', 'user.name=Fixture Committer', '-c', 'user.email=committer@example.invalid',
+            'commit', '-qm', 'Name record', '--author=Fixture Initiator <initiator@example.invalid>')
+        commit = git('rev-parse', 'HEAD')
+        git('update-index', '--add', '--cacheinfo', '160000,' + commit + ',submodule')
+        git('-c', 'user.name=Fixture Committer', '-c', 'user.email=committer@example.invalid',
+            'commit', '-qm', 'Gitlink refusal fixture')
+        return {'kind': 'repo', 'repo': str(repo), 'commit': git('rev-parse', 'HEAD'), 'path': 'names/agent.json'}
+
+    def test_repo_name_pinned_provenance_and_identical_file_hash(self):
+        source = self.repo_name_source()
+        repo = Path(source['repo'])
+        expected_blob = subprocess.check_output([
+            'git', '-C', str(repo), 'rev-parse', source['commit'] + ':' + source['path']]).decode().strip()
+        self.name_file.write_bytes((repo / source['path']).read_bytes())
+        named = read_name_record(source, with_provenance=True)
+        file_named = read_name_record(self.name_file, with_provenance=True)
+        self.assertEqual(named['record'], IDENTITY)
+        self.assertEqual(named['recordHash'], file_named['recordHash'])
+        self.assertEqual(named['source'], dict(source, blob=expected_blob,
+            author=named['source']['author'], committer=named['source']['committer']))
+        self.assertTrue(named['source']['author'].startswith('Fixture Committer <committer@example.invalid>'))
+        self.assertTrue(named['source']['committer'].startswith('Fixture Committer <committer@example.invalid>'))
+        # Author is informational, not an identity/permission check. Use the
+        # first commit to exercise a distinct initiator author and committer.
+        first = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD^']).decode().strip()
+        authored = read_name_record(dict(source, commit=first), with_provenance=True)['source']
+        self.assertTrue(authored['author'].startswith('Fixture Initiator <initiator@example.invalid>'))
+        self.assertNotEqual(authored['author'], authored['committer'])
+        (repo / source['path']).write_text('uncommitted invalid input')
+        subprocess.run(['git', '-C', str(repo), 'update-ref', 'HEAD', first], check=True)
+        self.assertEqual(read_name_record(source), IDENTITY)
+        from connectome_spawn import sources
+        with patch.object(sources, 'git', wraps=sources.git) as plumbing:
+            self.assertEqual(read_name_record(dict(source, repo=str(repo / '.git'))), IDENTITY)
+        self.assertTrue(all(call.args[1] in ('cat-file', 'ls-tree') for call in plumbing.call_args_list))
+        self.create()
+        self.move('initiation')
+        state = self.move('named', name_source=source)
+        self.assertEqual(state['nameRecord'], {k: named[k] for k in ('recordHash', 'source')})
+        self.assertEqual(state['identity'], IDENTITY)
+        self.assertEqual(self.move('named', name_source=source), state)
+        # Even another commit containing the same record is different pinned intent.
+        with self.assertRaises(SpawnError):
+            self.move('named', name_source=dict(source, commit=first))
+        with self.assertRaises(SpawnError):
+            self.move('named', name_source=source, name_file=self.name_file)
+        # Status reads only persisted provenance, not the now-unavailable repo.
+        repo.rename(self.work / 'moved-repo')
+        self.assertEqual(self.restart().status('example-agent'), state)
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/connectome-spawn'), 'status',
+            'example-agent', '--state-root', str(self.root)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['nameRecord'], state['nameRecord'])
+
+    def test_repo_name_without_prompt_remains_absent_through_activation(self):
+        record = {k: v for k, v in IDENTITY.items() if k != 'systemPrompt'}
+        source = self.repo_name_source(record)
+        self.assertEqual(read_name_record(source), record)
+        write(self.name_file, record)
+        self.assertEqual(read_name_record(self.name_file), record)
+        self.create()
+        self.move('initiation')
+        self.assertEqual(self.move('named', name_source=source)['identity'], record)
+        active = self.move('active')
+        self.assertNotIn('systemPrompt', active['identity'])
+        self.assertNotIn('systemPrompt', self.adapter.events[-1][1]['identity'])
+        self.assertEqual(self.restart().status('example-agent')['identity'], record)
+        for bad in (None, '', 'TODO', 'none'):
+            with self.subTest(prompt=bad), self.assertRaises(SpawnError):
+                name_record(dict(record, systemPrompt=bad))
+
+    def test_repo_name_refusals_leave_lifecycle_unchanged(self):
+        source = self.repo_name_source()
+        repo = source['repo']
+        tree = subprocess.check_output(['git', '-C', repo, 'rev-parse', 'HEAD^{tree}']).decode().strip()
+        blob = subprocess.check_output(['git', '-C', repo, 'rev-parse', 'HEAD:names/agent.json']).decode().strip()
+        bad_sources = [dict(source, commit=v) for v in (
+            'HEAD', source['commit'][:12], '0' * 40, 'f' * 40, source['commit'] + '^', tree, blob)]
+        bad_sources += [dict(source, path=v) for v in (
+            'missing.json', 'names', 'link.json', 'link.json/agent.json', 'submodule',
+            '../names/agent.json', 'names/../names/agent.json', '/names/agent.json')]
+        bad_sources += [dict(source, repo='https://example.invalid/config.git'),
+                        dict(source, repo=str(self.work / 'absent')), dict(source, extra=True),
+                        {'kind': 'repo', 'repo': repo, 'path': source['path']}, dict(source, kind='network')]
+        self.create()
+        self.move('initiation')
+        before = self.life.status('example-agent')
+        for bad in bad_sources:
+            with self.subTest(source=bad), self.assertRaises(SpawnError):
+                self.move('named', name_source=bad)
+            self.assertEqual(self.life.status('example-agent'), before)
+        with self.assertRaises(SpawnError):
+            read_name_record(source, ingress_root=self.work)
+
+    def test_repo_name_reuses_strict_record_decoder(self):
+        source = self.repo_name_source()
+        from connectome_spawn import sources
+        for raw in (b'{"name":"A","name":"B"}', b'{bad', b'unknown: field', b'x' * (1024 * 1024 + 1)):
+            with self.subTest(raw=raw[:32]), patch.object(sources, 'pinned_blob', return_value=(raw, source)), self.assertRaises(SpawnError):
+                read_name_record(source)
+
     def test_clean_lifecycle_restart_and_idempotence(self):
         self.assertEqual(self.create()['state'], 'planned')
         self.assertEqual(self.create()['state'], 'planned')
@@ -280,6 +391,7 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaises(SpawnError):
                 name_record(record)
         self.assertEqual(read_name_record(self.name_file), IDENTITY)
+        self.assertEqual(read_name_record(path=self.name_file), IDENTITY)
         for channel in ('TODO', '../escape', '${CHANNEL}'):
             with self.assertRaises(SpawnError):
                 self.life.create('example-agent', seed={'mode': 'clean'}, identity=IDENTITY,

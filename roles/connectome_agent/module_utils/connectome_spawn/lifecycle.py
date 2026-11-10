@@ -9,7 +9,7 @@ from typing import Protocol
 
 from .data import digest, fields, match, need
 from .persistence import directory, locked, read, safe_path, write
-from .schema import NAME, activation_identity, read_name_record
+from .schema import NAME, activation_identity, name_receipt, read_name_record
 from .seed import seed_intent
 from .identity import identity_policy, temporary_name, validate_provider_name
 
@@ -21,8 +21,9 @@ class LifecycleAdapter(Protocol):
         """T4 hook; acknowledge only durable completion, never activate on build/hold.
 
         join-initiation uses context.home and topic 'initiation'. start-initiation
-        runs on the agent's own temporary identity. Home-channel dialogue produces the agent's
-        name-record file. provision-permanent uses that record; redeploy-keep-memory
+        runs on the agent's own temporary identity. Normally the initiator commits
+        the name record to the config repo; self-naming needs an explicit request
+        and repo write access. provision-permanent uses the pinned record; redeploy-keep-memory
         switches identity without resetting context.store. No extra approval.
         """
         ...
@@ -42,7 +43,7 @@ def _handle(value, agent):
 
 def _state(value, agent):
     fields(value, ('schema', 'agent', 'state', 'seed', 'home', 'identity', 'identityPolicy', 'temporaryName', 'supportsRename',
-                   'temporaryIdentity', 'permanentIdentity', 'store', 'operations', 'pending'))
+                   'temporaryIdentity', 'permanentIdentity', 'store', 'operations', 'pending'), ('nameRecord',))
     need(value['schema'] == 'connectome.spawn-state/v1' and value['agent'] == agent and
          value['state'] in STATES, 'invalid lifecycle state')
     fields(value['seed'], ('mode', 'branch', 'digest'))
@@ -54,6 +55,9 @@ def _state(value, agent):
          value['seed']['branch'] == ('seeded' if value['seed']['mode'] == 'required' else 'clean'),
          'inconsistent persisted seed intent')
     activation_identity(value['identity'], value['home'])
+    if value.get('nameRecord') is not None:
+        name_receipt(value['nameRecord'])
+        need(value['nameRecord']['recordHash'] == digest(value['identity']), 'name record hash mismatch')
     need(type(value['store']) is str and type(value['operations']) is dict, 'invalid lifecycle records')
     need(identity_policy(value['identityPolicy']) == value['identityPolicy'] and
          match(value['temporaryName'], r'[A-Za-z][A-Za-z0-9_-]{0,255}') and
@@ -143,18 +147,25 @@ class Lifecycle:
             write(path, value)
             return self.status(agent)
 
-    def transition(self, agent, target, operation_id, *, name_file=None, payload=None):
+    def transition(self, agent, target, operation_id, *, name_file=None, name_source=None, payload=None):
         need(target in STATES and target != 'planned', 'illegal lifecycle target')
         need(match(operation_id, r'[A-Za-z0-9_-]{1,128}'), 'invalid operation id')
-        record = read_name_record(name_file, ingress_root=self.ingress_root) if name_file is not None else None
+        need(name_file is None or name_source is None, 'exactly one name record source required')
+        selected = name_source if name_source is not None else name_file
+        named = read_name_record(selected, ingress_root=self.ingress_root, with_provenance=True) if selected is not None else None
+        record = named['record'] if named is not None else None
+        receipt = {key: named[key] for key in ('recordHash', 'source')} if named is not None else None
         root, path, store, marker = self._paths(agent)
         with locked(root):
             value = self._read(agent)
             need((target == 'named') == (record is not None), 'name record required only for named transition')
             need(payload is None or target == 'active' and value['seed']['branch'] == 'seeded',
                  'seed payload not accepted for this transition')
-            request = digest({'target': target, 'record': record,
-                              'seed': seed_intent({'mode': 'required'}, payload) if payload is not None else None})
+            intent = {'target': target, 'record': record,
+                      'seed': seed_intent({'mode': 'required'}, payload) if payload is not None else None}
+            if receipt is not None:
+                intent['nameRecord'] = receipt
+            request = digest(intent)
             if operation_id in value['operations']:
                 need(value['operations'][operation_id] == {'digest': request, 'target': target},
                      'operation id reused with different input')
@@ -219,6 +230,7 @@ class Lifecycle:
                 step('start-initiation')
             elif target == 'named':
                 value['identity'] = record
+                value['nameRecord'] = receipt
             elif target == 'active' and branch == 'seeded':
                 step('build')
                 step('hold')

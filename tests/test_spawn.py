@@ -104,6 +104,41 @@ class SpawnTests(unittest.TestCase):
                          declaration if declaration is not None else self.declaration,
                          catalog_value if catalog_value is not None else self.catalog, self.stores, **kwargs)
 
+    def test_plan_and_dry_run_show_pinned_name_record(self):
+        record = {'name': 'ChosenAgent', 'displayName': 'Chosen Agent', 'summaryParticipant': 'ChosenAgent'}
+        (self.repo / 'name.json').write_text(json.dumps(record))
+        git(self.repo, 'add', 'name.json')
+        git(self.repo, '-c', 'user.name=Fixture Initiator', '-c', 'user.email=initiator@example.invalid',
+            'commit', '-qm', 'Chosen name')
+        commit = git(self.repo, 'rev-parse', 'HEAD')
+        source = {'kind': 'repo', 'repo': str(self.repo), 'commit': commit, 'path': 'name.json'}
+        expected = self.plan(name_source=source)
+        named = expected['plan']['nameRecord']
+        self.assertEqual(named['record'], record)
+        self.assertEqual(named['recordHash'], digest(record))
+        self.assertEqual(named['source']['commit'], commit)
+        self.assertEqual(named['source']['blob'], git(self.repo, 'rev-parse', commit + ':name.json'))
+        self.assertIn('Fixture Initiator', named['source']['author'])
+        self.assertIn('Fixture Initiator', named['source']['committer'])
+        (self.repo / 'name.json').write_text('working tree ignored')
+        for command in ('plan', 'dry-run'):
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/connectome-spawn'), command,
+                '--file', str(self.work / 'template.json'), '--instance', str(self.work / 'instance.json'),
+                '--catalog', str(self.catalog_root), '--stores', str(self.work / 'stores.json'),
+                '--name-repo', str(self.repo) + '+name.json@' + commit], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output['plan']['nameRecord'], named)
+            self.assertEqual(output['planHash'], expected['planHash'])
+            self.assertFalse(output['plan']['activationAllowed'])
+        name_file = self.work / 'name.json'
+        name_file.write_text(json.dumps(record))
+        file_plan = self.plan(name_source={'kind': 'file', 'path': str(name_file)})['plan']
+        self.assertEqual(file_plan['nameRecord']['recordHash'], named['recordHash'])
+        self.assertEqual(file_plan['nameRecord']['source'], {'kind': 'file', 'path': str(name_file)})
+        with self.assertRaises(SpawnError):
+            self.plan(name_source=dict(source, commit='HEAD'))
+
     def test_inline_file_repo_have_identical_hashes_and_plans(self):
         sources = [load_source(inline=json.dumps(self.spec)),
                    load_source(inline=yaml.safe_dump(self.spec)),

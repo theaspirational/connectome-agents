@@ -140,12 +140,14 @@ def instance(value):
 
 
 def name_record(value):
-    """Agent-written data, not an owner approval or executable configuration."""
+    """Initiator-written data, not an approval or executable configuration."""
     import unicodedata
     json_data(value)
-    fields(value, ('name', 'displayName', 'systemPrompt', 'summaryParticipant'))
+    fields(value, ('name', 'displayName', 'summaryParticipant'), ('systemPrompt',))
     for key, limit in (('name', 63), ('displayName', 128), ('systemPrompt', 65536),
                        ('summaryParticipant', 63)):
+        if key not in value:
+            continue
         concrete(value[key])
         need(len(value[key]) <= limit and not any(
             unicodedata.category(c).startswith('C') and not (key == 'systemPrompt' and c in '\n\t')
@@ -156,10 +158,51 @@ def name_record(value):
     return deepcopy(value)
 
 
-def read_name_record(path, *, ingress_root=None):
-    from .data import decode
-    from .sources import read_file
-    return name_record(decode(read_file(path, root=ingress_root)))
+def read_name_record(path, *, ingress_root=None, with_provenance=False):
+    """Single name ingress: a legacy file path or an explicit file/repo source.
+
+    Repo identity is the canonical local repository path, not a remote URL or
+    an authorization claim. A repo source always reads committed object bytes.
+    """
+    from pathlib import Path
+    from .data import decode, digest
+    from .sources import pinned_blob, read_file
+    source = path
+    if type(source) is not dict:
+        source = {'kind': 'file', 'path': source}
+    need(source.get('kind') in ('file', 'repo'), 'unsupported name record source')
+    if source['kind'] == 'file':
+        fields(source, ('kind', 'path'))
+        raw = read_file(source['path'], root=ingress_root)
+        provenance = {'kind': 'file', 'path': str(Path(source['path']).absolute())}
+    else:
+        fields(source, ('kind', 'repo', 'commit', 'path'))
+        need(ingress_root is None, 'file ingress root does not authorize a repository source')
+        raw, provenance = pinned_blob(source['repo'], source['commit'], source['path'])
+    record = name_record(decode(raw))
+    result = {'record': record, 'recordHash': digest(record), 'source': provenance}
+    return result if with_provenance else record
+
+
+def name_receipt(value):
+    """Validate persisted provenance without rereading a mutable local source."""
+    from .sources import COMMIT, absolute, relative
+    fields(value, ('recordHash', 'source'))
+    need(match(value['recordHash'], r'[0-9a-f]{64}'), 'invalid name record hash')
+    source = value['source']
+    need(type(source) is dict and source.get('kind') in ('file', 'repo'), 'invalid name source')
+    if source['kind'] == 'file':
+        fields(source, ('kind', 'path'))
+        need(type(source['path']) is str and source['path'].startswith('/') and
+             '..' not in source['path'].split('/'), 'invalid name file path')
+    else:
+        fields(source, ('kind', 'repo', 'commit', 'path', 'blob', 'author', 'committer'))
+        absolute(source['repo'])
+        relative(source['path'])
+        need(all(match(source[key], COMMIT) and source[key] != '0' * 40 for key in ('commit', 'blob')),
+             'invalid pinned name object')
+        need(all(type(source[key]) is str for key in ('author', 'committer')), 'invalid provenance')
+    return value
 
 
 def activation_identity(value, home):
