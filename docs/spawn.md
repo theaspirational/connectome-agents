@@ -14,7 +14,8 @@ source, not a copied CLI implementation: Ansible can import
 `ansible.module_utils.connectome_spawn`; the checkout launcher adds the
 `module_utils` directory to its import path; `pyproject.toml` installs that same
 package as `connectome_spawn`. Runtime dependencies are Python 3.10+ and PyYAML
-6+ only. Setuptools is only an optional installation/build dependency.
+6+ only. Setuptools and wheel are optional installation/build dependencies,
+not runtime dependencies.
 
 This layout permits Ansible's module-utils dependency bundling without requiring
 an independently installed target package. The existing deployment module is
