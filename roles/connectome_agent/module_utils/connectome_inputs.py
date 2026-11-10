@@ -23,14 +23,26 @@ def external_data_path(value):
             not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value))
 
 
+def external_data_flag(value):
+    """Literal data options only; code-loading flags can never be exempted."""
+    denied = {'-e', '--eval', '-p', '--print', '-c', '-r', '--require', '--import',
+              '--loader', '--experimental-loader', '-x', '-m'}
+    return (isinstance(value, str) and re.fullmatch(r'--?[A-Za-z][A-Za-z0-9_-]*', value) and
+            value not in denied and
+            not value.startswith(('--require', '--import', '--loader', '--experimental-loader')))
+
+
 def validate_external_data_args(records):
     valid = isinstance(records, list)
     seen = set()
     for record in records if valid else ():
-        if not (isinstance(record, dict) and set(record) == {'server', 'path'} and
+        if not (isinstance(record, dict) and
+                {'server', 'path', 'kind'} <= set(record) <= {'server', 'path', 'kind', 'flag'} and
                 isinstance(record['server'], str) and
                 re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', record['server']) and
-                external_data_path(record['path'])):
+                external_data_path(record['path']) and
+                isinstance(record['kind'], str) and record['kind'] in ('file', 'dir') and
+                ('flag' not in record or external_data_flag(record['flag']))):
             valid = False
             break
         key = (record['server'], record['path'])

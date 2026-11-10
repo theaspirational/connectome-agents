@@ -325,7 +325,7 @@ explanation. CLI argument errors also use a fixed envelope without echoing argv.
 | `E_ANCESTOR_WRITABLE` | Existing group/other-writable ancestor; the deployment result names `ancestor_path`. No chmod or writes occur. |
 | `E_EXTERNAL_COMMAND` | An `external[]` command or path argument, a link in its chain or a traversed directory is missing, not root-owned, group/other-writable or not a regular file; names `external_server` only. Nothing is repaired or activated. |
 | `E_EXTERNAL_ACCESS` | The agent account cannot read/execute an external command or path argument, or read/traverse a directory above it; names `external_server` only. Grant access explicitly; nothing is changed. |
-| `E_EXTERNAL_DATA_ARG` | Invalid, stale or unsafe `external_data_args` opt-in; requires an exact external-server argv file, agent-owned mode 0600 under its home with safe ancestry. No content or path in the error; nothing is repaired. |
+| `E_EXTERNAL_DATA_ARG` | Invalid, stale or unsafe `external_data_args` opt-in; requires an exact external-server argv data path after a root-owned script, with matching kind (file 0600 or directory 0700), safe position/flag and ancestry under the agent home. No content or path in the error; nothing is repaired. |
 | `E_SYSTEMD_PATH` | Use literal absolute paths without whitespace, specifiers, globs or escapes. |
 | `E_ENVIRONMENT_FILE` | Manager did not accept the required non-optional environment file. |
 | `E_UNIT_ACTIVE` | Install-only would replace an active/transitioning unit; names `unit` and `scope`. Stop it explicitly first. |
@@ -598,34 +598,60 @@ server already installed on the target at a literal absolute
   naming not-yet-existing paths are therefore refused.
 
 **Private argv data (opt-in).** The effective agent config accepts a closed,
-replacement-merged list (default absent/empty):
+replacement-merged list (default absent/empty). `server`, `path` and `kind` are
+required; `flag` is optional. Duplicate server/path pairs are refused.
 
 ```yaml
 external_data_args:
   - server: alpha
     path: /absolute/agent-home/.config/example/registry.json
+    kind: file
+  - server: beta
+    path: /absolute/agent-home/.local/state/example
+    kind: dir
+    flag: --state
 ```
 
-Only an exact string match of both server name and **raw argv element** is
-eligible: no globbing, prefix matching or `--flag=/path` extraction. The server
-must be external and the path must occur in its args, never equal its command;
-unknown/non-external servers and stale paths fail with `E_EXTERNAL_DATA_ARG`.
-For a non-root-owned match, `lstat` must find a regular, non-symlink file owned
-by the agent uid, mode **exactly 0600**, strictly under that account's passwd
-home. Paths must be absolute and lexically normal (no `..`, `.`, `//` or trailing
-slash). Every directory from home down must be owned by root or the agent;
-above home, root only. All must be real directories, not group/other-writable,
-and pass the same agent read/traverse check (`E_EXTERNAL_ACCESS`). Symlink
-ancestors are refused. Root-owned matches use the normal root-maintained rule,
-not this exception. Commands and every other arg keep their existing checks.
-Checks repeat at prepare and activation; no content is read or copied.
+Matching is literal and case-sensitive: no globbing or prefix path matching.
+The server must be external and the path must occur in its args in the declared
+form, never equal its command; unknown/non-external servers, stale declarations
+and unsafe bindings fail closed with `E_EXTERNAL_DATA_ARG`.
+
+- **Without `flag`:** the exemption is for data passed positionally to a
+  root-owned script. Only an exact raw argv element matches, never a
+  `--flag=PATH` value. It must not be `args[0]`, must follow an earlier
+  positional (non-flag) path-like arg that passes the normal root-owned checks,
+  and must not immediately follow any arg starting with `-`. Thus `-e FILE`,
+  `-c FILE`, `--require FILE`, `-r FILE`, `--import FILE`, `--loader FILE`,
+  `-x FILE` and even `rootscript.js --config FILE` are refused.
+- **With `flag`:** only exactly `FLAG PATH` (adjacent separate args) or
+  `FLAG=PATH` matches. An earlier positional root-owned script path that passes
+  the normal checks is still required. The declaration must be a literal option
+  (`-` or `--` followed by letters/digits/underscore/hyphen, starting with a
+  letter), without a value. Code-loading options are denied case-sensitively:
+  `-e`, `--eval`, `-p`, `--print`, `-c`, `-r`, `--require`, `--import`,
+  `--loader`, `--experimental-loader`, `-x`, `-m`, and every option starting
+  with `--require`, `--import`, `--loader` or `--experimental-loader`.
+
+For a non-root-owned match, `lstat` must find an agent-owned, non-symlink
+regular file mode **exactly 0600** for `kind: file`, or a non-symlink directory
+mode **exactly 0700** for `kind: dir`. Kind must match the object on disk.
+Either must be strictly under that account's passwd home. Paths must be absolute
+and lexically normal (no `..`, `.`, `//` or trailing slash). Every directory from
+home down must be owned by root or the agent; above home, root only. All must be
+real directories, not group/other-writable, and pass the same agent read/traverse
+check (`E_EXTERNAL_ACCESS`). Symlink ancestors are refused. Root-owned matches
+use the normal root-maintained rule, not this exception, with kind still checked.
+Commands and every other arg keep their existing checks. Checks repeat at prepare
+and activation; no content is read or copied and no state is created or repaired.
 
 `BUILD/deployment.json` records the declarations as part of the hashed request;
 the role's derived lock view, plan and activation status expose
-`external_data_args: [{server, path}]`, never content. Cook's raw
-`connectome.lock` and build identity are unchanged. This permits mutable private
-data, not agent-owned executable code; opt in only for adapters that treat the
-argument as data.
+`external_data_args: [{server, path, kind, flag?}]`, never content. Cook's raw
+`connectome.lock` and build identity are unchanged. Operators must only declare
+paths the program reads as data, not agent-owned executable code; mode 0600 does
+not prevent interpretation. The positional/flag rules are not a sandbox or a
+semantic check of the root-owned program.
 
 Nothing is chowned or chmodded. This trusts the host's root-maintained
 installation; it is not a content pin or a review of the server.

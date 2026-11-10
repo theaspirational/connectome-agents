@@ -8,7 +8,7 @@ MESSAGES = {
     'E_ANCESTOR_WRITABLE': 'Existing ancestor is group/other-writable; inspect ancestor_path and repair explicitly; not changed.',
     'E_EXTERNAL_COMMAND': 'External MCP server command must be an existing root-owned regular file, not group/other-writable, under root-owned non-writable directories; not changed.',
     'E_EXTERNAL_ACCESS': 'External MCP server command, path argument or an ancestor is not readable and executable/traversable by the agent account; not changed.',
-    'E_EXTERNAL_DATA_ARG': 'External data argument must exactly name a declared external server argv file: normal absolute path, agent-owned regular file mode 0600 under the agent home with safe ancestry; not changed.',
+    'E_EXTERNAL_DATA_ARG': 'External data argument requires an exact declared position or safe data flag after a root-owned script: normal absolute path, matching agent-owned file 0600 or directory 0700 under the agent home with safe ancestry; not changed.',
     'E_SYSTEMD_PATH': 'Systemd paths must be absolute literals without whitespace or special characters.',
     'E_ENVIRONMENT_FILE': 'Required unit environment file was not accepted by the user service manager.',
     'E_ARCHIVE_GITHEAD': 'Archive gitHead is missing, invalid or differs from the requested commit.',
