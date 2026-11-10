@@ -132,10 +132,6 @@ class LifecycleTests(unittest.TestCase):
         (repo / source['path']).write_text('uncommitted invalid input')
         subprocess.run(['git', '-C', str(repo), 'update-ref', 'HEAD', first], check=True)
         self.assertEqual(read_name_record(source), IDENTITY)
-        from connectome_spawn import sources
-        with patch.object(sources, 'git', wraps=sources.git) as plumbing:
-            self.assertEqual(read_name_record(dict(source, repo=str(repo / '.git'))), IDENTITY)
-        self.assertTrue(all(call.args[1] in ('cat-file', 'ls-tree') for call in plumbing.call_args_list))
         self.create()
         self.move('initiation')
         state = self.move('named', name_source=source)
@@ -154,6 +150,72 @@ class LifecycleTests(unittest.TestCase):
             'example-agent', '--state-root', str(self.root)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['nameRecord'], state['nameRecord'])
+
+    def test_repo_name_requires_real_repository_top(self):
+        source = self.repo_name_source()
+        repo = Path(source['repo'])
+        alias = self.work / 'repo-alias'
+        alias.symlink_to(repo, target_is_directory=True)
+        parent_alias = self.work / 'parent-alias'
+        parent_alias.symlink_to(self.work, target_is_directory=True)
+        # This used to read names/agent.json relative to the discovered parent,
+        # despite recording names/ as the repository in provenance.
+        bad = [(repo / 'names', 'agent.json'), (alias, source['path']),
+               (parent_alias / repo.name, source['path']), (repo / '.git', source['path'])]
+        gitfile_repo = self.work / 'gitfile-repo'
+        gitfile_repo.mkdir()
+        (gitfile_repo / '.git').write_text('gitdir: ' + str(repo / '.git') + '\n')
+        bad.append((gitfile_repo, source['path']))
+        worktree = self.work / 'linked-worktree'
+        subprocess.run(['git', '-C', str(repo), 'worktree', 'add', '-q', '--detach',
+                        str(worktree), source['commit']], check=True)
+        bad.append((worktree, source['path']))
+        for directory, path in bad:
+            with self.subTest(repo=directory), self.assertRaises(SpawnError):
+                read_name_record(dict(source, repo=str(directory), path=path))
+        # A .git symlink is refused even when its target is the original store.
+        store = self.work / 'saved-git'
+        (repo / '.git').rename(store)
+        (repo / '.git').symlink_to(store, target_is_directory=True)
+        with self.assertRaises(SpawnError):
+            read_name_record(source)
+
+    def test_repo_name_bare_store_and_explicit_git_directory(self):
+        source = self.repo_name_source()
+        bare = self.work / 'bare.git'
+        subprocess.run(['git', 'clone', '-q', '--bare', '--no-hardlinks',
+                        source['repo'], str(bare)], check=True)
+        from connectome_spawn import sources
+        original = subprocess.Popen
+        commands = []
+
+        def capture(argv, **kwargs):
+            commands.append(argv)
+            return original(argv, **kwargs)
+
+        with patch.object(sources.subprocess, 'Popen', side_effect=capture):
+            self.assertEqual(read_name_record(source), IDENTITY)
+            self.assertEqual(read_name_record(dict(source, repo=str(bare))), IDENTITY)
+        self.assertTrue(commands)
+        for argv in commands:
+            self.assertTrue(any(arg.startswith('--git-dir=') for arg in argv))
+            self.assertNotIn('-C', argv)
+            self.assertFalse(any(arg.startswith('--work-tree') for arg in argv))
+
+    def test_repo_name_full_sha_ref_collisions_refused(self):
+        source = self.repo_name_source()
+        repo, commit = source['repo'], source['commit']
+        other = subprocess.check_output(['git', '-C', repo, 'rev-parse', 'HEAD^']).decode().strip()
+        for prefix in ('refs/heads/', 'refs/tags/', 'refs/custom/nested/', 'refs/'):
+            for target in (commit, other):
+                ref = prefix + commit
+                subprocess.run(['git', '-C', repo, 'update-ref', ref, target], check=True)
+                try:
+                    with self.subTest(ref=ref, target=target), self.assertRaises(SpawnError):
+                        read_name_record(source)
+                finally:
+                    subprocess.run(['git', '-C', repo, 'update-ref', '-d', ref], check=True)
+        self.assertEqual(read_name_record(source), IDENTITY)
 
     def test_repo_name_without_prompt_remains_absent_through_activation(self):
         record = {k: v for k, v in IDENTITY.items() if k != 'systemPrompt'}

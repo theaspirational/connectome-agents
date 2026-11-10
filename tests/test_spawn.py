@@ -152,9 +152,10 @@ class SpawnTests(unittest.TestCase):
         (self.repo / 'template.yml').write_text('uncommitted: ignored')
         self.assertEqual(load_source(repo=str(self.repo) + '+template.yml@' + self.commit), self.spec)
 
-    def test_bare_and_git_directory_object_stores(self):
+    def test_bare_store_and_refused_nonbare_git_directory(self):
         expected = load_source(repo=str(self.repo) + '+template.yml@' + self.commit)
-        self.assertEqual(load_source(repo=str(self.repo / '.git') + '+template.yml@' + self.commit), expected)
+        with self.assertRaises(SpawnError):
+            load_source(repo=str(self.repo / '.git') + '+template.yml@' + self.commit)
         bare = self.work / 'bare.git'
         subprocess.run(['git', 'clone', '--bare', '--no-hardlinks', str(self.repo), str(bare)],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -365,10 +366,15 @@ class SpawnTests(unittest.TestCase):
                                     'GIT_CONFIG_VALUE_0': '!false', 'GIT_DIR': '/nonexistent',
                                     'GIT_WORK_TREE': '/nonexistent', 'GIT_CONFIG_SYSTEM': '/nonexistent'}):
             self.assertEqual(load_source(repo=str(self.repo) + '+template.yml@' + self.commit), self.spec)
+        from connectome_spawn.sources import commit_tree, git as source_git
+        original = source_git(str(self.repo), 'cat-file', 'commit', self.commit)
         git(self.repo, 'replace', self.commit, self.runtime_commit)
-        # A replaced commit must not expose the second commit's tree.
-        from connectome_spawn.sources import commit_tree
-        self.assertNotEqual(commit_tree(str(self.repo), self.commit), commit_tree(str(self.repo), self.runtime_commit))
+        # Plumbing still ignores replacement objects. The pin itself now fails
+        # closed because refs/replace/<sha> collides with its full SHA basename.
+        self.assertEqual(source_git(str(self.repo), 'cat-file', 'commit', self.commit), original)
+        with self.assertRaises(SpawnError):
+            commit_tree(str(self.repo), self.commit)
+        commit_tree(str(self.repo), self.runtime_commit)
 
     def test_missing_partial_clone_objects_never_invoke_remote_helper(self):
         marker = self.work / 'remote-was-called'

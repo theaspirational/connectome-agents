@@ -1,4 +1,4 @@
-"""Local-only source reads: never fetch, checkout, execute hooks or consult refs."""
+"""Local-only source reads: never fetch, checkout, execute hooks or resolve pins through refs."""
 import hashlib
 import os
 from pathlib import Path
@@ -68,36 +68,66 @@ def read_file(path, limit=LIMIT, *, root=None):
 
 
 def git(repo, *args, limit=LIMIT):
-    """Only fixed plumbing verbs are used by callers; repo never a URL.
+    """Read an explicit local object store, never discover a parent repository.
 
-    No ambient Git config, replacements, lazy promisor fetch, filters or pager.
-    Local repo config is still parsed by Git; protocol policy denies every
-    transport, including file, even if an object store is a partial clone.
+    Non-bare inputs must be repository tops with a real .git directory; bare
+    inputs must declare core.bare. Gitfiles/linked worktrees are not supported.
+    Pin no-follow directory traversal with fds, as for local file reads.
+    No ambient config, replacements, lazy fetch, filters, hooks or transports.
     """
     absolute(repo)
-    need(Path(repo).is_dir(), 'local object store required')
     env = {'PATH': os.defpath, 'LANG': 'C', 'GIT_CONFIG_NOSYSTEM': '1',
            'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_NO_REPLACE_OBJECTS': '1',
            'GIT_NO_LAZY_FETCH': '1', 'GIT_TERMINAL_PROMPT': '0',
            'GIT_OPTIONAL_LOCKS': '0', 'GIT_ALLOW_PROTOCOL': ''}
-    argv = ['git', '-c', 'safe.directory=' + str(Path(repo).resolve()),
-            '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
-            '-c', 'protocol.allow=never', '-C', repo, *args]
+    directory_fd = None
     try:
-        with subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
-            data = child.stdout.read(limit + 1)
-            if len(data) > limit:
-                child.kill()
-            code = child.wait()
-        need(code == 0 and len(data) <= limit, 'missing or oversized local git object')
-        return data
+        directory_fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for component in Path(repo).parts[1:]:
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        has_dotgit = os.path.lexists('/proc/self/fd/' + str(directory_fd) + '/.git')
+        if has_dotgit:
+            next_fd = os.open('.git', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        argv = ['git', '--git-dir=/proc/self/fd/' + str(directory_fd),
+                '-c', 'safe.directory=' + repo,
+                '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+                '-c', 'protocol.allow=never']
+
+        def run(arguments, bound):
+            with subprocess.Popen(argv + list(arguments), env=env, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  pass_fds=(directory_fd,)) as child:
+                data = child.stdout.read(bound + 1)
+                if len(data) > bound:
+                    child.kill()
+                code = child.wait()
+            need(code == 0 and len(data) <= bound, 'missing or oversized local git object')
+            return data
+
+        if not has_dotgit:
+            need(run(('rev-parse', '--is-bare-repository'), LIMIT) == b'true\n',
+                 'repository top or bare object store required')
+        return run(args, limit)
     except OSError:
-        raise SpawnError('local git unavailable') from None
+        raise SpawnError('unreadable local repository or git unavailable') from None
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def commit_tree(repo, commit):
     need(match(commit, COMMIT) and commit != '0' * 40, 'full nonzero commit required')
+    refs = git(repo, 'for-each-ref', '--format=%(refname)').splitlines()
+    need(not any(ref.endswith(b'/' + commit.encode('ascii')) for ref in refs),
+         'commit pin collides with ref name')
+    resolved = git(repo, 'rev-parse', '--verify', '--quiet', '--end-of-options', commit + '^{commit}')
+    need(resolved == (commit + '\n').encode('ascii'), 'exact commit object required')
     need(git(repo, 'cat-file', '-t', commit) == b'commit\n', 'commit object required')
     raw = git(repo, 'cat-file', 'commit', commit)
     first = raw.split(b'\n', 1)[0].decode('ascii')
@@ -107,7 +137,7 @@ def commit_tree(repo, commit):
 
 def entries(repo, commit):
     tree = commit_tree(repo, commit)
-    raw = git(repo, 'ls-tree', '-rz', tree)
+    raw = git(repo, 'ls-tree', '-rz', commit)
     result = {}
     for record in raw.split(b'\0'):
         if not record:
@@ -121,8 +151,8 @@ def entries(repo, commit):
 
 
 def blob(repo, commit, path, limit=LIMIT):
-    entry = regular_blob(repo, commit, path)
-    return git(repo, 'cat-file', 'blob', entry[2], limit=limit)
+    regular_blob(repo, commit, path)
+    return git(repo, 'cat-file', 'blob', commit + ':' + path, limit=limit)
 
 
 def regular_blob(repo, commit, path):
@@ -137,7 +167,7 @@ def regular_blob(repo, commit, path):
 def pinned_blob(repo, commit, path, limit=LIMIT):
     """Read a pinned regular blob and informational commit provenance locally."""
     entry = regular_blob(repo, commit, path)
-    identity = absolute(str(Path(repo).resolve()))
+    identity = absolute(repo)
     headers = git(repo, 'cat-file', 'commit', commit).split(b'\n\n', 1)[0].split(b'\n')
     provenance = {}
     for key in ('author', 'committer'):
@@ -147,7 +177,7 @@ def pinned_blob(repo, commit, path, limit=LIMIT):
             provenance[key] = rows[0].decode('utf-8')
         except UnicodeError:
             raise SpawnError('invalid commit provenance') from None
-    return git(repo, 'cat-file', 'blob', entry[2], limit=limit), {
+    return git(repo, 'cat-file', 'blob', commit + ':' + path, limit=limit), {
         'kind': 'repo', 'repo': identity, 'commit': commit,
         'path': path, 'blob': entry[2], **provenance}
 
@@ -184,7 +214,8 @@ def resolve_artifact(entry):
     total = 0
     for path, (mode, kind, oid) in sorted(inventory.items()):
         need(mode in ('100644', '100755') and kind == 'blob', 'artifact links and submodules refused')
-        content = git(entry['repo'], 'cat-file', 'blob', oid, limit=ARTIFACT_LIMIT - total)
+        content = git(entry['repo'], 'cat-file', 'blob', entry['commit'] + ':' + path,
+                      limit=ARTIFACT_LIMIT - total)
         total += len(content)
         need(total <= ARTIFACT_LIMIT, 'artifact size limit exceeded')
         files.append({'path': path, 'mode': mode, 'size': len(content),

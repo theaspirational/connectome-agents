@@ -75,7 +75,10 @@ Exactly one template source is required:
 The final `+` separates the absolute local repository directory from its relative
 blob path; the final `@` separates the full, lowercase 40-hex commit. No remote
 URL, branch, tag, abbreviated commit, revision expression, symlink blob,
-submodule path or traversal is accepted. Bare repositories work. Only Git
+submodule path or traversal is accepted. Repository paths must be real repository
+tops with a real `.git` directory, or bare repositories (`core.bare=true`).
+Symlinks in any path component, `.git` files and linked worktrees are refused,
+as are commit pins also named by any ref. Only explicit `--git-dir` Git
 plumbing reads local objects: no fetch, checkout, replacement objects, lazy
 promisor fetch, hooks, user/system configuration, or permitted Git transport.
 Dirty working-tree bytes do not override committed template bytes.

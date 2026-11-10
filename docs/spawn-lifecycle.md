@@ -137,7 +137,11 @@ The commit must already exist locally. Only local Git plumbing reads the commit,
 tree and blob: no checkout, network, fetch, filters or working-tree reads. Missing
 commits/paths, non-commit pins, non-blob entries, symlink mode 120000, submodules,
 non-full SHAs and paths containing `..` components are refused. Repo identity is
-the canonical absolute local repository path, not a remote URL. The receipt
+the absolute local repository top, not a remote URL or subdirectory. Every path
+component must be nonsymlink; non-bare repos require a real `.git` directory.
+Gitfiles and linked worktrees are refused; bare repos with `core.bare=true` work.
+Git uses only explicit `--git-dir`, never repository discovery. A pin matching
+any ref basename is refused even when that ref targets the same commit. The receipt
 `nameRecord` contains `recordHash` (canonical validated-record SHA-256) and
 `source: {kind, repo, commit, path, blob, author, committer}`. Author/committer
 are the commit headers, including identity and timestamp/offset. Source metadata
