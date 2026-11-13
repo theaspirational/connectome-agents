@@ -90,7 +90,9 @@ Before any provisioning, the rendered name is checked against the provider's
 **never truncated**. Name records are also checked against provider capabilities
 before entering `named`. The fake defaults to 63 ASCII letters/digits/underscore/
 hyphen, starting with a letter. A rename-capability change during initiation is
-refused. Name collisions are refused, never resolved by sharing an account or silently changing the name.
+refused. Name collisions within the provider's ledger and owned identities are refused,
+never resolved by sharing an account or silently changing the name. Realm-level
+uniqueness is limited to what the transport enforces.
 Plans list conditional rename/replace steps; no provider capability is assumed
 by the offline planner (`identity.supportsRename: null`).
 
@@ -245,8 +247,9 @@ contains protected prompt/identity data: keep its output private.
 Handles are closed `{id, agent}` data: a stable provider-local id (1–128 ASCII
 letters/digits/underscore/hyphen) and the owning agent identifier. They contain
 no credentials. Providers must isolate native account/message history per agent,
-refuse ownership/name collisions, persist operation receipts, and make identical
-operation retries idempotent. Reusing an operation id with changed intent fails.
+refuse ownership collisions and name collisions within their ledger and owned
+identities (realm-level uniqueness follows transport rules), persist operation
+receipts, and make identical operation retries idempotent. Reusing an operation id with changed intent fails.
 No implicit reclaim, reuse or transfer of temporary identities is allowed.
 
 `FileIdentityProvider(root, supports_rename=False)` initializes the offline fake;
@@ -308,25 +311,35 @@ address is not a renamed display persona. Preflight checks case-insensitive
 names against **all ledger tombstones** and the caller's active owned bots, and
 checks the native prefix in that owned listing. It does not enumerate foreign
 or inactive realm accounts. Zulip display names are not globally unique; this
-provider does **not** promise realm-wide full_name uniqueness. Native-address
-collisions, including foreign/inactive accounts, are rejected by Zulip at POST;
+provider does **not** promise realm-wide full_name uniqueness. Zulip only
+enforces exact full_name uniqueness among active users; deactivated and
+case-variant duplicates are possible. Routing and mentions must address agents
+by native user id/email (for example, `@**Name|id**`), never a bare full_name.
+Native-address collisions, including foreign/inactive accounts, are rejected
+by Zulip at POST;
 a refusal is never permission to adopt the colliding account. A matching owned
 short-name prefix with a different full_name or a different per-user owner is
 always refused. No unjournaled existing bot is adopted.
 After POST (including a lost response), owned-bot listing and an individual user
 read reconcile the reservation. Retries after process death find that same bot,
-not a second POST. A bounded, parsed Zulip JSON `result:error` response (including
-4xx/429 and JSON 5xx errors) means creation was refused: the reservation and
-pending intent are atomically released. The value-free error labels 408/429/5xx
-retryable and other refusals terminal (correct the request/policy first). There
-is no automatic retry; a later explicit call may use the same or a new id.
-Network loss, timeout, malformed/oversized responses, redirects or a 5xx without
-a parsed error remain ambiguous. If no committed bot is observable, the operation
-stays pending and POST is **never blindly repeated**. This
+not a second POST. Only HTTP 400–499 with a bounded, parsed Zulip JSON
+`result:error` body means creation was refused: the reservation and pending
+intent are atomically released. The value-free error labels only 408/429
+retryable and other 4xx refusals terminal (correct the request/policy first).
+There is no automatic retry; a later explicit call may use the same or a new id.
+Any 2xx with `result:error`, every 5xx (even parsed JSON errors), truncated,
+malformed/oversized responses, redirects, network loss and timeouts remain
+ambiguous: Zulip can commit a bot before returning an error. If no committed bot
+is observable, the operation stays pending and POST is **never blindly repeated**. This
 also covers a crash just before POST: an operator must reconcile the no-effect
 case. New operation ids cannot bypass pending work for that agent. Observed,
-owned rename/deactivate retries are idempotent assignments; completed operation
-ids bind exact intent, including the entire validated name record.
+owned rename/deactivate retries are idempotent assignments. After a parsed 4xx
+refusal, an individual-user read verifies the real bot state: an unchanged
+rename or still-active retirement releases only that intent with a clear error;
+an already-applied effect completes normally. Failed or inconsistent observation
+keeps the intent pending, as do ambiguous mutation responses with no observed
+effect. Completed operation ids bind exact intent, including the entire
+validated name record.
 
 Provider receipts are `root/zulip.json`, locked and atomically fsynced, with
 retired tombstones kept permanently. Realm/operator/delivery-root binding is a

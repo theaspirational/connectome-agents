@@ -53,10 +53,10 @@ def _credentials(path, allow_loopback_http):
 
 
 class ZulipRefusal(SpawnError):
-    """Parsed server error: no effect committed; never retain its private body."""
+    """Parsed 4xx refusal; never retain its private body."""
     def __init__(self, status):
         self.status = status
-        self.retryable = status in (408, 429) or status >= 500
+        self.retryable = status in (408, 429)
         super().__init__('Zulip request refused (HTTP ' + str(status) + ')')
 
 
@@ -65,7 +65,7 @@ def _response(response, status):
     need(raw.lstrip().startswith(b'{'), 'invalid Zulip JSON response')
     value = decode(raw)
     need(type(value) is dict, 'invalid Zulip JSON response')
-    if value.get('result') == 'error' and (200 <= status < 300 or 400 <= status < 600):
+    if value.get('result') == 'error' and 400 <= status < 500:
         raise ZulipRefusal(status) from None
     need(200 <= status < 300 and value.get('result') == 'success',
          'Zulip request failed; reconcile provider state')
@@ -296,7 +296,7 @@ class ZulipIdentityProvider:
                     api_call(credentials, 'POST', '/bots', {'full_name': name,
                              'short_name': row['short_name'], 'bot_type': 1})
                 except ZulipRefusal as refusal:
-                    # A parsed Zulip error is definitive, unlike a lost reply.
+                    # Only a parsed 4xx is a definitive create refusal.
                     del value['operations'][key]
                     del value['identities'][handle['id']]
                     write(self.path, value)
@@ -341,12 +341,20 @@ class ZulipIdentityProvider:
                              for r in value['identities'].values()), 'permanent identity already exists')
                 self._preflight(credentials, value, record['name'], exclude=handle['id'])
                 self._intent(value, key, request, handle, 'rename', record['name'])
+            refusal = None
             if user['full_name'] != record['name']:
                 try:
                     api_call(credentials, 'PATCH', '/bots/' + str(row['native_id']), {'full_name': record['name']})
+                except ZulipRefusal as failure:
+                    refusal = failure
                 except SpawnError:
                     pass
             user = self._observe(credentials, operator, row, target=record['name'])
+            if refusal is not None and user['full_name'] == row['name']:
+                del value['operations'][key]
+                write(self.path, value)
+                raise SpawnError('Zulip rename refused (HTTP ' + str(refusal.status) +
+                                 '); intent released') from None
             need(user['full_name'] == record['name'] and user['is_active'], 'Zulip rename awaiting reconciliation')
             row.update(name=record['name'], kind='permanent')
             self._complete(value, key)
@@ -366,12 +374,20 @@ class ZulipIdentityProvider:
             user = self._observe(credentials, operator, row)
             if not prior:
                 self._intent(value, key, request, handle, 'retire')
+            refusal = None
             if user['is_active']:
                 try:
                     api_call(credentials, 'DELETE', '/bots/' + str(row['native_id']))
+                except ZulipRefusal as failure:
+                    refusal = failure
                 except SpawnError:
                     pass
             user = self._observe(credentials, operator, row)
+            if refusal is not None and user['is_active']:
+                del value['operations'][key]
+                write(self.path, value)
+                raise SpawnError('Zulip retirement refused (HTTP ' + str(refusal.status) +
+                                 '); intent released') from None
             need(not user['is_active'], 'Zulip retirement awaiting reconciliation')
             delivered = safe_path(self.secrets_root / handle['agent'] / (handle['id'] + '.key'))
             if os.path.lexists(delivered):

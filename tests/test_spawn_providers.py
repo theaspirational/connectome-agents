@@ -36,6 +36,7 @@ class ZulipFixture:
         self.bots, self.calls = {}, []
         self.failure = None
         self.lost = None
+        self.committed_error = None
         self.response_mode = None
         self.user_overrides = {}
         fixture = self
@@ -71,7 +72,13 @@ class ZulipFixture:
                     return
                 if fixture.failure and fixture.failure[0] == method:
                     code = fixture.failure[1]
-                    if len(fixture.failure) > 2:
+                    if fixture.failure[2:] == ('truncated',):
+                        self.send_response(code)
+                        self.send_header('Content-Length', '999')
+                        self.end_headers()
+                        self.wfile.write(b'{"result":"error"')
+                        self.close_connection = True
+                    elif len(fixture.failure) > 2:
                         self.reply_raw(code, fixture.failure[2])
                     else:
                         self.reply(code, {'result': 'error', 'msg': 'private response must not escape'})
@@ -85,6 +92,10 @@ class ZulipFixture:
                     result = {'bots': [fixture.listed(b) for b in fixture.bots.values()
                                        if b['owner_id'] == 1 and b['is_active']]}
                 elif path == '/bots' and method == 'POST':
+                    if any(b['is_active'] and b['full_name'] == data['full_name'][0]
+                           for b in fixture.bots.values()):
+                        self.reply(400, {'result': 'error', 'msg': 'Name is already in use.'})
+                        return
                     short = data['short_name'][0]
                     if any(b['username'].split('-bot@')[0].lower() == short.lower() for b in fixture.bots.values()):
                         self.reply(400, {'result': 'error', 'msg': 'duplicate short name'})
@@ -107,12 +118,19 @@ class ZulipFixture:
                         self.reply(403, {'result': 'error'})
                         return
                     if method == 'PATCH':
+                        if any(b['user_id'] != bot['user_id'] and b['is_active'] and
+                               b['full_name'] == data['full_name'][0] for b in fixture.bots.values()):
+                            self.reply(400, {'result': 'error', 'msg': 'Name is already in use.'})
+                            return
                         bot['full_name'] = data['full_name'][0]
                     else:
                         bot['is_active'] = False
                     result = {}
                 else:
                     self.reply(404, {'result': 'error'})
+                    return
+                if fixture.committed_error == method or fixture.committed_error == (method, 400):
+                    self.reply(400 if type(fixture.committed_error) is tuple else 500, {'result': 'error', 'msg': 'private response'})
                     return
                 if fixture.lost == method:
                     fixture.lost = None
@@ -433,7 +451,7 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
         self.assertEqual(self.http.count('POST'), 1)
 
     def test_parsed_post_refusal_releases_intent_and_allows_explicit_retry(self):
-        for status in (200, 400, 403, 408, 429, 500, 503):
+        for status in (400, 403, 408, 429):
             with self.subTest(status=status):
                 self.root = self.work / ('refused-' + str(status))
                 self.http.bots.clear()
@@ -442,7 +460,7 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
                     self.create()
                 self.assertNotIn('private response', str(caught.exception))
                 self.assertIn('reservation released', str(caught.exception))
-                self.assertIn('retryable' if status >= 500 or status in (408, 429) else 'terminal', str(caught.exception))
+                self.assertIn('retryable' if status in (408, 429) else 'terminal', str(caught.exception))
                 state = read(self.root / 'zulip.json')
                 self.assertEqual(state['operations'], {})
                 self.assertEqual(state['identities'], {})
@@ -451,6 +469,146 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
                 op = 'create' if status in (200, 400, 429) else 'different'
                 handle = self.create(op=op)
                 self.assertEqual(self.create(op=op), handle)
+
+    def test_ambiguous_post_errors_keep_pending(self):
+        for status, body in ((200, None), (500, None), (503, None), (503, 'truncated')):
+            with self.subTest(status=status, body=body):
+                self.root = self.work / ('ambiguous-' + str(status) + str(body))
+                self.http.failure = ('POST', status) if body is None else ('POST', status, body)
+                with self.assertRaises(SpawnError) as caught:
+                    self.create()
+                self.assertNotIn('private response', str(caught.exception))
+                state = read(self.root / 'zulip.json')
+                self.assertEqual(len(state['identities']), 1)
+                self.assertEqual(next(iter(state['operations'].values()))['state'], 'pending')
+                count = self.http.count('POST')
+                self.http.failure = None
+                with self.assertRaises(SpawnError):
+                    self.create()
+                self.assertEqual(self.http.count('POST'), count)
+
+    def test_error_body_read_failure_keeps_pending(self):
+        import http.client
+        from connectome_spawn import zulip
+        response = zulip._response
+        def interrupted(body, status):
+            if status == 503:
+                raise http.client.IncompleteRead(b'private response')
+            return response(body, status)
+        self.http.failure = ('POST', 503)
+        with patch.object(zulip, '_response', side_effect=interrupted):
+            with self.assertRaises(SpawnError) as caught:
+                self.create()
+        self.assertNotIn('private response', str(caught.exception))
+        state = read(self.root / 'zulip.json')
+        self.assertEqual(len(state['identities']), 1)
+        self.assertEqual(next(iter(state['operations'].values()))['state'], 'pending')
+        self.http.failure = None
+        with self.assertRaises(SpawnError):
+            self.create()
+        self.assertEqual(self.http.count('POST'), 1)
+
+    def test_commit_then_500_discovers_exact_reserved_bot(self):
+        self.http.add('foreign', 'UnrelatedBot', owner=2)
+        self.http.committed_error = 'POST'
+        provider = self.provider()
+        with patch.object(provider, '_discover', return_value=None):
+            with self.assertRaises(SpawnError):
+                self.create(provider)
+        state = read(self.root / 'zulip.json')
+        self.assertEqual(len(state['operations']), 1)
+        self.assertEqual(next(iter(state['operations'].values()))['state'], 'pending')
+        reserved = next(iter(state['identities']))
+        handle = self.create()
+        self.assertEqual(handle['id'], reserved)
+        self.assertEqual(len(self.http.bots), 2)
+        self.assertEqual(self.http.count('POST'), 1)
+        self.assertEqual(self.provider().list()[0]['email'],
+                         self.http.bots[11]['username'])
+        self.assertEqual(self.create(), handle)
+
+    def test_refused_mutation_releases_intent_after_observation(self):
+        for method in ('PATCH', 'DELETE'):
+            with self.subTest(method=method):
+                self.root = self.work / method
+                self.http.bots.clear()
+                provider = self.provider()
+                handle = self.create(provider)
+                if method == 'PATCH':
+                    self.http.add('foreign', RECORD['name'], owner=2)
+                else:
+                    self.http.failure = (method, 400)
+                with self.assertRaisesRegex(SpawnError, 'refused.*intent released'):
+                    if method == 'PATCH':
+                        provider.rename(handle, RECORD, 'rename')
+                    else:
+                        provider.retire(handle, 'retire-refused')
+                self.assertEqual(self.http.calls[-1][:2], ('GET', '/users/' + str(self.http.bots[10]['user_id'])))
+                state = read(self.root / 'zulip.json')
+                self.assertFalse(any(o['state'] == 'pending' for o in state['operations'].values()))
+                self.assertEqual(state['identities'][handle['id']]['name'], 'NewbornAgent')
+                self.http.failure = None
+                provider.retire(handle, 'retire')
+                self.assertFalse(next(iter(self.http.bots.values()))['is_active'])
+
+    def test_refused_mutation_observed_effect_completes(self):
+        for method in ('PATCH', 'DELETE'):
+            with self.subTest(method=method):
+                self.root = self.work / method
+                self.http.bots.clear()
+                provider = self.provider()
+                handle = self.create(provider)
+                self.http.committed_error = (method, 400)
+                if method == 'PATCH':
+                    provider.rename(handle, RECORD, 'mutation')
+                else:
+                    provider.retire(handle, 'mutation')
+                state = read(self.root / 'zulip.json')
+                self.assertEqual(state['operations']['example-agent:mutation']['state'], 'complete')
+                self.http.committed_error = None
+
+    def test_refused_mutation_failed_observation_keeps_intent(self):
+        for method in ('PATCH', 'DELETE'):
+            with self.subTest(method=method):
+                self.root = self.work / method
+                self.http.bots.clear()
+                provider = self.provider()
+                handle = self.create(provider)
+                self.http.failure = (method, 403)
+                observe = provider._observe
+                calls = []
+                def fail_second(*args, **kwargs):
+                    calls.append(True)
+                    if len(calls) == 2:
+                        raise SpawnError('observation unavailable')
+                    return observe(*args, **kwargs)
+                with patch.object(provider, '_observe', side_effect=fail_second):
+                    with self.assertRaises(SpawnError):
+                        if method == 'PATCH':
+                            provider.rename(handle, RECORD, 'mutation')
+                        else:
+                            provider.retire(handle, 'mutation')
+                state = read(self.root / 'zulip.json')
+                self.assertEqual(state['operations']['example-agent:mutation']['state'], 'pending')
+                self.http.failure = None
+
+    def test_ambiguous_mutation_errors_keep_pending(self):
+        for method in ('PATCH', 'DELETE'):
+            for status in (200, 500, 503):
+                with self.subTest(method=method, status=status):
+                    self.root = self.work / (method + str(status))
+                    self.http.bots.clear()
+                    provider = self.provider()
+                    handle = self.create(provider)
+                    self.http.failure = (method, status)
+                    with self.assertRaises(SpawnError):
+                        if method == 'PATCH':
+                            provider.rename(handle, RECORD, 'rename')
+                        else:
+                            provider.retire(handle, 'retire')
+                    state = read(self.root / 'zulip.json')
+                    self.assertEqual(sum(o['state'] == 'pending' for o in state['operations'].values()), 1)
+                    self.http.failure = None
 
     def test_real_owned_bot_shape_delivers_key_and_lists(self):
         handle = self.create()
