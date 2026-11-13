@@ -185,4 +185,7 @@ package with the role's module-utils namespace, reads the existing catalog, and
 never applies or activates a deployment. Start with `examples/spawn/`.
 
 [Seed modes and clean-start initiation](docs/spawn-lifecycle.md) define the offline
-persisted lifecycle, pinned config-repo name record, per-agent identity-provider fake, and T4 adapter hooks.
+persisted lifecycle, pinned config-repo name record, and per-agent identity ownership.
+Explicit provider APIs now support Zulip bots, direct-key or inference-gate token
+files, and optional file secrets. Deployment adapters, role wiring and the chat
+frontend remain later work; plans still never activate anything.

@@ -62,13 +62,16 @@ def template(value):
     need(not (type(value) is dict and value.get('schema') == 'connectome.spawn-template/v1'),
          'migrate template v1 to v2: replace seedPolicy with seed.mode')
     data_only(value)
-    fields(value, ('schema', 'runtime', 'agent', 'connectors', 'modules', 'seed'), ('preflights', 'identity'))
+    fields(value, ('schema', 'runtime', 'agent', 'connectors', 'modules', 'seed'), ('preflights', 'identity', 'providers'))
     need(value['schema'] == 'connectome.spawn-template/v2', 'unsupported template schema')
     names(value['runtime'])
     names(value.get('preflights', []))
     names(value['connectors'])
     names(value['modules'], MODULES)
     seed_policy(value['seed'])
+    from .providers import provider_policy
+    need('providers' not in value or type(value['providers']) is dict, 'provider policy must be an object')
+    provider_policy(value.get('providers'))
     from .identity import identity_policy
     need('identity' not in value or type(value['identity']) is dict, 'identity policy must be an object')
     identity_policy(value.get('identity'))

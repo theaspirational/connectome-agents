@@ -1,4 +1,4 @@
-# Offline spawn planning and lifecycle
+# Offline spawn planning and explicit provider APIs
 
 `connectome-spawn validate|plan|dry-run|status` is read-only. It does not install,
 extract archives, run catalog commands, acquire dependencies, contact providers,
@@ -21,7 +21,10 @@ This layout permits Ansible's module-utils dependency bundling without requiring
 an independently installed target package. The existing deployment module is
 **not rewired**: a future frontend must explicitly call this API, without
 reimplementing validation or compilation. The shared module-utils lifecycle API
-adds offline persistence and adapter contracts; see
+adds offline persistence and adapter contracts. Explicit Python provider APIs
+now implement Zulip identity provisioning, local direct-key/inference-gate token
+consumption and optional file secrets; **planning never instantiates them**.
+There is still no apply/start implementation or role/chat integration; see
 [seed modes and initiation](spawn-lifecycle.md). No variable merging, `become`, ambient
 Ansible facts, environment defaults or private inventory enter the CLI.
 
@@ -236,7 +239,12 @@ Source documents are limited to 1 MiB/depth 32 and artifact payloads/trees to
 64 MiB each. No unpacking, archive safety or executable/ABI qualification is
 claimed. Runtime closure larger than that limit needs an explicit future change.
 
-Secret names become recipe requirements, never values. Catalog commands are
+Secret names become optional recipe requirements, never values. Identity (a new
+Zulip bot) and AI access (a gate agent token OR a direct key) are the only mandatory
+provider capabilities; extra file secrets/integrations are never mandatory for
+creating an agent. Their own explicitly requested execution may need an adapter.
+
+Catalog commands are
 trusted policy input and are recorded/compiled but never run. Do not let an
 untrusted API caller supply or modify the catalog. Hashes establish consistency,
 not catalog authentication. The current default catalog may intentionally fail
@@ -286,7 +294,38 @@ plan to current target observations and authorization; a key alone does not
 make effects safe to retry.
 
 Plans include `seed.mode`, the explicit `seed.branch`, a computed digest (never
-seed bytes), ordered `lifecycle` steps with `needsProvider`, and `providerActions`.
+seed bytes), ordered `lifecycle` steps with `needsProvider` (a list of provider
+kinds), and structured `providerActions`. Actions distinguish implemented
+`automatic` provider work from `operator-required` credential provisioning,
+privileged access provisioning and unimplemented deployment/seed hooks. They
+include no secret values or operator credential paths. Automatic work is still
+**intent only**, never executed or authorized by plan/dry-run.
+
+Zulip identity is declared first. AI access defaults to an explicit operator
+choice between `direct-key` and `inference-gate` (`providerSelection: one-of`),
+not both providers or an inferred credential.
+Optionally select its public intent in a template:
+
+```yaml
+providers:
+  aiAccess:
+    kind: inference-gate
+    pool: example-pool
+    limit: 100
+```
+
+Or select `aiAccess: {kind: direct-key}`. This closed policy accepts no credential
+paths/values. Gate provisioning is always a privileged operator action; its token
+file may be absent, in which case the explicit provider API reports
+`awaiting-provisioning`. No gate command or gate HTTP client exists here. The
+configured integer limit is only recorded intent, not a verified quota.
+
+For explicit Python provider construction, file/ownership rules, conservative
+Zulip capabilities, durable receipts and recovery limits see
+[provider APIs](spawn-lifecycle.md#t4-slice-1-providers-now-available). Operator
+configuration stays role-only. The provider APIs do not connect the existing
+role to lifecycle execution; T5/frontend must do that with authorization and
+runtime safeguards.
 Optional `--name-repo "$CONFIG_REPO+names/example-agent.json@$FULL_COMMIT"` or
 `--name-file PATH` adds `plan.nameRecord` with the validated record, content-only
 recordHash and pinned provenance. The bootstrap recipe is unchanged; these are
@@ -302,3 +341,9 @@ recovery and `status <agent> --state-root PATH`.
 Run `scripts/test.sh` for offline regression tests, including source equivalence,
 strict refusals, catalog fixture compatibility, symbolic admission, CLI
 read-only behavior and import parity with the Ansible module-utils namespace.
+
+Run `python3 scripts/test-spawn-provider-mutations.py` for the isolated provider
+mutation gate (private-file checks, native ownership/persona, pending-create
+replay and missing-token readiness). It copies fixtures under `.cache`, never
+changes production sources, and requires a green baseline plus five killed
+mutations.

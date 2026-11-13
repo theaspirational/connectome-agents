@@ -1,10 +1,19 @@
-# Seed modes and clean-start initiation (offline core)
+# Seed modes, clean-start initiation and explicit providers
 
-This package supplies **no real providers, no network calls and no apply CLI**.
-Plan/dry-run describe intent; they still say `activationAllowed: false`. Only
-explicitly injected adapters can perform effects through the Python lifecycle
-API. The included identity provider is a local file fake; tests supply fake
-deployment and seed adapters. This is not a qualified service deployment path.
+Plan/dry-run remain offline and always say `activationAllowed: false`. The
+Python API now includes an explicitly configured **Zulip identity provider**,
+local AI-access providers and a file-secret provider. Only explicit provider
+calls perform effects; merely importing the package or planning never contacts
+Zulip or reads credentials. There is **no apply/start CLI, lifecycle execution
+adapter, role wiring or chat frontend**. Tests still use fake deployment and
+seed adapters. This is not a qualified service deployment path.
+
+A new agent requires only **its own identity (a Zulip bot)** and **AI access
+(an inference-gate agent token OR a direct provider key)**. Runtime integrations,
+extra secrets, connectors, subscriptions, seed import and other platform actions
+are optional; choosing one may require its adapter, but none is an additional
+mandatory provider for agent creation. No orchestration service is a spawn
+backend dependency. Only Zulip transport provisioning is implemented.
 
 ## Modes
 
@@ -185,12 +194,12 @@ the now-permanent handle.
 
 The same functions are importable as `ansible.module_utils.connectome_spawn`.
 The existing role deployment engine is **not automatically wired** to these
-APIs; T4 must explicitly connect its frontend/role execution to them and use
+APIs; T5 must explicitly connect its frontend/role execution to them and use
 `read_name_record`, not bypass validation or install planner draft recipes.
 
 Per-agent files are `ROOT/AGENT/lifecycle.json`, `ROOT/AGENT/state/store/`, and
 `ROOT/AGENT/state/seed.consumed`. The latter is the required `state/seed.consumed`;
-T4 must bind this external store without copying/resetting memory. Completed
+T5 must bind this external store without copying/resetting memory. Completed
 operation ids and input digests live in the lifecycle file. Same id plus same
 input is a no-op, even after restart or later transitions; id reuse with changed
 input is refused. IDs use 1–128 ASCII letters, digits, underscore or hyphen.
@@ -208,7 +217,7 @@ No exactly-once external effect guarantee is claimed.
 An ordinary explicit failed transition is supported, but pending uncertain
 operations block every transition, including failed/retired: an operator must
 first reconcile service, memory and identity-provider reality. This version
-deliberately has no recovery/reset CLI. T4 must supply an audited recovery mechanism rather than
+deliberately has no recovery/reset CLI. T5 must supply an audited lifecycle recovery mechanism rather than
 assuming an interrupted effect did not happen. Symlink persistence paths and
 corrupt state are refused. Same-uid hostile path races and state tampering are
 outside the trusted-caller boundary. The journal is bounded to 1 MiB; no automatic
@@ -231,6 +240,7 @@ contains protected prompt/identity data: keep its output private.
 * `provision_permanent(agent, name_record, operation_id) -> handle`
 * `rename(handle, name_record, operation_id) -> handle` (same handle)
 * `retire(handle, operation_id)`
+* `list() -> list` (credential-free ownership/liveness observations)
 
 Handles are closed `{id, agent}` data: a stable provider-local id (1–128 ASCII
 letters/digits/underscore/hyphen) and the owning agent identifier. They contain
@@ -248,33 +258,137 @@ reconciliation if the agent crashed. Retired records are retained, never leased
 or reused. Uncertain real effects still require recovery through the lifecycle
 journal; the fake's atomic local operation is not proof of provider atomicity.
 
-T4 must supply, **Zulip first**:
+### T4 slice 1: providers now available
 
-* A real Zulip identity-provider adapter and credentials. Provision a new bot
-  identity per newborn; declare actual rename support and name limits. Preserve
-  exclusive ownership, durable operation receipts and idempotent retirement.
+`ZulipIdentityProvider(root, zuliprc=..., secrets_root=...)` implements the exact
+identity interface. Configuration is role-only Python API input, **not** a
+public template, CLI credential ingress, environment default or plan field.
+The operator supplies a dedicated human administrator's zuliprc-style file:
+`[api]` with exactly `email`, `key`, `site`. It must belong to the executing uid
+and have mode **0600**; the shared reader also refuses symlinks in every
+component, hard links and non-regular files. Credential bytes, their input path,
+and the raw operator email/site never enter handles, journals, plans or status.
+Use a least-privilege dedicated operator account: a bot inherits transport
+visibility from its owner. No subscriptions are created by this provider.
+
+Capabilities are `supports_rename=True`, `max_name_length=63`,
+`name_pattern=[A-Za-z][A-Za-z0-9_-]*`. Rename is supported by Zulip's
+`PATCH /api/v1/bots/{id}` with `full_name`; retirement uses
+`DELETE /api/v1/bots/{id}` (deactivation, not deletion/recycling).
+**63 and this ASCII grammar are conservative adapter-supported limits, not
+assertions of Zulip's universal server maxima/complete charset.** The reference
+API client does not establish universal realm/version limits. Stricter server
+policy can still refuse a name; names are never truncated. Provision/rename
+set `full_name` to the exact logical `name` (temporary name or name-record name),
+not `displayName`. Native email/short name remains unchanged on promotion.
+
+Create uses `POST /api/v1/bots` (`bot_type=1`), `GET /api/v1/bots` for owned bots,
+`GET /api/v1/users/me`, member listing (`include_deactivated=true`) and individual
+user reads for ownership, name and activity verification. The adapter requires
+modern responses with `owner_id` on owned bots, `bot_owner_id` on individual
+users, and deactivated users visible in member listings. Unsupported/incomplete
+responses fail closed. It requires a human owner/admin role (100 or 200).
+Production transport is HTTPS with normal certificate verification, no proxy
+inheritance and no redirects. `allow_loopback_http=True` permits only the IPv4
+loopback literal for offline tests; it does not enable arbitrary plaintext sites.
+Errors are value-free and never include response bodies, headers or credentials.
+
+The provider serializes writers and journals a random stable handle and its
+native short name (`spawn` plus handle id) **before POST**. This opaque native
+address is not a renamed display persona. Preflight refuses collisions, including
+existing operator-owned bots with identical full names, foreign bots and inactive
+accounts. A matching short-name prefix with a different full_name is always
+refused, as is a different owner. No unjournaled existing bot is adopted.
+After POST (including a lost response), owned-bot listing and an individual user
+read reconcile the reservation. Retries after process death find that same bot,
+not a second POST. If no effect is observable after submission, the operation
+stays pending and POST is **never blindly repeated**, even after a 4xx/5xx. This
+also covers a crash just before POST: an operator must reconcile the no-effect
+case. New operation ids cannot bypass pending work for that agent. Observed,
+owned rename/deactivate retries are idempotent assignments; completed operation
+ids bind exact intent, including the entire validated name record.
+
+Provider receipts are `root/zulip.json`, locked and atomically fsynced, with
+retired tombstones kept permanently. Realm/operator/delivery-root binding is a
+non-secret digest; changing that binding is refused, while operator key rotation
+is allowed. Bot API keys are delivered only to
+`secrets_root/AGENT/HANDLE_ID.key`: a single atomic **0600** byte file in a newly
+created **0700** directory. No key is serialized into a receipt or handle, and
+conflicting or unsafe existing key files are refused rather than overwritten.
+Delivery uses one deterministic private staging inode (`.HANDLE_ID.key.pending`);
+a retry promotes that same inode after an interruption, never accumulates extra
+key copies. Partial/conflicting staging bytes require operator reconciliation.
+Completed create retries also refuse a missing/unsafe delivery file. Retired
+keys remain private files but the bot is inactive; key cleanup/rotation is an
+operator concern. `list()` observes only reserved/owned identities, reports
+activity and pending reconciliation, and never returns API keys. Lost create
+receipts are discoverable via listing, but this is **not** automatic replay or
+recovery of a pending `Lifecycle` journal.
+
+`AIAccessProvider` declares `kind`, `plan(agent)` and
+`provision(agent, operation_id)`. Built-ins:
+
+* `DirectKeyProvider(root, key_file=...)`: the operator supplies a file; provision
+  validates it locally and records only its absolute path and SHA-256 digest,
+  never its bytes. No provider request or authorization/quota check is performed.
+* `InferenceGateProvider(root, token_file=..., pool=..., limit=...)`: plan returns
+  an **operator-required privileged action** with agent, pool and limit. Pool
+  uses a safe ASCII identifier (1–63 characters); limit is a positive integer
+  up to 10,000,000, an opaque planning input, not a claimed enforcement unit.
+  The provider never runs a command, invokes gate tooling or contacts the gate.
+  Until the operator provisions the agent token and supplies the file, provision
+  returns **`awaiting-provisioning`**, never ready/success. Ready means safe local
+  bytes exist, not proof of their validity, agent binding or applied pool/limit.
+
+Both use `root/access.json` for agent-scoped operation receipts, bind exact
+intent/path, and allow an awaiting operation to become ready on the same id.
+They refuse unsafe input or a changed/disappeared ready file. Direct keys also
+report awaiting-provisioning if absent. All key/token files require current-uid
+ownership, exact 0600, no symlink components and a single regular-file link.
+The operator is responsible for access-token authenticity and per-agent binding.
+
+`FileSecretProvider(secrets_root).resolve(agent, declared_names)` maps each
+explicit uppercase secret name to `secrets_root/AGENT/NAME`. It returns only
+path/digest metadata, reads with the same private-file rules, and never searches
+the environment or creates/copies secrets. Requesting an absent/unsafe file is
+refused; omitting an optional integration never requires that file.
+
+### Plan declarations and remaining T5/frontend work
+
+Plans now include structured `providerActions` with `providerKinds`, `execution`
+(`automatic` or `operator-required`) and `required`. `lifecycle[].needsProvider`
+is a list of real kinds, not a boolean. Mandatory steps are Zulip identity and
+AI access; extra file secrets and deployment/import hooks are marked optional.
+Only explicitly selecting an integration can make its own execution depend on
+an adapter. `automatic` means implemented by an explicitly called provider,
+**not** executed by planning or permission to apply. Adapter hooks still show
+`operator-required` and `available: false`; no platform success is invented.
+AI access explicitly uses `providerSelection: one-of`, never requires both
+alternatives. Unselected access also reports `selectionRequired: true`.
+Optional template `providers.aiAccess` chooses `direct-key` or `inference-gate`
+(the latter requires public pool/limit intent). Credential paths/values are
+rejected in this public policy. Conditional identity steps retain `when` tied
+to `provider.supports_rename`; an offline plan still assumes no injected provider
+capability (`identity.supportsRename: null`). Seeded plans now also declare
+permanent identity and AI access prerequisites; the lifecycle executor is not
+changed or qualified by these planning declarations.
+
+Still required in **T5/later frontend slices**, not implemented here:
+
 * `LifecycleAdapter.perform(step, context, operation_id)` implementations for
-  build/hold, join/start initiation, redeployment with memory kept, activation,
-  topic closure and retirement. Each receives a distinct `operation_id:step`;
-  context includes chosen identity, home, store, owned identity handles, literal
-  topic `initiation` and `initiationParticipants: home-channel-members`.
-  Never activate on build/hold; never retire temporary identity before permanent
-  redeploy acknowledges completion; never retire a successfully renamed identity
-  as part of promotion. Identity creation/rename/retirement use the separate
-  IdentityProvider interface, not deployment callback return values.
+  build/hold, join/start initiation, memory-preserving redeploy, activation,
+  topic closure and retirement. Never activate on build/hold, retire a temporary
+  bot before permanent redeploy, or retire a successfully renamed bot on promotion.
 * Initiator name-record commits (self-naming only on explicit request with repo
-  write access) during home-channel dialogue,
-  routing and subscriptions open to channel members, runtime memory binding,
-  external observations/reconciliation, and durable seed import adapters.
-* Existing role safeguards: concrete symbolic build binding, authorization,
-  provider-safe retries/reconciliation, secret handling, health and rollback.
-  A lifecycle journal or plan hash alone grants none of these permissions.
+  write access), home-channel dialogue/routing/subscriptions, runtime memory
+  binding, durable seed import and external reconciliation/recovery mechanisms.
+* Role/frontend authorization and integration of the two mandatory providers,
+  concrete symbolic build binding, health, rollback and audited lifecycle recovery.
+  Neither a journal nor a plan hash grants permission or makes an interrupted
+  lifecycle transition safe to replay. No apply/start command is supplied.
 
-All provider requirements appear in plan/dry-run `lifecycle[].needsProvider` and
-`providerActions`; conditional steps have `when` tied to `provider.supports_rename`.
-Only intent/record bookkeeping is local; the fake is not a real transport.
-Tests exercise transitions, refusals, concurrent per-agent provisioning, restarts,
-process death, interrupted effects and atomic persistence without any service.
+Offline tests use local files and an in-process loopback fake HTTP server;
+no real credentials, provider traffic or privileged platform commands are used.
 
 ### Local input path boundary
 
@@ -297,8 +411,9 @@ Symlinked roots are deliberately unsupported, even when their targets are
 inside the configured tree.
 
 This shared rule covers name records; opaque seed files; lifecycle/status
-`lifecycle.json` and `state/seed.consumed`; the fake identity provider's
-`identities.json`; and file-backed template, instance, stores, observed-state,
+`lifecycle.json` and `state/seed.consumed`; identity-provider state (`identities.json`,
+`zulip.json`) and AI-access receipts; private operator/key/token/declared-secret
+files; and file-backed template, instance, stores, observed-state,
 catalog descriptor/versions and payload inputs. State-root/store path checks
 also continue to reject symlinks. Store contents belong to the injected adapter
 and are not read by the spawn core. Persistence writes retain the documented

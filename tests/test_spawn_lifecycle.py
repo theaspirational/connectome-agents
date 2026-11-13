@@ -101,11 +101,11 @@ class LifecycleTests(unittest.TestCase):
         (repo / 'names/agent.json').write_text(json.dumps(record))
         (repo / 'link.json').symlink_to('names/agent.json')
         git('add', '.')
-        git('-c', 'user.name=Fixture Committer', '-c', 'user.email=committer@example.invalid',
-            'commit', '-qm', 'Name record', '--author=Fixture Initiator <initiator@example.invalid>')
+        git('-c', 'user.name=Fixture Committer', '-c', 'user.email=noreply@users.noreply.github.com',
+            'commit', '-qm', 'Name record', '--author=Fixture Initiator <contributors@users.noreply.github.com>')
         commit = git('rev-parse', 'HEAD')
         git('update-index', '--add', '--cacheinfo', '160000,' + commit + ',submodule')
-        git('-c', 'user.name=Fixture Committer', '-c', 'user.email=committer@example.invalid',
+        git('-c', 'user.name=Fixture Committer', '-c', 'user.email=noreply@users.noreply.github.com',
             'commit', '-qm', 'Gitlink refusal fixture')
         return {'kind': 'repo', 'repo': str(repo), 'commit': git('rev-parse', 'HEAD'), 'path': 'names/agent.json'}
 
@@ -121,13 +121,13 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(named['recordHash'], file_named['recordHash'])
         self.assertEqual(named['source'], dict(source, blob=expected_blob,
             author=named['source']['author'], committer=named['source']['committer']))
-        self.assertTrue(named['source']['author'].startswith('Fixture Committer <committer@example.invalid>'))
-        self.assertTrue(named['source']['committer'].startswith('Fixture Committer <committer@example.invalid>'))
+        self.assertTrue(named['source']['author'].startswith('Fixture Committer <noreply@users.noreply.github.com>'))
+        self.assertTrue(named['source']['committer'].startswith('Fixture Committer <noreply@users.noreply.github.com>'))
         # Author is informational, not an identity/permission check. Use the
         # first commit to exercise a distinct initiator author and committer.
         first = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD^']).decode().strip()
         authored = read_name_record(dict(source, commit=first), with_provenance=True)['source']
-        self.assertTrue(authored['author'].startswith('Fixture Initiator <initiator@example.invalid>'))
+        self.assertTrue(authored['author'].startswith('Fixture Initiator <contributors@users.noreply.github.com>'))
         self.assertNotEqual(authored['author'], authored['committer'])
         (repo / source['path']).write_text('uncommitted invalid input')
         subprocess.run(['git', '-C', str(repo), 'update-ref', 'HEAD', first], check=True)

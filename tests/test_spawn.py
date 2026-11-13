@@ -108,7 +108,7 @@ class SpawnTests(unittest.TestCase):
         record = {'name': 'ChosenAgent', 'displayName': 'Chosen Agent', 'summaryParticipant': 'ChosenAgent'}
         (self.repo / 'name.json').write_text(json.dumps(record))
         git(self.repo, 'add', 'name.json')
-        git(self.repo, '-c', 'user.name=Fixture Initiator', '-c', 'user.email=initiator@example.invalid',
+        git(self.repo, '-c', 'user.name=Fixture Initiator', '-c', 'user.email=contributors@users.noreply.github.com',
             'commit', '-qm', 'Chosen name')
         commit = git(self.repo, 'rev-parse', 'HEAD')
         source = {'kind': 'repo', 'repo': str(self.repo), 'commit': commit, 'path': 'name.json'}
@@ -453,6 +453,46 @@ class SpawnTests(unittest.TestCase):
             outputs.append(json.loads(result.stdout))
         self.assertTrue(all(p == outputs[0] for p in outputs))
 
+    def test_real_provider_plan_metadata_is_data_only_and_optional_extras(self):
+        original = self.plan()['plan']
+        kinds = {k for a in original['providerActions'] for k in a['providerKinds']}
+        self.assertTrue({'zulip', 'direct-key', 'inference-gate', 'file'} <= kinds)
+        self.assertTrue(any(s['needsProvider'] == ['file'] and not s['required'] for s in original['lifecycle']))
+        self.assertTrue(any(a['selectionRequired'] for a in original['providerActions'] if 'selectionRequired' in a))
+        self.assertEqual(next(s for s in original['lifecycle'] if s['step'] == 'ai-access')
+                         ['providerSelection'], 'one-of')
+        self.assertTrue(all(not a['required'] for a in original['providerActions'] if
+                            set(a['providerKinds']) & {'file', 'lifecycle-adapter', 'seed-import-adapter'}))
+        spec = deepcopy(self.spec)
+        spec['providers'] = {'aiAccess': {'kind': 'inference-gate', 'pool': 'example-pool', 'limit': 100}}
+        with patch('connectome_spawn.zulip.api_call', side_effect=AssertionError('no network')), \
+             patch('connectome_spawn.providers.file_metadata', side_effect=AssertionError('no credential read')):
+            plan = self.plan(spec)['plan']
+        supply = next(a for a in plan['providerActions'] if a['step'] == 'supply-ai-access')
+        self.assertEqual(supply['execution'], 'operator-required')
+        self.assertTrue(supply['privileged'])
+        self.assertEqual(supply['inputs'], {'agent': 'example-instance', 'pool': 'example-pool', 'limit': 100})
+        self.assertEqual(next(s for s in plan['lifecycle'] if s['step'] == 'ai-access')['needsProvider'], ['inference-gate'])
+        self.assertNotEqual(self.plan()['planHash'], self.plan(spec)['planHash'])
+        self.assertFalse(plan['activationAllowed'])
+        self.assertFalse(plan['filesWritten'])
+        (self.work / 'template.json').write_text(json.dumps(spec))
+        before = {str(p): p.read_bytes() for p in self.work.rglob('*') if p.is_file()}
+        dry = self.cli('dry-run')
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(json.loads(dry.stdout)['plan'], plan)
+        self.assertEqual(before, {str(p): p.read_bytes() for p in self.work.rglob('*') if p.is_file()})
+        for bad in (None, [], {'zuliprc': '/absolute/operator.ini'}, {'aiAccess': {'kind': 'unknown'}},
+                    {'aiAccess': {'kind': 'direct-key', 'key': 'credential-data'}},
+                    {'aiAccess': {'kind': 'direct-key', 'pool': 'example-pool'}},
+                    {'aiAccess': {'kind': 'inference-gate', 'pool': 'example-pool', 'limit': 0}}):
+            spec['providers'] = bad
+            with self.assertRaises(SpawnError):
+                self.plan(spec)
+        spec['providers'] = {'aiAccess': {'kind': 'direct-key'}}
+        self.assertEqual(next(s for s in self.plan(spec)['plan']['lifecycle'] if s['step'] == 'ai-access')
+                         ['needsProvider'], ['direct-key'])
+
     def test_seed_plans_cli_and_v1_migration(self):
         spec = deepcopy(self.spec)
         for mode in ('required', 'optional', 'clean'):
@@ -466,11 +506,14 @@ class SpawnTests(unittest.TestCase):
                 self.assertEqual(result['seed']['mode'], mode)
                 self.assertEqual(result['seed']['branch'], 'seeded' if payload else 'clean')
                 steps = result['lifecycle']
-                self.assertEqual(result['providerActions'], [s['step'] for s in steps if s['needsProvider']])
+                self.assertEqual([a['step'] for a in result['providerActions'] if a['step'] in
+                                  {s['step'] for s in steps}], [s['step'] for s in steps if s['needsProvider']])
+                self.assertTrue(all(type(s['needsProvider']) is list for s in steps))
                 self.assertFalse(result['activationAllowed'])
                 if payload:
                     self.assertEqual([s['step'] for s in steps],
-                                     ['build', 'hold', 'ingest', 'seed.consumed', 'activate'])
+                                     ['provision-permanent', 'ai-access', 'validate-optional-secrets',
+                                      'build', 'hold', 'ingest', 'seed.consumed', 'activate'])
                     self.assertEqual(result['seed']['digest'], hashlib.sha256(payload).hexdigest())
         spec['seed'] = {'mode': 'optional'}
         (self.work / 'template.json').write_text(json.dumps(spec))

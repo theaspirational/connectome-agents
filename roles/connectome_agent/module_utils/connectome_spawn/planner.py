@@ -9,6 +9,7 @@ from .catalog import (artifact_relative, local_roots, pin, resolve, resolve_runt
 from .data import BUILD_BINDING, canonical, digest, fields, json_data, match, need
 from .schema import concrete, instance, read_name_record, template
 from .seed import seed_intent, lifecycle_steps
+from .providers import plan_providers
 
 ARTIFACT_TOKEN = re.compile(r'\{artifact:([a-z0-9][a-z0-9_-]{0,62})\}')
 
@@ -180,6 +181,7 @@ def make_plan(template_value, instance_value, catalog, stores, *, observed=None,
         content = canonical(value).decode('utf-8') + '\n'
         files.append({'path': paths['config'] + '/' + filename, 'mode': '0600',
                       'content': content, 'sha256': hashlib.sha256(content.encode('utf-8')).hexdigest()})
+    steps, provider_actions = plan_providers(steps, spec.get('providers'), declaration['instance'], requirements)
     selection = {'descriptors': {n: trusted.descriptors[n] for n in selected},
                  'pins': {n: pin(trusted, n) for n in selected},
                  'runtime': trusted.versions['runtime'], 'platform': platform}
@@ -194,9 +196,9 @@ def make_plan(template_value, instance_value, catalog, stores, *, observed=None,
             'runtimeSources': runtime_sources, 'artifacts': artifacts, 'recipe': recipe, 'layout': layout,
             'exports': exports, 'preflights': preflights, 'platformPins': platform,
             'seed': seed, 'lifecycle': steps, 'home': declaration['home'], 'rights': declaration['rights'],
-            'providerActions': [s['step'] for s in steps if s['needsProvider']], 'files': files, 'observed': observed,
+            'providerActions': provider_actions, 'files': files, 'observed': observed,
             'activationAllowed': False, 'filesWritten': False,
-            'limitations': ['planning-only', 'provider-adapters-not-implemented', 'home-binding-not-provisioned',
+            'limitations': ['planning-only', 'lifecycle-adapter-not-implemented', 'home-binding-not-provisioned',
                             'rights-not-authorized', 'runtime-closure-not-qualified', 'platform-not-probed']}
     if named is not None:
         # This is the future named transition's input, not the bootstrap recipe.

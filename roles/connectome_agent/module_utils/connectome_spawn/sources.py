@@ -27,14 +27,15 @@ def absolute(value):
     return value
 
 
-def read_file(path, limit=LIMIT, *, root=None):
+def read_file(path, limit=LIMIT, *, root=None, private=False):
     """Read a bounded, single-link regular file without any symlink component.
 
     Paths are literal: never normalize away '..'. An explicit root is a
     containment boundary, not a base for interpreting relative input paths.
     Linux dir-fd traversal pins each directory; /proc confirms the opened file
     still resides beneath the boundary before any bytes are read. Refuse hard
-    links because their other names may be outside that boundary.
+    links because their other names may be outside that boundary. With private=True,
+    validate current-uid ownership and exact mode 0600 on the opened fd too.
     """
     path = Path(path).absolute()
     boundary = Path(root).absolute() if root is not None else path.parent
@@ -54,6 +55,9 @@ def read_file(path, limit=LIMIT, *, root=None):
             metadata = os.fstat(stream.fileno())
             need(stat.S_ISREG(metadata.st_mode), 'regular input file required')
             need(metadata.st_nlink == 1, 'single-link input file required')
+            if private:
+                need(metadata.st_uid == os.geteuid() and stat.S_IMODE(metadata.st_mode) == 0o600,
+                     'private input requires current owner and mode 0600')
             resolved = Path(os.readlink('/proc/self/fd/' + str(stream.fileno())))
             need(resolved.is_absolute() and resolved.is_relative_to(boundary) and
                  not str(resolved).endswith(' (deleted)'), 'input escapes root')
