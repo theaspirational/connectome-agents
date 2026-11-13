@@ -25,7 +25,8 @@ and change the template schema to `connectome.spawn-template/v2`.
 
 * **required**: supply opaque seed bytes (`--seed-file` for planning). Steps are
   build, hold **without activation**, ingest, durably write `state/seed.consumed`
-  containing computed SHA-256 `digest` and UTC ISO-8601 `timestamp`, then activate.
+  containing computed SHA-256 `digest` and UTC ISO-8601 `timestamp`, then start
+  and pass the journaled serviceReady gate before recording `active`.
   Activation checks concrete name, summaryParticipant and home
   channel, plus a concrete systemPrompt when present. Nothing starts the seeded agent before the receipt is committed.
 * **clean**: rejects seed bytes; follows the initiation flow below.
@@ -66,12 +67,15 @@ The normal clean path is `planned -> initiation -> named -> active`:
    record and provenance, not a dependency on later repo/file availability.
 4. Check the provider's `supports_rename` capability:
    * **replace** (`false`): provision a distinct permanent identity using the
-     chosen name, redeploy with the same memory store, then retire the temporary
-     identity. It is never reused or returned to a pool.
+     chosen name, redeploy with the same memory store, pass serviceReady,
+     close initiation, then retire the temporary identity. It is never reused
+     or returned to a pool.
    * **rename** (`true`): rename the temporary identity using the chosen name
      record. The same handle becomes permanent; redeploy with memory kept.
      Do **not** retire that handle as temporary cleanup.
-   Close the initiation topic. State becomes `active` only after all steps.
+   Both paths require serviceReady (health plus every selected connector
+   handshake) before closing initiation or recording `active`. Unknown/failed
+   probes keep promotion pending; no temporary identity is deactivated.
 
 Optional template configuration (the shown value is the default):
 
@@ -340,10 +344,33 @@ refusal, an individual-user read verifies the real bot state: an unchanged
 rename on its **first attempt**, or still-active retirement, releases only
 that intent with a retryable/terminal label. A rename with any earlier ambiguous
 attempt stays pending: that earlier PATCH may still land after a later refusal;
-an already-applied effect completes normally. Failed or inconsistent observation
-keeps the intent pending, as do ambiguous mutation responses with no observed
+an already-applied effect completes normally. A subsequent terminal refusal
+reports its HTTP status/category and directs the operator to `recover_rename`.
+Failed or inconsistent observation keeps the intent pending, as do ambiguous mutation responses with no observed
 effect. Completed operation ids bind exact intent, including the entire
 validated name record.
+
+For an ambiguous rename followed by a terminal refusal, retrying the identical
+rename re-observes a late commit. To resolve the no-effect case without editing
+JSON, use the explicit Python API:
+
+```python
+provider.recover_rename(handle, operation_id, observed="not-applied",
+    reason="All earlier requests settled; unchanged owned bot observed",
+    evidence_reference="operator-maintained-case-reference", settled=True)
+```
+
+Before asserting `settled=True`, the operator must settle/cancel **every earlier
+in-flight PATCH** using provider-side request tracing/administrative evidence.
+An unchanged GET alone is insufficient. If that cannot be established, keep the
+intent pending. Recovery requires a nonblank evidence reference and reason,
+re-observes ownership/name/activity, and atomically journals the original intent,
+uid/euid, time, statement and observation before releasing it. `observed="applied"`
+resolves an observed late commit to the original permanent handle instead.
+Neither branch sends PATCH/DELETE or replays a rename. A separate subsequent
+provider operation is explicit. This is an audited operator assertion, **not**
+an automated remote-quiescence guarantee or a new CLI/provider connection.
+Reasons/references must not include credentials.
 
 Provider receipts are `root/zulip.json`, locked and atomically fsynced, with
 retired tombstones kept permanently. Realm/operator/delivery-root binding is a
@@ -489,9 +516,10 @@ The existing low-level Lifecycle API remains usable with explicit test adapters.
 | hold | install user unit without start, from the **same** prepared build |
 | join-initiation | join the agent's owned identity to home channel/topic initiation, home-channel members may participate |
 | start-initiation / activate | install-only then switch/start the prepared build, supplying the current owned transport identity |
-| redeploy-keep-memory | render chosen identity (absent prompt stays absent), fresh build, switch/start with the **same** external store; acknowledge before temporary retirement |
-| close-initiation | close topic, no identity recycling |
-| retire | stop user unit, then provider deactivation of current owned identities; close any still-open initiation; retain store and journals |
+| redeploy-keep-memory | render chosen identity (absent prompt stays absent), fresh build, switch/start with the **same** external store; acknowledge, then pass journaled serviceReady before closing initiation or temporary retirement |
+| serviceReady | journal service-health and an MCP handshake for every selected connector; require evidenced success before active/topic closure/temporary retirement |
+| close-initiation | close topic while participating identities are still live; no identity recycling |
+| retire | stop user unit; close any still-open initiation **before** provider deactivation of current owned identities; retain store and journals |
 
 Each executor request receives explicit inputs and a stable
 `operation:step:action` id; identity/import steps use `operation:step`. The
@@ -529,7 +557,8 @@ does not claim that translation or production runtime qualification is complete.
 
 ### Honest verification stages
 
-`verify(operation_id)` separately journals all observations/probes and records:
+`verify(operation_id)` is allowed only in `initiation` and `active` (never
+retired/failed/planned/named). It separately journals observations/probes and records:
 
 * `serviceReady`: executor service-health evidence **and** an MCP probe for each
   selected connector: start connector, initialize MCP, `tools/list`, close.
@@ -543,8 +572,21 @@ does not claim that translation or production runtime qualification is complete.
 Only an applied receipt with nonempty structured evidence and the stage's
 explicit true result qualifies as success. Missing/incomplete/negative evidence
 is conservatively unknown, never success. Verification does not send a test chat
-message or authenticate through a real service here. Probes also have durable
-intent; lost acknowledgements block blind re-probing. Distinct verification ids
+message or authenticate through a real service here.
+
+Promotion and seeded activation run the same checks as a **journaled gate**,
+not a prior verify receipt: `serviceReady:service-health`, then
+`serviceReady:mcp-handshake:CONNECTOR`. Only successful gate probes complete;
+unknown/failed probes leave an explicit pending serviceReady status, keep the
+temporary bot live (a renamed handle stays live as permanent), and prevent
+initiation closure and `active`. Provider authentication and real reply remain
+independent observations, not activation prerequisites. To retry a closed,
+unsuccessful probe, first reconcile its exact descriptor/id and establish no
+in-flight probe remains; explicitly recover that checkpoint as `not-applied`
+when the observer permits it, then continue the original operation. A lost
+successful probe receipt can instead be recovered from the observer's original
+result, without re-running the connector. Recovery never invents probe success.
+Probes also have durable intent; lost acknowledgements block blind re-probing. Distinct verification ids
 request fresh observations; an identical completed id is a no-op.
 
 `reconcile()` only asks the executor to observe the exact pending effect, or
@@ -574,12 +616,33 @@ not-applied; an unknown observation alone is never retry authorization.
 
 A handle-producing operation requires the observer's original owned handle;
 the CLI cannot fabricate one. Such lost-handle recovery needs the Python API
-with an injected observer. Durable completed checkpoints cannot be rolled back
+with an injected observer. Promotion/activation switch-start and ingest also
+require an **applied observer result with nonempty evidence**; an operator's
+reason alone is insufficient, so the observer-less CLI refuses `--observed applied`
+for these unresolved checkpoints. Use the bound Python backend with a trusted
+observer that checks the exact deployment or durably completed import. For an
+import, first validate the full expected store against the planned seed digest;
+a partial store is not applied, and must never receive `seed.consumed`. Leave
+unknown imports pending rather than deleting stores/receipts or asserting success.
+The same evidence rule applies to gate probes. Durable completed checkpoints
+cannot be rolled back
 by saying not-applied. Legacy pending journals without checkpoint history are
 refused for continuation and need an external migration/reconciliation procedure;
 there is no unsafe automatic migration, deletion/reset or auto-replay command.
 Recovery statements/observations may write the local journal even on failure;
 CLI errors for these commands report filesWritten as unknown rather than false.
+Known lifecycle failures include fixed, value-free `code`/`detail` fields (unknown
+agent, pending mismatch, contradiction, completed checkpoint, missing evidence).
+Unclassified/parser errors remain generic; input values are never echoed.
+A misspelled agent in status/reconcile/recover creates no directory or lock.
+
+Residual audit limits: journals are private atomic JSON, not hash-chained,
+signed or append-only; same-uid edits are outside the trust boundary. Reconcile
+and receipt/audit history still grow without compaction. The 1 MiB journal cap
+fails closed and can stop progress; rotation/archival needs a separately designed
+operator procedure, not deletion of evidence. uid/euid do not identify the
+original login/sudo user. These are not tamper-evidence or unbounded-liveness
+claims.
 
 Retirement deactivates rather than deletes/recycles the provider identity,
 stops the unit and **keeps memory, seed receipts, config and ownership evidence**.

@@ -40,6 +40,11 @@ class FakeAdapter:
         if step == self.fail:
             raise RuntimeError('simulated crash after effect')
 
+    def verify(self, context, operation_id, checkpoint):
+        health = checkpoint('service-health', lambda: {
+            'state': 'applied', 'evidence': {'fixture': operation_id}, 'result': {'ready': True}})
+        return {'serviceReady': {'state': 'success', 'evidence': {'health': health, 'mcp': {}}}}
+
 
 class FakeImporter:
     def __init__(self, fail=False):

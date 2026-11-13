@@ -106,6 +106,15 @@ MUTATIONS = [
     ('claim-ready-without-token', 'providers.py',
      "'state': 'awaiting-provisioning'", "'state': 'ready'",
      'gate_waits_for_operator_token'),
+    ('release-rename-without-settling-prior-patch', 'zulip.py',
+     "need(observed == 'applied' or settled, 'settle earlier PATCH before releasing rename intent')",
+     'pass',
+     'ambiguous_then_terminal_rename_has_audited_release'),
+    ('rename-recovery-ignores-reobservation', 'zulip.py',
+     "need(user['is_active'] and user['full_name'] == (\n"
+     "                pending['target'] if observed == 'applied' else row['name']),",
+     'need(True,',
+     'rename_recovery_reobserves_and_resolves_late_commit'),
 ]
 
 

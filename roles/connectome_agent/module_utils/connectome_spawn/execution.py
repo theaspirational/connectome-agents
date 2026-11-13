@@ -17,6 +17,7 @@ from .planner import require_bound
 from .schema import activation_identity, instance
 from .seed import seed_intent
 from .sources import absolute
+from .verification import proven
 
 
 class Executor(Protocol):
@@ -243,23 +244,22 @@ class ExecutorLifecycleAdapter:
                   'unit': 'connectome-' + context['agent'] + '.service',
                   'unixName': self.plan['instance']['unixName']}
         def observe(action):
-            return checkpoint(action, lambda: self.executor.observe(action, inputs, operation_id + ':' + action))
+            return checkpoint(action, lambda: self.executor.observe(action, inputs, operation_id + ':' + action),
+                {'action': action, 'inputs': inputs, 'operation_id': operation_id + ':' + action})
         health = observe('service-health')
         probes = {}
         for connector in self.plan['recipe']['mcpServers']:
             action = 'mcp-handshake:' + connector
             # A probe starts the connector, initializes MCP and lists tools,
             # then closes it. It cannot start/restart the agent service.
-            probes[connector] = checkpoint(action, lambda connector=connector: self.executor.execute(
-                'mcp-handshake', {'agent': context['agent'], 'connector': connector,
-                    'steps': ['start', 'initialize', 'tools/list', 'close'],
-                    'useInstalledLaunch': True, 'verifyOwnedRelease': True}, operation_id + ':' + action))
+            probe_inputs = {'agent': context['agent'], 'connector': connector,
+                'steps': ['start', 'initialize', 'tools/list', 'close'],
+                'useInstalledLaunch': True, 'verifyOwnedRelease': True}
+            probes[connector] = checkpoint(action, lambda: self.executor.execute(
+                'mcp-handshake', probe_inputs, operation_id + ':' + action),
+                {'action': 'mcp-handshake', 'inputs': probe_inputs, 'operation_id': operation_id + ':' + action})
         auth = observe('provider-authenticated')
         reply = observe('first-real-reply')
-        def proven(receipt, key):
-            return (type(receipt) is dict and receipt.get('state') == 'applied' and
-                    type(receipt.get('evidence')) is dict and bool(receipt['evidence']) and
-                    type(receipt.get('result')) is dict and receipt['result'].get(key) is True)
         service = proven(health, 'ready') and all(
             proven(p, 'initialized') and proven(p, 'toolsListed') for p in probes.values())
         return {'serviceReady': {'state': 'success' if service else 'unknown',

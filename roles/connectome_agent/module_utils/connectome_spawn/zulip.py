@@ -8,6 +8,7 @@ pre-existing operator-owned personas. Display full_name is always exact.
 import base64
 import configparser
 from copy import deepcopy
+from datetime import datetime, timezone
 import http.client
 import os
 import socket
@@ -150,7 +151,8 @@ class ZulipIdentityProvider:
             return {'schema': 'connectome.zulip-identities/v1', 'binding': self.binding,
                     'identities': {}, 'operations': {}}
         value = read(self.path)
-        fields(value, ('schema', 'binding', 'identities', 'operations'))
+        fields(value, ('schema', 'binding', 'identities', 'operations'), ('audit',))
+        need(type(value.get('audit', [])) is list, 'invalid provider audit')
         need(value['schema'] == 'connectome.zulip-identities/v1' and value['binding'] == self.binding and
              type(value['identities']) is dict and type(value['operations']) is dict, 'invalid Zulip provider state')
         for identity_id, row in value['identities'].items():
@@ -358,9 +360,54 @@ class ZulipIdentityProvider:
                 raise SpawnError('Zulip rename refused (HTTP ' + str(refusal.status) +
                                  '); ' + ('retryable' if refusal.retryable else 'terminal (correct request/policy)') +
                                  '; intent released') from None
+            if refusal is not None and prior and user['full_name'] == row['name']:
+                raise SpawnError('Zulip rename refused (HTTP ' + str(refusal.status) +
+                    '); ' + ('retryable' if refusal.retryable else 'terminal (correct request/policy)') +
+                    '; intent pending; settle earlier PATCH then use audited recover_rename') from None
             need(user['full_name'] == record['name'] and user['is_active'], 'Zulip rename awaiting reconciliation')
             row.update(name=record['name'], kind='permanent')
             self._complete(value, key)
+            return deepcopy(handle)
+
+    def recover_rename(self, handle, operation_id, *, observed, reason, evidence_reference, settled=False):
+        """Observe and resolve a pending rename, without PATCH/DELETE/replay.
+
+        For not-applied, the operator must first settle/cancel every in-flight
+        PATCH and cite that procedure's evidence. A GET alone cannot prove that
+        an earlier ambiguous request will not land later. No journal editing.
+        """
+        need(match(operation_id, r'[A-Za-z0-9_:-]{1,256}') and
+             observed in ('applied', 'not-applied') and type(settled) is bool,
+             'explicit rename recovery observation required')
+        for text in (reason, evidence_reference):
+            need(type(text) is str and 0 < len(text.strip()) <= 2048 and
+                 not any(ord(c) < 32 for c in text), 'bounded reason and evidence reference required')
+        need(observed == 'applied' or settled, 'settle earlier PATCH before releasing rename intent')
+        with locked(self.root):
+            value = self._read()
+            row = self._row(value, handle)
+            key = handle['agent'] + ':' + operation_id
+            pending = value['operations'].get(key)
+            need(pending is not None and pending['state'] == 'pending' and
+                 pending['action'] == 'rename' and pending['handle'] == handle,
+                 'pending rename operation mismatch')
+            credentials, operator = self._session()
+            user = self._observe(credentials, operator, row, target=pending['target'])
+            need(user['is_active'] and user['full_name'] == (
+                pending['target'] if observed == 'applied' else row['name']),
+                'rename recovery contradicts observation')
+            value.setdefault('audit', []).append({'event': 'recover-rename', 'operation': operation_id,
+                'handle': deepcopy(handle), 'intent': deepcopy(pending), 'observed': observed,
+                'reason': reason, 'evidenceReference': evidence_reference, 'settled': settled,
+                'who': {'uid': os.getuid(), 'euid': os.geteuid()},
+                'when': datetime.now(timezone.utc).isoformat(),
+                'observation': {'native_id': user['user_id'], 'name': user['full_name'], 'active': True}})
+            if observed == 'applied':
+                row.update(name=pending['target'], kind='permanent')
+                pending['state'] = 'complete'
+            else:
+                del value['operations'][key]
+            write(self.path, value)
             return deepcopy(handle)
 
     def retire(self, handle, operation_id):

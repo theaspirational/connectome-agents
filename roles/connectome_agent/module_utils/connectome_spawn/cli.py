@@ -9,6 +9,22 @@ from .sources import parse_repo_source
 from . import SpawnError, digest, instance, load_catalog, load_source, make_plan, template
 
 
+LIFECYCLE_ERRORS = {
+    'unknown agent; lifecycle journal missing': 'unknown-agent',
+    'invalid agent identifier': 'invalid-agent',
+    'explicit bounded recovery reason and observation required': 'recovery-input-required',
+    'pending operation mismatch or already resolved': 'pending-operation-mismatch',
+    'operator statement contradicts observation': 'observation-contradiction',
+    'durable completed checkpoint cannot be undone': 'completed-checkpoint',
+    'applied observer evidence required for promotion, ingest or serviceReady recovery': 'observer-evidence-required',
+    'invalid identity provider handle': 'observed-handle-required',
+    'serviceReady checkpoint requires successful observed probe evidence': 'probe-evidence-required',
+    'legacy pending operation needs external migration; replay refused': 'legacy-journal',
+    'state size limit exceeded': 'journal-size-limit',
+    'unreadable local file': 'unreadable-local-state',
+}
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         # argparse normally echoes invalid values, potentially protected text.
@@ -74,6 +90,8 @@ def main(argv=None):
         return 0
     except (SpawnError, OSError, UnicodeError, RecursionError) as exc:
         error = {'error': 'spawn input refused', 'filesWritten': None if mutation_attempted else False}
+        if isinstance(exc, SpawnError) and str(exc) in LIFECYCLE_ERRORS:
+            error.update(code=LIFECYCLE_ERRORS[str(exc)], detail=str(exc))
         if isinstance(exc, SpawnError) and str(exc).startswith('migrate template v1'):
             error['migration'] = str(exc)
         print(json.dumps(error), file=sys.stderr)

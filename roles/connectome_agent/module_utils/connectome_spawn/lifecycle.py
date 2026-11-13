@@ -13,6 +13,7 @@ from .persistence import directory, locked, read, safe_path, write
 from .schema import NAME, activation_identity, name_receipt, read_name_record
 from .seed import seed_intent
 from .identity import identity_policy, temporary_name, validate_provider_name
+from .verification import proven
 
 STATES = ('planned', 'initiation', 'named', 'active', 'failed', 'retired')
 
@@ -26,6 +27,15 @@ class LifecycleAdapter(Protocol):
         the name record to the config repo; self-naming needs an explicit request
         and repo write access. provision-permanent uses the pinned record; redeploy-keep-memory
         switches identity without resetting context.store. No extra approval.
+        """
+        ...
+
+    def verify(self, context: dict, operation_id: str, checkpoint) -> dict:
+        """Return evidenced stages; serviceReady requires health and every MCP.
+
+        Use checkpoint(name, action, descriptor=None) for every observation or
+        probe. The descriptor scopes recovery to the exact original request.
+        No adapter may infer readiness from a switch/start acknowledgement.
         """
         ...
 
@@ -98,6 +108,7 @@ class Lifecycle:
 
     def _read(self, agent):
         _, path, store, _ = self._paths(agent)
+        need(path.is_file(), 'unknown agent; lifecycle journal missing')
         value = _state(read(path), agent)
         need(value['store'] == str(store), 'store binding mismatch')
         return value
@@ -107,6 +118,8 @@ class Lifecycle:
         _, _, store, marker = self._paths(agent)
         reasons = []
         if value['pending'] is not None:
+            if value['pending']['step'].startswith('serviceReady:'):
+                reasons.append('serviceReady pending: health and every connector handshake must succeed; temporary identity kept')
             reasons.append('checkpoint resolved; explicit continuation required' if value['pending'].get('ready') else
                            'uncertain operation; manual reconciliation required; no replay')
         if value['seed']['branch'] == 'seeded' and store.exists() and not marker.exists():
@@ -135,6 +148,7 @@ class Lifecycle:
     def reconcile(self, agent):
         """Observe a pending intent, never replay an effect or clear uncertainty."""
         root, path, _, _ = self._paths(agent)
+        self._read(agent)
         with locked(root):
             value = self._read(agent)
             observation = self._observe(value)
@@ -164,8 +178,10 @@ class Lifecycle:
         need(match(operation_id, r'[A-Za-z0-9_-]{1,128}') and self.adapter is not None and
              hasattr(self.adapter, 'verify'), 'verification adapter and operation required')
         root, path, _, _ = self._paths(agent)
+        self._read(agent)
         with locked(root):
             value = self._read(agent)
+            need(value['state'] in ('initiation', 'active'), 'verify requires initiation or active agent')
             request = digest({'verify': agent})
             prior = value['operations'].get(operation_id)
             if prior is not None:
@@ -182,12 +198,12 @@ class Lifecycle:
                     'step': 'prepared', 'completed': {}, 'ready': False, 'kind': 'verify'}
             value['pending']['ready'] = False
             write(path, value)
-            def checkpoint(name, action):
+            def checkpoint(name, action, descriptor=None):
                 completed = value['pending']['completed']
                 if name in completed:
                     return deepcopy(completed[name])
                 value['pending']['step'] = name
-                value['pending']['effect'] = None
+                value['pending']['effect'] = descriptor
                 write(path, value)
                 result = action()
                 completed[name] = deepcopy(result)
@@ -205,12 +221,14 @@ class Lifecycle:
         """Resolve ONE checkpoint by explicit operator statement; do not resume it.
 
         A handle-producing effect needs an observed handle; an operator cannot
-        invent/adopt an identity by clearing the pending operation.
+        invent/adopt an identity by clearing the pending operation. Promotion,
+        ingest and serviceReady checkpoints also require actual observer evidence.
         """
         need(observed in ('applied', 'not-applied') and type(reason) is str and
              0 < len(reason.strip()) <= 2048 and not any(ord(c) < 32 for c in reason),
              'explicit bounded recovery reason and observation required')
         root, path, _, _ = self._paths(agent)
+        self._read(agent)
         with locked(root):
             value = self._read(agent)
             pending = value['pending']
@@ -224,7 +242,17 @@ class Lifecycle:
             if step.endswith(':completed'):
                 need(observed == 'applied', 'durable completed checkpoint cannot be undone')
             elif step != 'prepared' and observed == 'applied':
-                result = observation if pending.get('kind') == 'verify' else observation.get('result')
+                if (step == 'ingest' or step in ('activate', 'redeploy-keep-memory') or
+                        step.endswith(':switch-start') or step.startswith('serviceReady:')):
+                    need(observation['state'] == 'applied' and bool(observation['evidence']),
+                         'applied observer evidence required for promotion, ingest or serviceReady recovery')
+                if step == 'serviceReady:service-health':
+                    need(proven(observation, 'ready'), 'serviceReady checkpoint requires successful observed probe evidence')
+                elif step.startswith('serviceReady:mcp-handshake:'):
+                    need(proven(observation, 'initialized') and proven(observation, 'toolsListed'),
+                         'serviceReady checkpoint requires successful observed probe evidence')
+                result = (observation if pending.get('kind') == 'verify' or step.startswith('serviceReady:')
+                          else observation.get('result'))
                 if step in ('provision-temporary', 'provision-permanent', 'rename'):
                     result = _handle(result, agent)
                 completed[step] = result
@@ -383,6 +411,30 @@ class Lifecycle:
                     return self.adapter.perform_journaled(name, context, operation_id + ':' + name, run)
                 return effect(name, lambda: self.adapter.perform(name, context, operation_id + ':' + name))
 
+            def service_ready():
+                need(hasattr(self.adapter, 'verify'), 'serviceReady verification adapter required')
+                value['verification'] = {'serviceReady': {'state': 'unknown', 'evidence': None}}
+                write(path, value)
+                def checkpoint(name, action, descriptor=None):
+                    def probe():
+                        result = action()
+                        # Do not complete an unknown/failed gate probe. Recovery
+                        # may observe its result or explicitly authorize a fresh probe.
+                        value['verification']['serviceReady'] = {'state': 'unknown',
+                            'evidence': {'checkpoint': name, 'receipt': result}}
+                        write(path, value)
+                        if name == 'service-health':
+                            need(proven(result, 'ready'), 'serviceReady pending: service health unknown or failed')
+                        elif name.startswith('mcp-handshake:'):
+                            need(proven(result, 'initialized') and proven(result, 'toolsListed'),
+                                 'serviceReady pending: MCP handshake unknown or failed')
+                        return result
+                    return effect('serviceReady:' + name, probe, descriptor)
+                value['verification'] = self.adapter.verify(deepcopy(value), operation_id + ':serviceReady', checkpoint)
+                write(path, value)
+                need(value['verification']['serviceReady']['state'] == 'success',
+                     'serviceReady pending: health and every connector handshake required')
+
             if target == 'initiation':
                 step('build')
                 value['temporaryIdentity'] = _handle(step('provision-temporary', lambda:
@@ -413,6 +465,7 @@ class Lifecycle:
                     'digest': value['seed']['digest'], 'timestamp': datetime.now(timezone.utc).isoformat()}))
                 self._marker(marker, value)
                 step('activate')
+                service_ready()
             elif target == 'active':
                 if value['supportsRename']:
                     original = value['temporaryIdentity'] or value['permanentIdentity']
@@ -427,23 +480,27 @@ class Lifecycle:
                     need(value['permanentIdentity'] != value['temporaryIdentity'],
                          'replace must provision a distinct permanent identity')
                 step('redeploy-keep-memory')
+                service_ready()
+                step('close-initiation')
+                value['topicOpen'] = False
                 if value['temporaryIdentity'] is not None:
                     step('retire-temporary', lambda: self.identity_provider.retire(
                         value['temporaryIdentity'], operation_id + ':retire-temporary'))
                     value['temporaryIdentity'] = None
-                step('close-initiation')
-                value['topicOpen'] = False
             elif target == 'retired':
                 step('retire')
                 had_temporary = value.get('topicOpen', value['temporaryIdentity'] is not None)
+                if had_temporary:
+                    step('close-initiation')
+                    value['topicOpen'] = False
                 for field in ('temporaryIdentity', 'permanentIdentity'):
                     if value[field] is not None:
                         step('retire-' + field, lambda: self.identity_provider.retire(
                             value[field], operation_id + ':retire-' + field))
                         value[field] = None
-                if had_temporary:
-                    step('close-initiation')
-                    value['topicOpen'] = False
+            if target == 'active':
+                need(value.get('verification', {}).get('serviceReady', {}).get('state') == 'success',
+                     'serviceReady required before active')
             value['state'] = target
             value['operations'][operation_id] = {'digest': request, 'target': target}
             value.setdefault('receipts', {})[operation_id] = value['pending']['completed']

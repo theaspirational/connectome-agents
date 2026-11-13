@@ -570,6 +570,58 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
         self.assertEqual(provider.rename(handle, RECORD, 'rename'), handle)
         self.assertEqual(self.http.count('PATCH'), 2)
 
+    def test_ambiguous_then_terminal_rename_has_audited_release(self):
+        provider = self.provider()
+        handle = self.create(provider)
+        self.http.failure = ('PATCH', 503)
+        with self.assertRaises(SpawnError):
+            provider.rename(handle, RECORD, 'rename')
+        self.http.failure = ('PATCH', 400)
+        with self.assertRaisesRegex(SpawnError, 'HTTP 400.*terminal.*audited recover_rename'):
+            provider.rename(handle, RECORD, 'rename')
+        count = len(self.http.calls)
+        with self.assertRaisesRegex(SpawnError, 'settle earlier PATCH'):
+            provider.recover_rename(handle, 'rename', observed='not-applied', reason='Inspected fixture',
+                                    evidence_reference='fixture:closed-requests')
+        self.assertEqual(len(self.http.calls), count)
+        with self.assertRaisesRegex(SpawnError, 'evidence reference'):
+            provider.recover_rename(handle, 'rename', observed='not-applied', reason='Inspected fixture',
+                                    evidence_reference='', settled=True)
+        self.http.failure = None
+        provider.recover_rename(handle, 'rename', observed='not-applied', reason='Both fixture requests closed',
+                                evidence_reference='fixture:closed-requests', settled=True)
+        self.assertTrue(all(m == 'GET' for m, _, _ in self.http.calls[count:]))
+        state = read(provider.path)
+        self.assertNotIn('example-agent:rename', state['operations'])
+        audit = state['audit'][-1]
+        self.assertEqual(audit['observed'], 'not-applied')
+        self.assertEqual(audit['who'], {'uid': os.getuid(), 'euid': os.geteuid()})
+        self.assertEqual(audit['intent']['target'], RECORD['name'])
+        self.assertTrue(audit['settled'])
+        # No hand-edited journal is required to escape the old pending rename.
+        self.provider().retire(handle, 'retire-after-recovery')
+        self.assertFalse(next(iter(self.http.bots.values()))['is_active'])
+
+    def test_rename_recovery_reobserves_and_resolves_late_commit(self):
+        provider = self.provider()
+        handle = self.create(provider)
+        self.http.failure = ('PATCH', 503)
+        with self.assertRaises(SpawnError):
+            provider.rename(handle, RECORD, 'rename')
+        self.http.failure = None
+        next(iter(self.http.bots.values()))['full_name'] = RECORD['name']
+        count = len(self.http.calls)
+        with self.assertRaisesRegex(SpawnError, 'contradicts observation'):
+            provider.recover_rename(handle, 'rename', observed='not-applied', reason='Incorrect fixture assertion',
+                                    evidence_reference='fixture:closed-requests', settled=True)
+        provider.recover_rename(handle, 'rename', observed='applied', reason='Observed late fixture commit',
+                                evidence_reference='fixture:observed-rename')
+        self.assertTrue(all(m == 'GET' for m, _, _ in self.http.calls[count:]))
+        state = read(provider.path)
+        self.assertEqual(state['operations']['example-agent:rename']['state'], 'complete')
+        self.assertEqual(state['identities'][handle['id']]['kind'], 'permanent')
+        self.assertEqual(provider.rename(handle, RECORD, 'rename'), handle)
+
     def test_retryable_mutation_refusal_is_labelled(self):
         for method in ('PATCH', 'DELETE'):
             with self.subTest(method=method):
