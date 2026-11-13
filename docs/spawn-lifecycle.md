@@ -4,9 +4,11 @@ Plan/dry-run remain offline and always say `activationAllowed: false`. The
 Python API now includes an explicitly configured **Zulip identity provider**,
 local AI-access providers and a file-secret provider. Only explicit provider
 calls perform effects; merely importing the package or planning never contacts
-Zulip or reads credentials. There is **no apply/start CLI, lifecycle execution
-adapter, role wiring or chat frontend**. Tests still use fake deployment and
-seed adapters. This is not a qualified service deployment path.
+Zulip or reads credentials. There is an **executor-only Python lifecycle backend**, staged verification and
+an audited recovery CLI. The default executor only records proposed actions;
+it cannot acknowledge deployment. There is **no real executor, apply/start CLI,
+automatic role wiring or chat frontend**. Tests use temporary paths and fakes.
+This is not a qualified service deployment path.
 
 A new agent requires only **its own identity (a Zulip bot)** and **AI access
 (an inference-gate agent token OR a direct provider key)**. Runtime integrations,
@@ -196,12 +198,13 @@ the now-permanent handle.
 
 The same functions are importable as `ansible.module_utils.connectome_spawn`.
 The existing role deployment engine is **not automatically wired** to these
-APIs; T5 must explicitly connect its frontend/role execution to them and use
-`read_name_record`, not bypass validation or install planner draft recipes.
+APIs. `ExecutionBackend` is the explicit Python frontend, using `read_name_record`
+for naming. The executor boundary carries thin role-engine requests; it does
+not bypass validation or install planner draft recipes.
 
 Per-agent files are `ROOT/AGENT/lifecycle.json`, `ROOT/AGENT/state/store/`, and
 `ROOT/AGENT/state/seed.consumed`. The latter is the required `state/seed.consumed`;
-T5 must bind this external store without copying/resetting memory. Completed
+`ExecutionBackend` binds this exact external store without copying/resetting memory. Completed
 operation ids and input digests live in the lifecycle file. Same id plus same
 input is a no-op, even after restart or later transitions; id reuse with changed
 input is refused. IDs use 1–128 ASCII letters, digits, underscore or hyphen.
@@ -218,9 +221,8 @@ No exactly-once external effect guarantee is claimed.
 
 An ordinary explicit failed transition is supported, but pending uncertain
 operations block every transition, including failed/retired: an operator must
-first reconcile service, memory and identity-provider reality. This version
-deliberately has no recovery/reset CLI. T5 must supply an audited lifecycle recovery mechanism rather than
-assuming an interrupted effect did not happen. Symlink persistence paths and
+first reconcile service, memory and identity-provider reality. Recovery now resolves a checkpoint only after an explicit operator statement
+(see below); it never assumes an interrupted effect did not happen. Symlink persistence paths and
 corrupt state are refused. Same-uid hostile path races and state tampering are
 outside the trusted-caller boundary. The journal is bounded to 1 MiB; no automatic
 history pruning or identity tombstone reclamation is implemented.
@@ -335,7 +337,9 @@ also covers a crash just before POST: an operator must reconcile the no-effect
 case. New operation ids cannot bypass pending work for that agent. Observed,
 owned rename/deactivate retries are idempotent assignments. After a parsed 4xx
 refusal, an individual-user read verifies the real bot state: an unchanged
-rename or still-active retirement releases only that intent with a clear error;
+rename on its **first attempt**, or still-active retirement, releases only
+that intent with a retryable/terminal label. A rename with any earlier ambiguous
+attempt stays pending: that earlier PATCH may still land after a later refusal;
 an already-applied effect completes normally. Failed or inconsistent observation
 keeps the intent pending, as do ambiguous mutation responses with no observed
 effect. Completed operation ids bind exact intent, including the entire
@@ -395,39 +399,26 @@ is appropriate for random API keys/tokens but reveals offline-guessable hashes
 of low-entropy optional secrets. Keep receipts private; keyed/salted digests
 remain a follow-up, not a confidentiality guarantee of this slice.
 
-### Plan declarations and remaining T5/frontend work
+### Plan declarations and remaining frontend work
 
-Plans now include structured `providerActions` with `providerKinds`, `execution`
-(`automatic` or `operator-required`) and `required`. `lifecycle[].needsProvider`
-is a list of real kinds, not a boolean. Mandatory steps are Zulip identity and
-AI access; extra file secrets and deployment/import hooks are marked optional.
-Only explicitly selecting an integration can make its own execution depend on
-an adapter. `automatic` means implemented by an explicitly called provider,
-**not** executed by planning or permission to apply. Adapter hooks still show
-`operator-required` and `available: false`; no platform success is invented.
-AI access explicitly uses `providerSelection: one-of`, never requires both
-alternatives. Unselected access also reports `selectionRequired: true`.
-Optional template `providers.aiAccess` chooses `direct-key` or `inference-gate`
-(the latter requires public pool/limit intent). Credential paths/values are
-rejected in this public policy. Conditional identity steps retain `when` tied
-to `provider.supports_rename`; an offline plan still assumes no injected provider
-capability (`identity.supportsRename: null`). Seeded plans now also declare
-permanent identity and AI access prerequisites; the lifecycle executor is not
-changed or qualified by these planning declarations.
+Plans include structured `providerActions` and `executorActions` distinguishing
+`automatic` from `operator-required`. `lifecycle[].needsProvider` lists real
+provider/adapter kinds. Mandatory capabilities are identity and AI access;
+optional integrations need their own explicitly selected adapter. Deployment
+steps now describe automatic **executor requests**, with a dry-run default;
+production seed-format and conversation hooks remain unavailable. Planning
+never instantiates providers, grants permissions or sends requests.
+AI access uses `providerSelection: one-of`; unselected access reports
+`selectionRequired: true`. Public policy accepts no credential paths/values.
+Conditional identity steps retain `when` tied to `provider.supports_rename`;
+offline plans assume no capability (`identity.supportsRename: null`).
 
-Still required in **T5/later frontend slices**, not implemented here:
-
-* `LifecycleAdapter.perform(step, context, operation_id)` implementations for
-  build/hold, join/start initiation, memory-preserving redeploy, activation,
-  topic closure and retirement. Never activate on build/hold, retire a temporary
-  bot before permanent redeploy, or retire a successfully renamed bot on promotion.
-* Initiator name-record commits (self-naming only on explicit request with repo
-  write access), home-channel dialogue/routing/subscriptions, runtime memory
-  binding, durable seed import and external reconciliation/recovery mechanisms.
-* Role/frontend authorization and integration of the two mandatory providers,
-  concrete symbolic build binding, health, rollback and audited lifecycle recovery.
-  Neither a journal nor a plan hash grants permission or makes an interrupted
-  lifecycle transition safe to replay. No apply/start command is supplied.
+Still required in later owner-approved windows: a real executor and translation
+to the role engine, role/frontend authorization, production seed-format import,
+initiator commits/self-naming write-access enforcement, real conversation routing
+and subscriptions, runtime qualification, real health/rollback validation and
+the first real spawn. The executor-only core and audited checkpoint recovery
+below do not claim these integrations. No apply/start CLI is supplied.
 
 Offline tests use local files and an in-process loopback fake HTTP server;
 no real credentials, provider traffic or privileged platform commands are used.
@@ -461,3 +452,137 @@ also continue to reject symlinks. Store contents belong to the injected adapter
 and are not read by the spawn core. Persistence writes retain the documented
 trusted same-uid caller assumption; this is not hostile concurrent-writer
 isolation or an authenticity check on regular-file contents.
+
+## Executor-only apply, verify and reconcile
+
+`ExecutionBackend(root, validated_plan, private_repo=..., build_root=...,
+executor=..., supports_rename=False)` accepts the **trusted output of make_plan**,
+not arbitrary public JSON authenticated by its self-hash. It checks the envelope
+hash and instance/home binding, and persists the complete execution binding in
+`ROOT/AGENT/execution.json`. Changing that binding is refused. The private repo
+and build root are explicit operator inputs, never template commands or ambient
+host defaults. `supports_rename` declares the injected provider's capability;
+the default models offline replacement, not a discovery of Zulip capabilities.
+No production provider is selected or instantiated by this backend.
+
+```python
+backend = ExecutionBackend(state_root, validated_plan,
+    private_repo=config_repo, build_root=build_root, executor=offline_fixture)
+backend.apply("initiate")
+backend.apply("record-name", target="named", name_source=pinned_name_source)
+backend.apply("promote", target="active")
+backend.verify("observe-runtime")
+backend.reconcile()
+# Retirement is explicit; there is no destructive remove shortcut:
+backend.apply("retire", target="retired")
+```
+
+For a seeded plan pass the matching payload to `apply`; its target defaults to
+active. A provider-owned permanent identity precedes build. Build/hold do not
+start anything; ingest and the durable seed receipt precede activation. Seed
+formats still need an executor-owned importer; no production importer ships.
+The existing low-level Lifecycle API remains usable with explicit test adapters.
+
+| Lifecycle step | Executor request / acknowledgement |
+| --- | --- |
+| build | local AI-access input/ready check; selected optional secrets; Unix user with collision refusal; private directories; agent layer in private repo (executor must enforce write access); fresh cook build, install-only/no-start |
+| hold | install user unit without start, from the **same** prepared build |
+| join-initiation | join the agent's owned identity to home channel/topic initiation, home-channel members may participate |
+| start-initiation / activate | install-only then switch/start the prepared build, supplying the current owned transport identity |
+| redeploy-keep-memory | render chosen identity (absent prompt stays absent), fresh build, switch/start with the **same** external store; acknowledge before temporary retirement |
+| close-initiation | close topic, no identity recycling |
+| retire | stop user unit, then provider deactivation of current owned identities; close any still-open initiation; retain store and journals |
+
+Each executor request receives explicit inputs and a stable
+`operation:step:action` id; identity/import steps use `operation:step`. The
+lifecycle fsyncs each individual action intent **before** execute, then retains
+its credential-free receipt in `receipts`. Completed subactions are not repeated
+on an explicitly recovered continuation. A missing/unknown acknowledgement
+leaves pending intent, including with the default `DryRunExecutor`; it does not
+advance state or pretend the recorder deployed anything. Build directories are
+operation/phase-specific. Symbolic paths are bound and `require_bound` runs;
+recipe/layout files and their hashes are regenerated after binding. Runtime
+state is never copied into builds. Executor inputs/outputs and status contain
+protected configuration; evidence must never contain keys or raw provider bodies.
+
+Actions: `ai-access`, `validate-optional-secrets`, `create-unix-user`, `create-directories`,
+`render-agent-layer`, `cook-build`, `install-user-unit`, `switch-start`,
+`join-initiation`, `close-initiation`, `stop-unit`, `provision-temporary`,
+`provision-permanent`, `rename`, `retire-identity`, `ingest`, `mcp-handshake`.
+Planning lists automatic executor requests separately from operator-only work;
+automatic means supported request orchestration, **not available real execution**.
+AI-access acknowledgement means safe supplied local input, not authentication.
+Privileged gate token minting/limits, credential supply, config-repo permissions,
+Unix user/state deletion, user-manager provisioning and a real executor/first
+spawn remain operator-only.
+No useradd, systemctl, loginctl, cook, gate or Zulip command is run by this backend.
+
+The role engine currently performs filesystem/subprocess effects directly and
+consumes normalized deployment specs rather than spawn envelopes. Sharing it by
+calling it here would violate the executor-only boundary. Requests therefore
+name `Deployment.prepare`, `Deployment.activate` and `connectome_cook.adapt` as
+the intended engine, instead of forking their build/switch/rollback/health logic.
+A later owner-approved real executor must translate these typed requests into
+that engine, re-resolve/verify local runtime and artifact inputs, enforce path,
+ownership and launch audits, and durably track its internal effects. This slice
+does not claim that translation or production runtime qualification is complete.
+
+### Honest verification stages
+
+`verify(operation_id)` separately journals all observations/probes and records:
+
+* `serviceReady`: executor service-health evidence **and** an MCP probe for each
+  selected connector: start connector, initialize MCP, `tools/list`, close.
+  The executor uses the installed launch, not planner drafts. With no selected
+  connectors there is no connector handshake to claim.
+* `providerAuthenticated`: independent provider-authentication evidence, not a
+  safe key file or running service.
+* `firstRealReply`: independent evidence of a real reply, not a synthetic
+  readiness check or authentication alone.
+
+Only an applied receipt with nonempty structured evidence and the stage's
+explicit true result qualifies as success. Missing/incomplete/negative evidence
+is conservatively unknown, never success. Verification does not send a test chat
+message or authenticate through a real service here. Probes also have durable
+intent; lost acknowledgements block blind re-probing. Distinct verification ids
+request fresh observations; an identical completed id is a no-op.
+
+`reconcile()` only asks the executor to observe the exact pending effect, or
+current deployment reality when nothing is pending. It journals the observation,
+never creates/restarts/replays, clears intent, or changes lifecycle state.
+Without an observer, CLI reconciliation reports unknown, never absence/success.
+
+### Audited recovery, not reset
+
+```sh
+scripts/connectome-spawn reconcile example-agent --state-root /absolute/spawn-state
+scripts/connectome-spawn recover example-agent --state-root /absolute/spawn-state \
+  --operation initiate --observed not-applied --reason 'Inspected the target and confirmed no effect'
+```
+
+`recover` requires a nonblank bounded reason, matching pending operation, and
+`applied` or `not-applied`. It observes first (unknown is retained as unknown),
+refuses a statement contradicting available evidence, and appends the uid/euid,
+UTC timestamp, operation, checkpoint, statement, reason and observation to the
+private journal. It resolves **one checkpoint**, not the whole transition, and
+returns without executing anything. A separate explicit API call with the same
+operation id and exact original inputs re-observes immediately before continuing
+(and blocks if reality contradicts the statement): applied checkpoints are skipped;
+not-applied checkpoints can be attempted again. Other ids remain refused.
+The operator is responsible for resolving an in-flight attempt before asserting
+not-applied; an unknown observation alone is never retry authorization.
+
+A handle-producing operation requires the observer's original owned handle;
+the CLI cannot fabricate one. Such lost-handle recovery needs the Python API
+with an injected observer. Durable completed checkpoints cannot be rolled back
+by saying not-applied. Legacy pending journals without checkpoint history are
+refused for continuation and need an external migration/reconciliation procedure;
+there is no unsafe automatic migration, deletion/reset or auto-replay command.
+Recovery statements/observations may write the local journal even on failure;
+CLI errors for these commands report filesWritten as unknown rather than false.
+
+Retirement deactivates rather than deletes/recycles the provider identity,
+stops the unit and **keeps memory, seed receipts, config and ownership evidence**.
+Deleting the Unix account, state, build history, credentials outside provider
+retirement, or private repo records is explicitly operator-only. No remove
+command silently turns retirement into data deletion.

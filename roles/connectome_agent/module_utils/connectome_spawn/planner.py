@@ -197,8 +197,16 @@ def make_plan(template_value, instance_value, catalog, stores, *, observed=None,
             'exports': exports, 'preflights': preflights, 'platformPins': platform,
             'seed': seed, 'lifecycle': steps, 'home': declaration['home'], 'rights': declaration['rights'],
             'providerActions': provider_actions, 'files': files, 'observed': observed,
+            'executorActions': [
+                {'action': action, 'execution': 'automatic', 'requiresExecutor': True,
+                 'defaultExecutor': 'dry-run-recorder'} for action in (
+                    'ai-access', 'validate-optional-secrets', 'create-unix-user', 'create-directories', 'render-agent-layer',
+                    'cook-build', 'install-user-unit', 'switch-start', 'join-initiation',
+                    'close-initiation', 'stop-unit', 'mcp-handshake')
+            ] + [{'action': action, 'execution': 'operator-required', 'available': False}
+                 for action in ('delete-unix-user', 'delete-state', 'grant-config-write', 'provision-user-manager')],
             'activationAllowed': False, 'filesWritten': False,
-            'limitations': ['planning-only', 'lifecycle-adapter-not-implemented', 'home-binding-not-provisioned',
+            'limitations': ['planning-only', 'real-executor-not-implemented', 'home-binding-not-provisioned',
                             'rights-not-authorized', 'runtime-closure-not-qualified', 'platform-not-probed']}
     if named is not None:
         # This is the future named transition's input, not the bootstrap recipe.

@@ -166,6 +166,10 @@ def plan_providers(steps, policy, agent, secret_names):
             entry.update(needsProvider=['lifecycle-adapter'], execution='operator-required', required=False)
         elif step == 'ingest':
             entry.update(needsProvider=['seed-import-adapter'], execution='operator-required', required=False)
+        elif step in ('build', 'hold', 'join-initiation', 'start-initiation',
+                       'redeploy-keep-memory', 'activate', 'close-initiation'):
+            entry.update(needsProvider=['executor'], execution='automatic', required=True,
+                         requiresExecutor=True, defaultExecutor='dry-run-recorder')
         elif entry['needsProvider']:
             entry.update(needsProvider=['lifecycle-adapter'], execution='operator-required', required=False)
         else:

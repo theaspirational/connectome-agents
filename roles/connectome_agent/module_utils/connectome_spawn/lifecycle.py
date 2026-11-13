@@ -6,6 +6,7 @@ replayed. Completed operations are idempotent by id AND exact input digest.
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Protocol
+import os
 
 from .data import digest, fields, match, need
 from .persistence import directory, locked, read, safe_path, write
@@ -18,7 +19,7 @@ STATES = ('planned', 'initiation', 'named', 'active', 'failed', 'retired')
 
 class LifecycleAdapter(Protocol):
     def perform(self, step: str, context: dict, operation_id: str) -> None:
-        """T4 hook; acknowledge only durable completion, never activate on build/hold.
+        """Adapter contract; acknowledge only durable completion, never activate on build/hold.
 
         join-initiation uses context.home and topic 'initiation'. start-initiation
         runs on the agent's own temporary identity. Normally the initiator commits
@@ -43,7 +44,7 @@ def _handle(value, agent):
 
 def _state(value, agent):
     fields(value, ('schema', 'agent', 'state', 'seed', 'home', 'identity', 'identityPolicy', 'temporaryName', 'supportsRename',
-                   'temporaryIdentity', 'permanentIdentity', 'store', 'operations', 'pending'), ('nameRecord',))
+                   'temporaryIdentity', 'permanentIdentity', 'store', 'operations', 'pending'), ('nameRecord', 'audit', 'topicOpen', 'receipts', 'verification'))
     need(value['schema'] == 'connectome.spawn-state/v1' and value['agent'] == agent and
          value['state'] in STATES, 'invalid lifecycle state')
     fields(value['seed'], ('mode', 'branch', 'digest'))
@@ -71,11 +72,16 @@ def _state(value, agent):
         need(match(key, r'[A-Za-z0-9_-]{1,128}') and match(row['digest'], r'[0-9a-f]{64}') and
              row['target'] in STATES, 'invalid operation record')
     if value['pending'] is not None:
-        fields(value['pending'], ('operation', 'digest', 'target', 'step'))
+        fields(value['pending'], ('operation', 'digest', 'target', 'step'),
+               ('completed', 'ready', 'effect', 'kind', 'resolution'))
+        need(type(value['pending'].get('completed', {})) is dict and
+             type(value['pending'].get('ready', False)) is bool, 'invalid pending checkpoints')
         need(match(value['pending']['operation'], r'[A-Za-z0-9_-]{1,128}') and
              match(value['pending']['digest'], r'[0-9a-f]{64}') and
              value['pending']['target'] in STATES and type(value['pending']['step']) is str,
              'invalid pending operation')
+    need(type(value.get('audit', [])) is list and type(value.get('receipts', {})) is dict and
+         type(value.get('topicOpen', False)) is bool, 'invalid lifecycle journal')
     return value
 
 
@@ -101,7 +107,8 @@ class Lifecycle:
         _, _, store, marker = self._paths(agent)
         reasons = []
         if value['pending'] is not None:
-            reasons.append('uncertain operation; manual reconciliation required; no replay')
+            reasons.append('checkpoint resolved; explicit continuation required' if value['pending'].get('ready') else
+                           'uncertain operation; manual reconciliation required; no replay')
         if value['seed']['branch'] == 'seeded' and store.exists() and not marker.exists():
             reasons.append('existing store without seed.consumed; never a fresh import')
         if marker.exists():
@@ -113,6 +120,122 @@ class Lifecycle:
         return dict(value, recovery=reasons,
                     identityNotice='owned; liveness unknown; reconcile with provider'
                     if value['temporaryIdentity'] or value['permanentIdentity'] else None)
+
+    def _observe(self, value):
+        pending = value['pending']
+        if self.adapter is None or not hasattr(self.adapter, 'observe'):
+            return {'state': 'unknown', 'evidence': None}
+        observation = self.adapter.observe(deepcopy(value),
+            pending['operation'] + ':' + pending['step'] if pending is not None else 'reconcile')
+        fields(observation, ('state', 'evidence'), ('result',))
+        need(observation['state'] in ('applied', 'not-applied', 'unknown'), 'invalid observation')
+        need(observation['state'] == 'unknown' or bool(observation['evidence']), 'observation evidence required')
+        return observation
+
+    def reconcile(self, agent):
+        """Observe a pending intent, never replay an effect or clear uncertainty."""
+        root, path, _, _ = self._paths(agent)
+        with locked(root):
+            value = self._read(agent)
+            observation = self._observe(value)
+            value.setdefault('audit', []).append({'event': 'reconcile',
+                'when': datetime.now(timezone.utc).isoformat(), 'observation': observation,
+                'operation': value['pending']['operation'] if value['pending'] else None,
+                'step': value['pending']['step'] if value['pending'] else None})
+            write(path, value)
+            return dict(self.status(agent), observation=observation)
+
+    def _resume(self, value, path):
+        # Consume the operator grant durably, then observe again immediately
+        # before continuation. Reality may have changed since recover returned.
+        declared = value['pending'].get('resolution')
+        value['pending']['ready'] = False
+        write(path, value)
+        observation = self._observe(value)
+        value.setdefault('audit', []).append({'event': 'resume-observation',
+            'operation': value['pending']['operation'], 'step': value['pending']['step'],
+            'when': datetime.now(timezone.utc).isoformat(), 'observation': observation})
+        write(path, value)
+        need(observation['state'] in ('unknown', declared),
+             'reality changed after recovery; reconcile before continuation')
+
+    def verify(self, agent, operation_id):
+        """Journal probes independently of deployment; never infer authentication/reply."""
+        need(match(operation_id, r'[A-Za-z0-9_-]{1,128}') and self.adapter is not None and
+             hasattr(self.adapter, 'verify'), 'verification adapter and operation required')
+        root, path, _, _ = self._paths(agent)
+        with locked(root):
+            value = self._read(agent)
+            request = digest({'verify': agent})
+            prior = value['operations'].get(operation_id)
+            if prior is not None:
+                need(prior['digest'] == request, 'operation id conflict')
+                return self.status(agent)
+            pending = value['pending']
+            if pending is not None:
+                need(pending.get('ready', False) and pending.get('kind') == 'verify' and
+                     pending['operation'] == operation_id and pending['digest'] == request,
+                     'uncertain operation requires recovery; probe replay refused')
+                self._resume(value, path)
+            else:
+                value['pending'] = {'operation': operation_id, 'digest': request, 'target': value['state'],
+                    'step': 'prepared', 'completed': {}, 'ready': False, 'kind': 'verify'}
+            value['pending']['ready'] = False
+            write(path, value)
+            def checkpoint(name, action):
+                completed = value['pending']['completed']
+                if name in completed:
+                    return deepcopy(completed[name])
+                value['pending']['step'] = name
+                value['pending']['effect'] = None
+                write(path, value)
+                result = action()
+                completed[name] = deepcopy(result)
+                value['pending']['step'] = name + ':completed'
+                write(path, value)
+                return result
+            value['verification'] = self.adapter.verify(deepcopy(value), operation_id, checkpoint)
+            value['operations'][operation_id] = {'digest': request, 'target': value['state']}
+            value.setdefault('receipts', {})[operation_id] = value['pending']['completed']
+            value['pending'] = None
+            write(path, value)
+            return self.status(agent)
+
+    def recover(self, agent, *, operation_id, observed, reason):
+        """Resolve ONE checkpoint by explicit operator statement; do not resume it.
+
+        A handle-producing effect needs an observed handle; an operator cannot
+        invent/adopt an identity by clearing the pending operation.
+        """
+        need(observed in ('applied', 'not-applied') and type(reason) is str and
+             0 < len(reason.strip()) <= 2048 and not any(ord(c) < 32 for c in reason),
+             'explicit bounded recovery reason and observation required')
+        root, path, _, _ = self._paths(agent)
+        with locked(root):
+            value = self._read(agent)
+            pending = value['pending']
+            need(pending is None or 'completed' in pending, 'legacy pending operation needs external migration; replay refused')
+            need(pending is not None and pending['operation'] == operation_id and
+                 not pending.get('ready', False), 'pending operation mismatch or already resolved')
+            observation = self._observe(value)  # observe BEFORE granting an explicit retry
+            need(observation['state'] in ('unknown', observed), 'operator statement contradicts observation')
+            step = pending['step']
+            completed = pending.setdefault('completed', {})
+            if step.endswith(':completed'):
+                need(observed == 'applied', 'durable completed checkpoint cannot be undone')
+            elif step != 'prepared' and observed == 'applied':
+                result = observation if pending.get('kind') == 'verify' else observation.get('result')
+                if step in ('provision-temporary', 'provision-permanent', 'rename'):
+                    result = _handle(result, agent)
+                completed[step] = result
+            pending['ready'] = True
+            pending['resolution'] = observed
+            value.setdefault('audit', []).append({'event': 'recover', 'operation': operation_id,
+                'step': step, 'observed': observed, 'reason': reason,
+                'who': {'uid': os.getuid(), 'euid': os.geteuid()},
+                'when': datetime.now(timezone.utc).isoformat(), 'observation': observation})
+            write(path, value)
+            return self.status(agent)
 
     @staticmethod
     def _marker(path, value):
@@ -143,7 +266,7 @@ class Lifecycle:
                      'identityPolicy': policy, 'temporaryName': temporary_name(policy), 'supportsRename': None,
                      'temporaryIdentity': None, 'permanentIdentity': None,
                      'store': str(store), 'operations': {operation_id: {'digest': request, 'target': 'planned'}},
-                     'pending': None}
+                     'pending': None, 'audit': [], 'topicOpen': False, 'receipts': {}}
             write(path, value)
             return self.status(agent)
 
@@ -170,7 +293,12 @@ class Lifecycle:
                 need(value['operations'][operation_id] == {'digest': request, 'target': target},
                      'operation id reused with different input')
                 return self.status(agent)
-            need(value['pending'] is None, 'uncertain operation requires recovery; replay refused')
+            resuming = value['pending'] is not None
+            if resuming:
+                need(value['pending'].get('ready', False) and
+                     value['pending']['operation'] == operation_id and value['pending']['digest'] == request,
+                     'uncertain operation requires recovery; replay refused')
+                self._resume(value, path)
             source, branch = value['state'], value['seed']['branch']
             legal = ((branch == 'clean' and (source, target) in
                       (('planned', 'initiation'), ('initiation', 'named'), ('named', 'active'))) or
@@ -185,14 +313,15 @@ class Lifecycle:
             if branch == 'seeded' and target == 'active':
                 need(seed_intent({'mode': value['seed']['mode']}, payload) == value['seed'],
                      'seed payload does not match planned digest')
-                need(not store.exists() and not marker.exists(),
+                need(resuming or not store.exists() and not marker.exists(),
                      'existing store or consumed seed requires recovery; re-ingest refused')
                 need(self.importer is not None, 'seed importer adapter required')
             if branch == 'clean' and target == 'active':
-                need(value['temporaryIdentity'] is not None, 'temporary identity missing')
+                need(value['temporaryIdentity'] is not None or resuming, 'temporary identity missing')
+            seed_identity = branch == 'seeded' and target == 'active' and getattr(self.adapter, 'requires_permanent_identity', False)
             effects = target in ('initiation', 'active', 'retired')
             need(not effects or self.adapter is not None, 'lifecycle adapter required')
-            identity_effects = target in ('initiation', 'named') or branch == 'clean' and target == 'active' or (
+            identity_effects = seed_identity or target in ('initiation', 'named') or branch == 'clean' and target == 'active' or (
                 target == 'retired' and (value['temporaryIdentity'] or value['permanentIdentity']))
             if identity_effects:
                 need(self.identity_provider is not None, 'identity provider required')
@@ -203,72 +332,110 @@ class Lifecycle:
                      value['supportsRename'] == self.identity_provider.supports_rename,
                      'identity provider capability changed; reconciliation required')
                 value['supportsRename'] = self.identity_provider.supports_rename
-            value['pending'] = {'operation': operation_id, 'digest': request, 'target': target, 'step': 'prepared'}
+            if not resuming:
+                value['pending'] = {'operation': operation_id, 'digest': request, 'target': target,
+                                    'step': 'prepared', 'completed': {}, 'ready': False}
+            value['pending']['ready'] = False
             write(path, value)
 
-            def step(name, action=None):
+            def effect(name, action, descriptor=None):
+                completed = value['pending'].setdefault('completed', {})
+                if name in completed:
+                    return deepcopy(completed[name])
                 value['pending']['step'] = name
+                value['pending']['effect'] = descriptor
                 write(path, value)
-                if action is not None:
-                    action()
-                else:
-                    context = deepcopy(value)
-                    context['topic'] = 'initiation'
-                    context['initiationParticipants'] = 'home-channel-members'
-                    self.adapter.perform(name, context, operation_id + ':' + name)
-                # An interruption here intentionally leaves an uncertain intent.
+                result = action()
+                completed[name] = deepcopy(result)
                 value['pending']['step'] = name + ':completed'
                 write(path, value)
+                return result
+
+            def step(name, action=None):
+                if action is not None:
+                    action_name, inputs = name, None
+                    if name == 'provision-temporary':
+                        inputs = {'agent': agent, 'name': value['temporaryName']}
+                    elif name == 'provision-permanent':
+                        inputs = {'agent': agent, 'record': value['identity']}
+                    elif name == 'rename':
+                        inputs = {'handle': value['temporaryIdentity'] or value['permanentIdentity'],
+                                  'record': value['identity']}
+                    elif name.startswith('retire-'):
+                        field = 'temporaryIdentity' if name == 'retire-temporary' else name[len('retire-'):]
+                        action_name = 'retire-identity'
+                        inputs = {'handle': value[field], 'keepTombstone': True}
+                    elif name == 'ingest':
+                        inputs = {'store': str(store), 'digest': value['seed']['digest'], 'freshOnly': True}
+                    descriptor = None if inputs is None else {
+                        'action': action_name, 'inputs': deepcopy(inputs), 'operation_id': operation_id + ':' + name}
+                    return effect(name, action, descriptor)
+                context = deepcopy(value)
+                context['topic'] = 'initiation'
+                context['initiationParticipants'] = 'home-channel-members'
+                if hasattr(self.adapter, 'perform_journaled'):
+                    def run(action_name, inputs):
+                        checkpoint = name + ':' + action_name
+                        action_id = operation_id + ':' + checkpoint
+                        return effect(checkpoint, lambda: self.adapter.execute_effect(
+                            action_name, deepcopy(inputs), action_id),
+                            {'action': action_name, 'inputs': inputs, 'operation_id': action_id})
+                    return self.adapter.perform_journaled(name, context, operation_id + ':' + name, run)
+                return effect(name, lambda: self.adapter.perform(name, context, operation_id + ':' + name))
 
             if target == 'initiation':
                 step('build')
-                def provision_temporary():
-                    value['temporaryIdentity'] = _handle(self.identity_provider.provision_temporary(
-                        agent, value['temporaryName'], operation_id + ':provision-temporary'), agent)
-                step('provision-temporary', provision_temporary)
+                value['temporaryIdentity'] = _handle(step('provision-temporary', lambda:
+                    self.identity_provider.provision_temporary(
+                        agent, value['temporaryName'], operation_id + ':provision-temporary')), agent)
                 step('join-initiation')
+                value['topicOpen'] = True
                 step('start-initiation')
             elif target == 'named':
                 value['identity'] = record
                 value['nameRecord'] = receipt
             elif target == 'active' and branch == 'seeded':
+                if seed_identity:
+                    value['permanentIdentity'] = _handle(step('provision-permanent', lambda:
+                        self.identity_provider.provision_permanent(
+                            agent, value['identity'], operation_id + ':provision-permanent')), agent)
                 step('build')
                 step('hold')
                 def ingest():
                     need(not store.exists() and not marker.exists(),
                          'existing store requires recovery; never a fresh import')
-                    directory(store)
+                    if not getattr(self.importer, 'reserves_store', False):
+                        directory(store)
                     self.importer.ingest(payload, store, operation_id + ':ingest')
                 step('ingest', ingest)
+                need(store.is_dir(), 'seed importer must acknowledge a durable memory store')
                 step('seed.consumed', lambda: write(marker, {
                     'digest': value['seed']['digest'], 'timestamp': datetime.now(timezone.utc).isoformat()}))
                 self._marker(marker, value)
                 step('activate')
             elif target == 'active':
                 if value['supportsRename']:
-                    def rename():
-                        value['permanentIdentity'] = _handle(self.identity_provider.rename(
-                            value['temporaryIdentity'], value['identity'], operation_id + ':rename'), agent)
-                        need(value['permanentIdentity'] == value['temporaryIdentity'],
-                             'rename must preserve identity handle')
-                        value['temporaryIdentity'] = None
-                    step('rename', rename)
+                    original = value['temporaryIdentity'] or value['permanentIdentity']
+                    value['permanentIdentity'] = _handle(step('rename', lambda:
+                        self.identity_provider.rename(original, value['identity'], operation_id + ':rename')), agent)
+                    need(value['permanentIdentity'] == original, 'rename must preserve identity handle')
+                    value['temporaryIdentity'] = None
                 else:
-                    def provision_permanent():
-                        value['permanentIdentity'] = _handle(self.identity_provider.provision_permanent(
-                            agent, value['identity'], operation_id + ':provision-permanent'), agent)
-                        need(value['permanentIdentity'] != value['temporaryIdentity'],
-                             'replace must provision a distinct permanent identity')
-                    step('provision-permanent', provision_permanent)
+                    value['permanentIdentity'] = _handle(step('provision-permanent', lambda:
+                        self.identity_provider.provision_permanent(
+                            agent, value['identity'], operation_id + ':provision-permanent')), agent)
+                    need(value['permanentIdentity'] != value['temporaryIdentity'],
+                         'replace must provision a distinct permanent identity')
                 step('redeploy-keep-memory')
                 if value['temporaryIdentity'] is not None:
                     step('retire-temporary', lambda: self.identity_provider.retire(
                         value['temporaryIdentity'], operation_id + ':retire-temporary'))
                     value['temporaryIdentity'] = None
                 step('close-initiation')
+                value['topicOpen'] = False
             elif target == 'retired':
                 step('retire')
-                had_temporary = value['temporaryIdentity'] is not None
+                had_temporary = value.get('topicOpen', value['temporaryIdentity'] is not None)
                 for field in ('temporaryIdentity', 'permanentIdentity'):
                     if value[field] is not None:
                         step('retire-' + field, lambda: self.identity_provider.retire(
@@ -276,8 +443,10 @@ class Lifecycle:
                         value[field] = None
                 if had_temporary:
                     step('close-initiation')
+                    value['topicOpen'] = False
             value['state'] = target
             value['operations'][operation_id] = {'digest': request, 'target': target}
+            value.setdefault('receipts', {})[operation_id] = value['pending']['completed']
             value['pending'] = None
             write(path, value)
             return self.status(agent)

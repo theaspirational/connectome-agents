@@ -21,3 +21,7 @@ from .providers import AIAccessProvider, DirectKeyProvider, InferenceGateProvide
 
 __all__ += ['ZulipIdentityProvider', 'AIAccessProvider', 'DirectKeyProvider',
             'InferenceGateProvider', 'FileSecretProvider']
+
+from .execution import ExecutionBackend, Executor, DryRunExecutor, ExecutorLifecycleAdapter
+
+__all__ += ['ExecutionBackend', 'Executor', 'DryRunExecutor', 'ExecutorLifecycleAdapter']

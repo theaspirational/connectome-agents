@@ -24,7 +24,7 @@ reimplementing validation or compilation. The shared module-utils lifecycle API
 adds offline persistence and adapter contracts. Explicit Python provider APIs
 now implement Zulip identity provisioning, local direct-key/inference-gate token
 consumption and optional file secrets; **planning never instantiates them**.
-There is still no apply/start implementation or role/chat integration; see
+There is an executor-only Python apply/verify/reconcile backend, but no real executor or role/chat integration; see
 [seed modes and initiation](spawn-lifecycle.md). No variable merging, `become`, ambient
 Ansible facts, environment defaults or private inventory enter the CLI.
 
@@ -262,7 +262,7 @@ or preflight paths. These are **draft recipes, not installable files**.
 A future apply adapter must bind the real role request directory, call
 `require_bound(apply_input)` (which refuses any surviving build token), validate
 all concrete paths and recipe fields, and recompute installed-file hashes before
-writing or execution. This package contains no apply/bind command. Do not feed
+writing or execution. There is no apply/bind CLI; the executor-only Python backend binds and rehashes files. Do not feed
 draft files directly to the existing deployment module. The admission-guard test
 explicitly proves that an unresolved draft is refused as an apply input.
 
@@ -323,9 +323,9 @@ configured integer limit is only recorded intent, not a verified quota.
 For explicit Python provider construction, file/ownership rules, conservative
 Zulip capabilities, durable receipts and recovery limits see
 [provider APIs](spawn-lifecycle.md#t4-slice-1-providers-now-available). Operator
-configuration stays role-only. The provider APIs do not connect the existing
-role to lifecycle execution; T5/frontend must do that with authorization and
-runtime safeguards.
+configuration stays role-only. The executor-only Python frontend does not instantiate real providers or run
+the existing role. Real role translation, authorization and runtime safeguards
+remain a later executor window.
 Optional `--name-repo "$CONFIG_REPO+names/example-agent.json@$FULL_COMMIT"` or
 `--name-file PATH` adds `plan.nameRecord` with the validated record, content-only
 recordHash and pinned provenance. The bootstrap recipe is unchanged; these are
@@ -347,3 +347,11 @@ mutation gate (private-file checks, native ownership/persona, pending-create
 replay and missing-token readiness). It copies fixtures under `.cache`, never
 changes production sources, and requires a green baseline plus five killed
 mutations.
+
+For the explicit Python `ExecutionBackend`, action list, separate service/MCP,
+provider-authentication and real-reply stages, retirement boundaries and audited
+`recover AGENT --operation ID --observed applied|not-applied --reason TEXT`, see
+[executor-only lifecycle](spawn-lifecycle.md#executor-only-apply-verify-and-reconcile).
+The default dry-run recorder cannot acknowledge a deployment. Run
+`python3 -B scripts/test-spawn-execution-mutations.py` for the isolated offline
+executor/recovery mutation gate.
