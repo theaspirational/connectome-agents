@@ -20,18 +20,24 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'roles/connectome_agent/module_utils'))
 from connectome_spawn import (SpawnError, ZulipIdentityProvider, DirectKeyProvider,
                               InferenceGateProvider, FileSecretProvider)
-from connectome_spawn.persistence import read
+from connectome_spawn.persistence import read, write_secret_bytes
 
 RECORD = {'name': 'ChosenAgent', 'displayName': 'Chosen Agent', 'summaryParticipant': 'ChosenAgent'}
 
 
 class ZulipFixture:
-    """Small endpoint model, including commit-then-disconnect and ownership."""
+    """Loopback Zulip wire model, never internal /register realm_bots records.
+
+    GET /bots uses get_bots_backend's exact field set and caller/active filter.
+    User endpoints project only documented fields consumed by this provider;
+    POST/PATCH/DELETE return only the common success envelope (payload ignored).
+    """
     def __init__(self):
         self.bots, self.calls = {}, []
         self.failure = None
         self.lost = None
         self.response_mode = None
+        self.user_overrides = {}
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -65,14 +71,19 @@ class ZulipFixture:
                     return
                 if fixture.failure and fixture.failure[0] == method:
                     code = fixture.failure[1]
-                    self.reply(code, {'result': 'error', 'msg': 'private response must not escape'})
+                    if len(fixture.failure) > 2:
+                        self.reply_raw(code, fixture.failure[2])
+                    else:
+                        self.reply(code, {'result': 'error', 'msg': 'private response must not escape'})
                     return
                 if path == '/users/me':
                     result = {'user_id': 1, 'is_bot': False, 'role': 100}
                 elif path.split('?')[0] == '/users':
-                    result = {'members': [dict(b, email=b['username']) for b in fixture.bots.values()]}
+                    self.reply(500, {'result': 'error', 'msg': 'whole-realm listing forbidden'})
+                    return
                 elif path == '/bots' and method == 'GET':
-                    result = {'bots': [dict(b) for b in fixture.bots.values() if b['owner_id'] == 1 and b['is_active']]}
+                    result = {'bots': [fixture.listed(b) for b in fixture.bots.values()
+                                       if b['owner_id'] == 1 and b['is_active']]}
                 elif path == '/bots' and method == 'POST':
                     short = data['short_name'][0]
                     if any(b['username'].split('-bot@')[0].lower() == short.lower() for b in fixture.bots.values()):
@@ -80,14 +91,16 @@ class ZulipFixture:
                         return
                     bot = fixture.add(short, data['full_name'][0])
                     assert data['bot_type'] == ['1']
-                    result = dict(bot)
+                    result = {}  # Provider must ignore the create payload.
                 elif path.startswith('/users/'):
                     key = path.split('/')[-1]
                     bot = next((b for b in fixture.bots.values() if str(b['user_id']) == key or b['username'] == key), None)
                     if bot is None:
                         self.reply(404, {'result': 'error'})
                         return
-                    result = {'user': dict(bot, bot_owner_id=bot['owner_id'], is_bot=True)}
+                    result = {'user': {k: bot[k] for k in ('user_id', 'full_name', 'is_active')}}
+                    result['user'].update(email=bot['username'], bot_owner_id=bot['owner_id'], is_bot=True)
+                    result['user'].update(fixture.user_overrides)
                 elif path.startswith('/bots/') and method in ('PATCH', 'DELETE'):
                     bot = fixture.bots.get(int(path.split('/')[-1]))
                     if not bot or bot['owner_id'] != 1:
@@ -106,7 +119,7 @@ class ZulipFixture:
                     self.connection.shutdown(socket.SHUT_RDWR)
                     self.connection.close()
                     return
-                self.reply(200, dict(result, result='success'))
+                self.reply(200, dict(result, result='success', msg=''))
 
             def reply(self, status, value):
                 self.reply_raw(status, json.dumps(value).encode())
@@ -134,6 +147,12 @@ class ZulipFixture:
                'api_key': 'bot-fixture-' + str(uid), 'owner_id': owner, 'is_active': active}
         self.bots[uid] = bot
         return bot
+
+    @staticmethod
+    def listed(bot):
+        return {**{k: bot[k] for k in ('username', 'full_name', 'api_key')},
+                'avatar_url': '', 'default_sending_stream': None,
+                'default_events_register_stream': None, 'default_all_public_streams': False}
 
     def count(self, method):
         return sum(c[0] == method for c in self.calls)
@@ -189,6 +208,9 @@ class ProviderTests(unittest.TestCase):
         self.provider().retire(handle, 'retire')
         self.assertEqual(self.http.count('DELETE'), 1)
         self.assertFalse(next(iter(self.http.bots.values()))['is_active'])
+        self.assertFalse(files[0].exists())
+        with self.assertRaisesRegex(SpawnError, 'retired'):
+            self.create(provider)
         rows = self.provider().list()
         self.assertTrue(rows[0]['retired'])
         for path in self.root.rglob('*'):
@@ -410,11 +432,39 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
         self.create()
         self.assertEqual(self.http.count('POST'), 1)
 
+    def test_parsed_post_refusal_releases_intent_and_allows_explicit_retry(self):
+        for status in (200, 400, 403, 408, 429, 500, 503):
+            with self.subTest(status=status):
+                self.root = self.work / ('refused-' + str(status))
+                self.http.bots.clear()
+                self.http.failure = ('POST', status)
+                with self.assertRaises(SpawnError) as caught:
+                    self.create()
+                self.assertNotIn('private response', str(caught.exception))
+                self.assertIn('reservation released', str(caught.exception))
+                self.assertIn('retryable' if status >= 500 or status in (408, 429) else 'terminal', str(caught.exception))
+                state = read(self.root / 'zulip.json')
+                self.assertEqual(state['operations'], {})
+                self.assertEqual(state['identities'], {})
+                self.assertEqual(self.http.bots, {})
+                self.http.failure = None
+                op = 'create' if status in (200, 400, 429) else 'different'
+                handle = self.create(op=op)
+                self.assertEqual(self.create(op=op), handle)
+
+    def test_real_owned_bot_shape_delivers_key_and_lists(self):
+        handle = self.create()
+        bot = next(iter(self.http.bots.values()))
+        self.assertEqual(set(self.http.listed(bot)), {'username', 'full_name', 'api_key', 'avatar_url',
+                         'default_sending_stream', 'default_events_register_stream', 'default_all_public_streams'})
+        self.assertEqual((self.secrets / handle['agent'] / (handle['id'] + '.key')).read_text(), bot['api_key'])
+        self.assertTrue(self.provider().list()[0]['active'])
+
     def test_post_errors_leave_uncertain_intent_and_changed_id_is_refused(self):
         for status in (400, 403, 429, 500, 503):
             with self.subTest(status=status):
                 self.root = self.work / ('provider-' + str(status))
-                self.http.failure = ('POST', status)
+                self.http.failure = ('POST', status, b'{invalid private response')
                 with self.assertRaises(SpawnError) as caught:
                     self.create()
                 self.assertNotIn('private response', str(caught.exception))
@@ -439,7 +489,12 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
                 with self.assertRaises(SpawnError):
                     self.create()
             self.assertEqual(len(self.http.bots), 1)
-        self.assertEqual(self.http.count('POST'), 0)
+        # Owned/active collisions are caught before submission. The foreign and
+        # inactive native collisions are definitive POST refusals, not adoption.
+        self.assertEqual(self.http.count('POST'), 2)
+        state = read(self.root / 'zulip.json')
+        self.assertEqual(state['operations'], {})
+        self.assertEqual(state['identities'], {})
 
     def test_foreign_or_changed_bot_during_reconciliation_is_refused(self):
         provider = self.provider()
@@ -488,7 +543,8 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
                         lambda: provider.rename(handle, dict(RECORD, name='a' * 64), 'rename'),
                         lambda: self.create(provider, agent='../escape'),
                         lambda: self.create(provider, name='a' * 64),
-                        lambda: self.create(provider, name='Bad Name')):
+                        lambda: self.create(provider, name='Bad Name'),
+                        lambda: self.create(provider, name='A')):
             with self.assertRaises(SpawnError):
                 request()
         provider.rename(handle, RECORD, 'rename')
@@ -546,6 +602,137 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
             with self.assertRaises(SpawnError) as caught:
                 self.provider()
             self.assertNotIn('operator-fixture', str(caught.exception))
+
+    def test_one_character_name_is_rejected_before_network(self):
+        with self.assertRaises(SpawnError):
+            self.create(name='A')
+        self.assertEqual(self.http.calls, [])
+        self.create(name='Ab')
+        self.assertEqual(self.http.count('POST'), 1)
+
+    def test_retire_retry_fsyncs_directory_after_interrupted_unlink(self):
+        from connectome_spawn import zulip
+        provider = self.provider()
+        handle = self.create(provider)
+        delivered = self.secrets / handle['agent'] / (handle['id'] + '.key')
+        with patch.object(zulip, 'sync_dir', side_effect=OSError('interrupted fsync')):
+            with self.assertRaises(OSError):
+                provider.retire(handle, 'retire')
+        self.assertFalse(delivered.exists())
+        self.assertEqual(self.http.count('DELETE'), 1)
+        self.assertEqual(read(self.root / 'zulip.json')['operations']['example-agent:retire']['state'], 'pending')
+        with patch.object(zulip, 'sync_dir', wraps=zulip.sync_dir) as sync:
+            provider.retire(handle, 'retire')
+        sync.assert_called_once_with(delivered.parent)
+        self.assertEqual(self.http.count('DELETE'), 1)
+        self.assertTrue(provider.list()[0]['retired'])
+
+    def test_retire_refuses_unsafe_key_replacement(self):
+        provider = self.provider()
+        handle = self.create(provider)
+        delivered = self.secrets / handle['agent'] / (handle['id'] + '.key')
+        delivered.chmod(0o644)
+        with self.assertRaises(SpawnError):
+            provider.retire(handle, 'retire')
+        self.assertTrue(delivered.exists())
+        self.assertFalse(next(iter(self.http.bots.values()))['is_active'])
+        delivered.chmod(0o600)
+        provider.retire(handle, 'retire')
+        self.assertFalse(delivered.exists())
+        self.assertEqual(self.http.count('DELETE'), 1)
+
+    def test_staged_key_conflict_never_promotes_or_overwrites(self):
+        path = self.work / 'key'
+        staging = self.private(self.work / '.key.pending', 'different-fixture')
+        with self.assertRaisesRegex(SpawnError, 'staging conflict'):
+            write_secret_bytes(path, b'expected-fixture')
+        self.assertEqual(staging.read_bytes(), b'different-fixture')
+        self.assertFalse(path.exists())
+
+    def test_staging_open_requires_exclusive_nofollow_flags(self):
+        path = self.work / 'key'
+        staging = self.work / '.key.pending'
+        original = os.open
+        seen = []
+        def raced_open(target, flags, *args, **kwargs):
+            if Path(target) == staging and flags & os.O_WRONLY:
+                seen.append(flags)
+                self.private(staging, 'raced-fixture')
+            return original(target, flags, *args, **kwargs)
+        with patch('connectome_spawn.persistence.os.open', side_effect=raced_open):
+            with self.assertRaises(FileExistsError):
+                write_secret_bytes(path, b'expected-fixture')
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0] & (os.O_EXCL | os.O_NOFOLLOW), os.O_EXCL | os.O_NOFOLLOW)
+        self.assertEqual(staging.read_bytes(), b'raced-fixture')
+        self.assertFalse(path.exists())
+
+    def test_staging_write_error_unlinks_partial_secret(self):
+        path = self.work / 'key'
+        original = os.fsync
+        def fail_file(fd):
+            if not os.path.isdir('/proc/self/fd/' + str(fd)):
+                raise OSError('simulated write error')
+            return original(fd)
+        with patch('connectome_spawn.persistence.os.fsync', side_effect=fail_file):
+            with self.assertRaises(OSError):
+                write_secret_bytes(path, b'expected-fixture')
+        self.assertFalse((self.work / '.key.pending').exists())
+        self.assertFalse(path.exists())
+
+    def test_delivery_conflict_never_accepts_different_key(self):
+        provider = self.provider()
+        handle = self.create(provider)
+        path = self.secrets / handle['agent'] / (handle['id'] + '.key')
+        before = path.read_bytes()
+        with self.assertRaisesRegex(SpawnError, 'delivery conflict'):
+            provider._deliver(handle, 'different-fixture')
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.http.count('POST'), 1)
+
+    def test_full_name_preflight_is_case_insensitive(self):
+        self.http.add('unrelated', 'newbornagent')
+        with self.assertRaisesRegex(SpawnError, 'name collision'):
+            self.create()
+        self.assertEqual(self.http.count('POST'), 0)
+
+    def test_retired_ledger_names_stay_reserved_without_active_bot(self):
+        provider = self.provider()
+        handle = self.create(provider)
+        provider.retire(handle, 'retire')
+        with self.assertRaisesRegex(SpawnError, 'name collision'):
+            self.create(provider, agent='another-agent', name='newbornagent', op='new')
+        self.assertEqual(self.http.count('POST'), 1)
+
+    def test_observe_checks_native_email_before_mutating(self):
+        provider = self.provider()
+        handle = self.create(provider)
+        next(iter(self.http.bots.values()))['username'] = 'changed-bot@users.noreply.github.com'
+        with self.assertRaises(SpawnError):
+            provider.retire(handle, 'retire')
+        with self.assertRaises(SpawnError):
+            provider.rename(handle, RECORD, 'rename')
+        self.assertEqual(self.http.count('DELETE'), 0)
+        self.assertEqual(self.http.count('PATCH'), 0)
+
+    def test_discover_explicit_owner_check_uses_individual_user(self):
+        # Even when /bots lists it as caller-owned, reject a changed owner in
+        # the per-user response (e.g. a transfer racing discovery).
+        self.http.user_overrides = {'bot_owner_id': 2}
+        with self.assertRaises(SpawnError):
+            self.create()
+        self.assertEqual(self.http.count('POST'), 1)
+        self.assertEqual(list(self.secrets.rglob('*.key')), [])
+        self.http.user_overrides = {}
+        self.create()
+        self.assertEqual(self.http.count('POST'), 1)
+
+    def test_large_realm_never_requires_whole_member_listing(self):
+        for i in range(4000):
+            self.http.add('foreign' + str(i), 'Foreign' + str(i), owner=2)
+        self.create()
+        self.assertFalse(any(path.split('?')[0] == '/users' for _, path, _ in self.http.calls))
+        self.assertTrue(any(path.startswith('/users/spawn') for _, path, _ in self.http.calls))
 
     def test_secrets_are_name_to_private_file_metadata_only(self):
         provider = FileSecretProvider(self.secrets)

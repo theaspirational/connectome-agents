@@ -268,11 +268,15 @@ The operator supplies a dedicated human administrator's zuliprc-style file:
 and have mode **0600**; the shared reader also refuses symlinks in every
 component, hard links and non-regular files. Credential bytes, their input path,
 and the raw operator email/site never enter handles, journals, plans or status.
-Use a least-privilege dedicated operator account: a bot inherits transport
-visibility from its owner. No subscriptions are created by this provider.
+The adapter requires a **human organization owner (role 100) or administrator
+(role 200)**, not a normal member or a bot. The account must also be allowed by
+the realm's bot-creation policy (`can_create_bots_group`). Use a dedicated admin
+with minimal stream subscriptions, not a personal administrator: its bots can
+post wherever their owner is subscribed, including private streams. This slice
+does not support a lower-privilege service owner and creates no subscriptions.
 
 Capabilities are `supports_rename=True`, `max_name_length=63`,
-`name_pattern=[A-Za-z][A-Za-z0-9_-]*`. Rename is supported by Zulip's
+`name_pattern=[A-Za-z][A-Za-z0-9_-]+` (minimum length **2**). Rename is supported by Zulip's
 `PATCH /api/v1/bots/{id}` with `full_name`; retirement uses
 `DELETE /api/v1/bots/{id}` (deactivation, not deletion/recycling).
 **63 and this ASCII grammar are conservative adapter-supported limits, not
@@ -282,12 +286,17 @@ policy can still refuse a name; names are never truncated. Provision/rename
 set `full_name` to the exact logical `name` (temporary name or name-record name),
 not `displayName`. Native email/short name remains unchanged on promotion.
 
-Create uses `POST /api/v1/bots` (`bot_type=1`), `GET /api/v1/bots` for owned bots,
-`GET /api/v1/users/me`, member listing (`include_deactivated=true`) and individual
-user reads for ownership, name and activity verification. The adapter requires
-modern responses with `owner_id` on owned bots, `bot_owner_id` on individual
-users, and deactivated users visible in member listings. Unsupported/incomplete
-responses fail closed. It requires a human owner/admin role (100 or 200).
+Create uses `POST /api/v1/bots` (`bot_type=1`), `GET /api/v1/bots`,
+`GET /api/v1/users/me` and individual `GET /api/v1/users/{email-or-id}` reads.
+There is **no whole-realm `GET /users` dependency**. Zulip's `get_bots_backend`
+already filters to caller-owned active bots. Its entries contain `username`,
+`full_name`, `api_key`, `avatar_url` and `default_*` settings, **not** `owner_id`,
+`user_id` or `is_active` (do not confuse these with `/register` `realm_bots`).
+Discovery uses the listed username to fetch that single user; the returned
+`user_id`, `email`, `is_bot`, `bot_owner_id`, `full_name`, `is_active` must match
+the reservation/operator. Later observations use its native id. No user-endpoint
+`username` fallback is assumed. POST response fields are ignored; PATCH/DELETE
+need only the success envelope. Unsupported/incomplete responses fail closed.
 Production transport is HTTPS with normal certificate verification, no proxy
 inheritance and no redirects. `allow_loopback_http=True` permits only the IPv4
 loopback literal for offline tests; it does not enable arbitrary plaintext sites.
@@ -295,14 +304,25 @@ Errors are value-free and never include response bodies, headers or credentials.
 
 The provider serializes writers and journals a random stable handle and its
 native short name (`spawn` plus handle id) **before POST**. This opaque native
-address is not a renamed display persona. Preflight refuses collisions, including
-existing operator-owned bots with identical full names, foreign bots and inactive
-accounts. A matching short-name prefix with a different full_name is always
-refused, as is a different owner. No unjournaled existing bot is adopted.
+address is not a renamed display persona. Preflight checks case-insensitive
+names against **all ledger tombstones** and the caller's active owned bots, and
+checks the native prefix in that owned listing. It does not enumerate foreign
+or inactive realm accounts. Zulip display names are not globally unique; this
+provider does **not** promise realm-wide full_name uniqueness. Native-address
+collisions, including foreign/inactive accounts, are rejected by Zulip at POST;
+a refusal is never permission to adopt the colliding account. A matching owned
+short-name prefix with a different full_name or a different per-user owner is
+always refused. No unjournaled existing bot is adopted.
 After POST (including a lost response), owned-bot listing and an individual user
 read reconcile the reservation. Retries after process death find that same bot,
-not a second POST. If no effect is observable after submission, the operation
-stays pending and POST is **never blindly repeated**, even after a 4xx/5xx. This
+not a second POST. A bounded, parsed Zulip JSON `result:error` response (including
+4xx/429 and JSON 5xx errors) means creation was refused: the reservation and
+pending intent are atomically released. The value-free error labels 408/429/5xx
+retryable and other refusals terminal (correct the request/policy first). There
+is no automatic retry; a later explicit call may use the same or a new id.
+Network loss, timeout, malformed/oversized responses, redirects or a 5xx without
+a parsed error remain ambiguous. If no committed bot is observable, the operation
+stays pending and POST is **never blindly repeated**. This
 also covers a crash just before POST: an operator must reconcile the no-effect
 case. New operation ids cannot bypass pending work for that agent. Observed,
 owned rename/deactivate retries are idempotent assignments; completed operation
@@ -315,12 +335,16 @@ is allowed. Bot API keys are delivered only to
 `secrets_root/AGENT/HANDLE_ID.key`: a single atomic **0600** byte file in a newly
 created **0700** directory. No key is serialized into a receipt or handle, and
 conflicting or unsafe existing key files are refused rather than overwritten.
+Retirement first verifies remote deactivation, then validates and unlinks the
+delivered key file and fsyncs its directory before committing the receipt. A
+crash between unlink and receipt is safely retryable. A completed create cannot
+redeliver a retired identity's key. Deactivation does not rotate the remote key:
+external copies may work if an administrator reactivates the bot; do not do so.
 Delivery uses one deterministic private staging inode (`.HANDLE_ID.key.pending`);
 a retry promotes that same inode after an interruption, never accumulates extra
 key copies. Partial/conflicting staging bytes require operator reconciliation.
-Completed create retries also refuse a missing/unsafe delivery file. Retired
-keys remain private files but the bot is inactive; key cleanup/rotation is an
-operator concern. `list()` observes only reserved/owned identities, reports
+Completed create retries also refuse a missing/unsafe delivery file. `list()`
+observes only reserved/owned identities, reports
 activity and pending reconciliation, and never returns API keys. Lost create
 receipts are discoverable via listing, but this is **not** automatic replay or
 recovery of a pending `Lifecycle` journal.
@@ -352,6 +376,11 @@ explicit uppercase secret name to `secrets_root/AGENT/NAME`. It returns only
 path/digest metadata, reads with the same private-file rules, and never searches
 the environment or creates/copies secrets. Requesting an absent/unsafe file is
 refused; omitting an optional integration never requires that file.
+
+Secret-file metadata currently uses unsalted SHA-256 content fingerprints. This
+is appropriate for random API keys/tokens but reveals offline-guessable hashes
+of low-entropy optional secrets. Keep receipts private; keyed/salted digests
+remain a follow-up, not a confidentiality guarantee of this slice.
 
 ### Plan declarations and remaining T5/frontend work
 

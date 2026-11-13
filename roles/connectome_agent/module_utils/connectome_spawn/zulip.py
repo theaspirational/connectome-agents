@@ -18,7 +18,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from .data import SpawnError, decode, digest, fields, match, need
 from .identity import validate_provider_name
-from .persistence import locked, read, safe_path, write, write_secret_bytes
+from .persistence import locked, read, safe_path, sync_dir, write, write_secret_bytes
 from .schema import NAME, name_record as validate_name_record
 from .sources import read_file
 
@@ -52,6 +52,26 @@ def _credentials(path, allow_loopback_http):
         raise SpawnError('invalid operator credential file') from None
 
 
+class ZulipRefusal(SpawnError):
+    """Parsed server error: no effect committed; never retain its private body."""
+    def __init__(self, status):
+        self.status = status
+        self.retryable = status in (408, 429) or status >= 500
+        super().__init__('Zulip request refused (HTTP ' + str(status) + ')')
+
+
+def _response(response, status):
+    raw = response.read(1024 * 1024 + 1)
+    need(raw.lstrip().startswith(b'{'), 'invalid Zulip JSON response')
+    value = decode(raw)
+    need(type(value) is dict, 'invalid Zulip JSON response')
+    if value.get('result') == 'error' and (200 <= status < 300 or 400 <= status < 600):
+        raise ZulipRefusal(status) from None
+    need(200 <= status < 300 and value.get('result') == 'success',
+         'Zulip request failed; reconcile provider state')
+    return value
+
+
 def api_call(credentials, method, path, params=None):
     """Bounded form-encoded REST call. No proxies, redirects, logs or raw errors."""
     params = {} if params is None else params
@@ -65,14 +85,18 @@ def api_call(credentials, method, path, params=None):
                                'Content-Type': 'application/x-www-form-urlencoded'})
     try:
         with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=10) as response:
-            need(200 <= response.status < 300, 'Zulip request failed; reconcile provider state')
-            raw = response.read(1024 * 1024 + 1)
-            need(raw.lstrip().startswith(b'{'), 'invalid Zulip JSON response')
-            value = decode(raw)
-            need(type(value) is dict and value.get('result') == 'success',
-                 'Zulip request failed; reconcile provider state')
-            return value
-    except (HTTPError, URLError, OSError, http.client.HTTPException, ValueError):
+            return _response(response, response.status)
+    except HTTPError as error:
+        try:
+            with error:
+                return _response(error, error.code)
+        except SpawnError as failure:
+            raise failure from None
+        except (OSError, http.client.HTTPException, ValueError):
+            raise SpawnError('Zulip request failed; reconcile provider state') from None
+    except SpawnError as failure:
+        raise failure from None
+    except (URLError, OSError, http.client.HTTPException, ValueError):
         raise SpawnError('Zulip request failed; reconcile provider state') from None
 
 
@@ -90,11 +114,11 @@ class ZulipIdentityProvider:
     PATCH /bots/{id} supports full_name rename, NOT native email rename. The
     declared 63-character ASCII identifier grammar is a conservative supported
     subset, not a claim about all server/version/realm name limits. Servers may
-    impose stricter policy; failures remain pending for reconciliation.
+    impose stricter policy; definitive refusals release create reservations.
     """
     supports_rename = True
     max_name_length = 63
-    name_pattern = r'[A-Za-z][A-Za-z0-9_-]*'
+    name_pattern = r'[A-Za-z][A-Za-z0-9_-]+'
 
     def __init__(self, root, *, zuliprc, secrets_root, allow_loopback_http=False):
         need(type(allow_loopback_http) is bool, 'invalid transport configuration')
@@ -177,55 +201,56 @@ class ZulipIdentityProvider:
         write(self.path, value)
 
     @staticmethod
-    def _members(credentials):
-        value = api_call(credentials, 'GET', '/users', {'include_deactivated': 'true'})
-        need(type(value.get('members')) is list and all(type(m) is dict for m in value['members']),
-             'invalid Zulip member listing')
-        return value['members']
+    def _bots(credentials):
+        # get_bots_backend filters bot_owner=caller, is_active=True. It does
+        # NOT return owner_id, user_id, is_active or /register realm_bots data.
+        bots = api_call(credentials, 'GET', '/bots').get('bots')
+        need(type(bots) is list and all(type(b) is dict and _email(b.get('username')) and
+             type(b.get('full_name')) is str for b in bots), 'invalid owned-bot listing')
+        return bots
 
     def _preflight(self, credentials, value, name, short_name=None, exclude=None):
-        # No adoption, even of an operator-owned bot with an identical persona.
+        # Never adopt an unjournaled account. Retired ledger names stay reserved.
         need(not any(i != exclude and row['name'].casefold() == name.casefold()
                      for i, row in value['identities'].items()), 'identity name collision; never reuse')
-        native = value['identities'][exclude]['native_id'] if exclude is not None else None
-        for member in self._members(credentials):
-            if native is not None and member.get('user_id') == native:
+        email = value['identities'][exclude]['email'] if exclude is not None else None
+        for bot in self._bots(credentials):
+            if email is not None and bot['username'] == email:
                 continue
-            email = member.get('email', member.get('username', ''))
-            need(type(email) is str and type(member.get('full_name')) is str, 'invalid Zulip member')
-            need(member.get('full_name', '').casefold() != name.casefold() and
-                 (short_name is None or not email.casefold().startswith(short_name.casefold() + '-bot@')),
+            need(bot['full_name'].casefold() != name.casefold() and
+                 (short_name is None or not bot['username'].casefold().startswith(short_name.casefold() + '-bot@')),
                  'Zulip name collision; never adopt an existing account')
+        # No realm-wide /users scan: full_name is not globally unique in Zulip.
+        # Native-address collisions with foreign/inactive users are refused by
+        # POST itself. Only a fresh successful create can be reconciled below.
 
     @staticmethod
     def _observe(credentials, operator, row, *, target=None):
         user = api_call(credentials, 'GET', '/users/' + str(row['native_id'])).get('user')
         need(type(user) is dict and user.get('user_id') == row['native_id'] and
              user.get('is_bot') is True and _user_id(user.get('bot_owner_id')) and user.get('bot_owner_id') == operator and
-             user.get('email', user.get('username')) == row['email'] and
+             user.get('email') == row['email'] and
              user.get('full_name') in (row['name'], target) and type(user.get('is_active')) is bool,
              'owned Zulip bot changed; reconciliation required')
         return user
 
     def _discover(self, credentials, operator, row):
-        bots = api_call(credentials, 'GET', '/bots').get('bots')
-        need(type(bots) is list and all(type(b) is dict for b in bots), 'invalid owned-bot listing')
+        bots = self._bots(credentials)
         prefix = row['short_name'].casefold() + '-bot@'
         found = [b for b in bots if type(b.get('username')) is str and b['username'].casefold().startswith(prefix)]
         need(len(found) <= 1, 'ambiguous owned-bot listing')
         if not found:
             # An absent active owned bot is NOT permission to repeat POST.
-            # Detect foreign/deactivated collisions without receiving their keys.
+            # Check owned-name collisions without receiving unrelated user data.
             self._preflight(credentials, {'identities': {}}, row['name'], row['short_name'])
             return None
         bot = found[0]
-        need(_email(bot.get('username')) and bot.get('full_name') == row['name'] and
-             _user_id(bot.get('owner_id')) and bot.get('owner_id') == operator,
+        need(_email(bot.get('username')) and bot.get('full_name') == row['name'],
              'Zulip bot collision; never adopt a different persona or owner')
         user = api_call(credentials, 'GET', '/users/' + quote(bot['username'], safe='')).get('user')
         need(type(user) is dict and _user_id(user.get('user_id')) and user.get('is_bot') is True and
              _user_id(user.get('bot_owner_id')) and user.get('bot_owner_id') == operator and user.get('full_name') == row['name'] and
-             user.get('is_active') is True and user.get('email', user.get('username')) == bot['username'],
+             user.get('is_active') is True and user.get('email') == bot['username'],
              'Zulip bot collision or inactive bot; reconciliation required')
         need(type(bot.get('api_key')) is str and bool(bot['api_key']) and
              not any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in bot['api_key']), 'invalid Zulip bot key')
@@ -247,6 +272,7 @@ class ZulipIdentityProvider:
             value = self._read()
             key, prior = self._prior(value, agent, operation_id, request)
             if prior and prior['state'] == 'complete':
+                need(not self._row(value, prior['handle'])['retired'], 'bot identity retired; key invalidated')
                 delivered = self.secrets_root / agent / (prior['handle']['id'] + '.key')
                 need(bool(read_file(delivered, root=self.secrets_root / agent, private=True)),
                      'delivered bot key missing; reconciliation required')
@@ -269,6 +295,14 @@ class ZulipIdentityProvider:
                     # Ignore returned key: one credential delivery path, by listing.
                     api_call(credentials, 'POST', '/bots', {'full_name': name,
                              'short_name': row['short_name'], 'bot_type': 1})
+                except ZulipRefusal as refusal:
+                    # A parsed Zulip error is definitive, unlike a lost reply.
+                    del value['operations'][key]
+                    del value['identities'][handle['id']]
+                    write(self.path, value)
+                    category = 'retryable' if refusal.retryable else 'terminal (correct request/policy)'
+                    raise SpawnError('Zulip create refused (HTTP ' + str(refusal.status) + '); ' +
+                                     category + '; reservation released') from None
                 except SpawnError:
                     pass  # POST may have committed. Listing is the authority.
             found = self._discover(credentials, operator, row)
@@ -339,6 +373,14 @@ class ZulipIdentityProvider:
                     pass
             user = self._observe(credentials, operator, row)
             need(not user['is_active'], 'Zulip retirement awaiting reconciliation')
+            delivered = safe_path(self.secrets_root / handle['agent'] / (handle['id'] + '.key'))
+            if os.path.lexists(delivered):
+                # Validate before deletion; never follow an unsafe replacement.
+                read_file(delivered, root=self.secrets_root / handle['agent'], private=True)
+                delivered.unlink()
+            # Also sync on retry if death followed unlink but preceded fsync.
+            if delivered.parent.exists():
+                sync_dir(delivered.parent)
             row['retired'] = True
             self._complete(value, key)
 
