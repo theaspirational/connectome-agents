@@ -9,6 +9,14 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = Path('roles/connectome_agent/module_utils/connectome_spawn')
 MUTATIONS = [
+    ('release-rename-after-prior-ambiguous-patch', 'zulip.py',
+     "if refusal is not None and not prior and user['full_name'] == row['name']:",
+     "if refusal is not None and user['full_name'] == row['name']:",
+     'ambiguous_rename_then_refusal_keeps_intent'),
+    ('retire-release-marks-retired', 'zulip.py',
+     "if refusal is not None and user['is_active']:\n",
+     "if refusal is not None and user['is_active']:\n                row['retired'] = True\n",
+     'refused_mutation_releases_intent_after_observation'),
     ('accept-unsafe-private-input', 'sources.py',
      '            if private:', '            if False:',
      'private_reader_refuses_modes_links_and_owner'),
@@ -74,7 +82,7 @@ MUTATIONS = [
      "            raise ZulipRefusal(error.code) from None",
      'error_body_read_failure_keeps_pending'),
     ('retain-refused-rename', 'zulip.py',
-     "if refusal is not None and user['full_name'] == row['name']:",
+     "if refusal is not None and not prior and user['full_name'] == row['name']:",
      "if False:",
      'refused_mutation_releases_intent_after_observation'),
     ('retain-refused-retire', 'zulip.py',

@@ -350,11 +350,14 @@ class ZulipIdentityProvider:
                 except SpawnError:
                     pass
             user = self._observe(credentials, operator, row, target=record['name'])
-            if refusal is not None and user['full_name'] == row['name']:
+            # An earlier ambiguous PATCH may still commit after this refusal.
+            # Only a first-attempt refusal can release the durable intent.
+            if refusal is not None and not prior and user['full_name'] == row['name']:
                 del value['operations'][key]
                 write(self.path, value)
                 raise SpawnError('Zulip rename refused (HTTP ' + str(refusal.status) +
-                                 '); intent released') from None
+                                 '); ' + ('retryable' if refusal.retryable else 'terminal (correct request/policy)') +
+                                 '; intent released') from None
             need(user['full_name'] == record['name'] and user['is_active'], 'Zulip rename awaiting reconciliation')
             row.update(name=record['name'], kind='permanent')
             self._complete(value, key)
@@ -387,7 +390,8 @@ class ZulipIdentityProvider:
                 del value['operations'][key]
                 write(self.path, value)
                 raise SpawnError('Zulip retirement refused (HTTP ' + str(refusal.status) +
-                                 '); intent released') from None
+                                 '); ' + ('retryable' if refusal.retryable else 'terminal (correct request/policy)') +
+                                 '; intent released') from None
             need(not user['is_active'], 'Zulip retirement awaiting reconciliation')
             delivered = safe_path(self.secrets_root / handle['agent'] / (handle['id'] + '.key'))
             if os.path.lexists(delivered):

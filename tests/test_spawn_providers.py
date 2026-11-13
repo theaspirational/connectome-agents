@@ -538,7 +538,7 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
                     self.http.add('foreign', RECORD['name'], owner=2)
                 else:
                     self.http.failure = (method, 400)
-                with self.assertRaisesRegex(SpawnError, 'refused.*intent released'):
+                with self.assertRaisesRegex(SpawnError, 'refused.*terminal.*intent released'):
                     if method == 'PATCH':
                         provider.rename(handle, RECORD, 'rename')
                     else:
@@ -547,9 +547,43 @@ ZulipIdentityProvider(sys.argv[2], zuliprc=sys.argv[3], secrets_root=sys.argv[4]
                 state = read(self.root / 'zulip.json')
                 self.assertFalse(any(o['state'] == 'pending' for o in state['operations'].values()))
                 self.assertEqual(state['identities'][handle['id']]['name'], 'NewbornAgent')
+                self.assertFalse(state['identities'][handle['id']]['retired'])
                 self.http.failure = None
                 provider.retire(handle, 'retire')
                 self.assertFalse(next(iter(self.http.bots.values()))['is_active'])
+
+    def test_ambiguous_rename_then_refusal_keeps_intent(self):
+        provider = self.provider()
+        handle = self.create(provider)
+        self.http.failure = ('PATCH', 503)
+        with self.assertRaises(SpawnError):
+            provider.rename(handle, RECORD, 'rename')
+        self.http.failure = ('PATCH', 429)
+        with self.assertRaises(SpawnError) as caught:
+            provider.rename(handle, RECORD, 'rename')
+        self.assertNotIn('intent released', str(caught.exception))
+        state = read(self.root / 'zulip.json')
+        self.assertEqual(state['operations']['example-agent:rename']['state'], 'pending')
+        # The original request lands late; reconciliation must still find it.
+        self.http.failure = None
+        next(iter(self.http.bots.values()))['full_name'] = RECORD['name']
+        self.assertEqual(provider.rename(handle, RECORD, 'rename'), handle)
+        self.assertEqual(self.http.count('PATCH'), 2)
+
+    def test_retryable_mutation_refusal_is_labelled(self):
+        for method in ('PATCH', 'DELETE'):
+            with self.subTest(method=method):
+                self.root = self.work / method
+                self.http.bots.clear()
+                provider = self.provider()
+                handle = self.create(provider)
+                self.http.failure = (method, 429)
+                with self.assertRaisesRegex(SpawnError, 'refused.*retryable.*intent released'):
+                    if method == 'PATCH':
+                        provider.rename(handle, RECORD, 'rename')
+                    else:
+                        provider.retire(handle, 'retire')
+                self.http.failure = None
 
     def test_refused_mutation_observed_effect_completes(self):
         for method in ('PATCH', 'DELETE'):
