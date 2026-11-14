@@ -47,7 +47,7 @@ class PublicTests(unittest.TestCase):
         ('secret store path', 'vault' + '/example/credential'),
         ('inventory key', 'ansible_' + 'host'),
         ('literal credential', 'EXAMPLE_' + 'TOKEN: "literal-value"'),
-        ('non-public email address', 'person' + '@' + 'example.invalid'),
+        ('non-public email address', 'person' + '@' + 'company.io'),
         ('unreviewed repository identity', 'https://github.' + 'com/unreviewed/connector.git'),
     ]
 
@@ -336,16 +336,38 @@ class PublicTests(unittest.TestCase):
             self.assertIn('denied identifier', result.stderr)
 
     def test_email_allowlist(self):
-        for domain in ('example.com', 'mail.invalid', 'localhost',
-                       'users.noreply.github.com.evil.invalid', 'example.invalid.evil'):
-            for local in ('person', 'first.last+tag'):
-                self.assertTrue(checker.hits(local + '@' + domain))
-        self.assertFalse(checker.hits('contributor+tag@' + 'users.noreply.github.com'))
-        for domain in ('example.invalid', 'EXAMPLE.INVALID'):
-            for local in ('noreply', 'contributors'):
-                self.assertFalse(checker.hits(local + '@' + domain))
-            for local in ('person', 'first.last', 'contributor+tag', 'agent-zeta', 'noreply+person'):
-                self.assertTrue(checker.hits(local + '@' + domain))
+        allowed = ('example.com', 'example.net', 'example.org',
+                   'a.example.com', 'a.example.net', 'a.example.org',
+                   'deep.a.example.com', 'EXAMPLE.COM', 'A.EXAMPLE.NET',
+                   'invalid', 'example', 'test', 'localhost',
+                   'example.invalid', 'EXAMPLE.INVALID', 'mail.invalid',
+                   'mail.example', 'mail.test', 'mail.localhost',
+                   'deep.mail.test', 'MAIL.LOCALHOST',
+                   'users.noreply.github.com.evil.invalid',
+                   'users.noreply.github.com')
+        for domain in allowed:
+            for local in ('noreply', 'contributors', 'person', 'first.last+tag', 'noreply+person'):
+                address = local + '@' + domain
+                with self.subTest(address=address):
+                    self.assertFalse(checker.hits(address))
+                    self.assertFalse(checker.hits('--author=Fixture Initiator <' + address + '>'))
+                    self.assertFalse(checker.hits('user.email=' + address))
+        rejected = ('gmail.com', 'company.io', 'example.io', 'example.co', 'example.dev',
+                    'example.invalid.attacker.com', 'notexample.com', 'badexample.com',
+                    'example.com.evil.io', 'example.net.evil.io', 'example.org.evil.io',
+                    'badexample.net', 'badexample.org', 'notinvalid', 'nottest',
+                    'notexample', 'notlocalhost', 'mail.test.evil.io',
+                    'mail.example.evil.io', 'mail.localhost.evil.io',
+                    'example.invalid.evil', 'users.noreply.github.com.evil.io',
+                    'sub.users.noreply.github.com')
+        for domain in rejected:
+            address = 'name' + '@' + domain
+            with self.subTest(domain=domain):
+                self.assertIn('non-public email address', checker.hits(address))
+                # One allowed address cannot mask another, rejected address.
+                self.assertTrue(checker.private_email('person@example.com ' + address))
+        # Reserved domains do not bypass the independent denylist rule.
+        self.assertIn('denied identifier', checker.hits('agent-zeta' + '@' + 'example.invalid'))
         self.assertFalse(checker.hits('unit charset [A-Za-z0-9_.@-]+'))
 
     def test_commit_range_messages_and_both_identities_scanned(self):
@@ -376,10 +398,10 @@ class PublicTests(unittest.TestCase):
             git('commit', '--allow-empty', '-qm', 'Neutral subject\n\n' + self.DENY_TERMS[0])
             message = git('rev-parse', 'HEAD')
             git('commit', '--allow-empty', '-qm', 'Neutral author test',
-                overrides={'GIT_AUTHOR_EMAIL': 'person@' + 'private.invalid'})
+                overrides={'GIT_AUTHOR_EMAIL': 'person@' + 'company.io'})
             author = git('rev-parse', 'HEAD')
             git('commit', '--allow-empty', '-qm', 'Neutral committer test',
-                overrides={'GIT_COMMITTER_EMAIL': 'person@' + 'private.invalid'})
+                overrides={'GIT_COMMITTER_EMAIL': 'person@' + 'company.io'})
             committer = git('rev-parse', 'HEAD')
             result = scan(base + '..HEAD')
             self.assertEqual(result.returncode, 1)

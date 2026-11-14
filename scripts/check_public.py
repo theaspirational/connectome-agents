@@ -11,8 +11,9 @@ import sys
 import yaml
 
 NOREPLY_DOMAIN = 'users.noreply.github.com'
-# Explicit neutral locals only; includes the repository's legacy Git identity.
-EXAMPLE_EMAIL_LOCALS = {'noreply', 'contributors'}
+# RFC 2606 / RFC 6761 names, matched only at whole DNS-label boundaries.
+RESERVED_EMAIL_DOMAINS = ('example.com', 'example.net', 'example.org',
+                          'invalid', 'example', 'test', 'localhost')
 EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
 ALLOWED_REPOS = {
     'anima-research': {'connectome-host', 'agent-framework', 'connectome-cook',
@@ -24,9 +25,10 @@ ALLOWED_REPOS = {
 
 
 def private_email(content):
-    return any(domain != NOREPLY_DOMAIN and not (domain == 'example.invalid' and
-               local in EXAMPLE_EMAIL_LOCALS) for local, domain in
-               (match.group().lower().rsplit('@', 1) for match in EMAIL.finditer(content)))
+    return any(domain != NOREPLY_DOMAIN and not any(
+               domain == reserved or domain.endswith('.' + reserved)
+               for reserved in RESERVED_EMAIL_DOMAINS) for domain in
+               (match.group().lower().rsplit('@', 1)[1] for match in EMAIL.finditer(content)))
 
 
 def unreviewed_repo(content):
