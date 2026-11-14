@@ -366,6 +366,17 @@ class PublicTests(unittest.TestCase):
                 self.assertIn('non-public email address', checker.hits(address))
                 # One allowed address cannot mask another, rejected address.
                 self.assertTrue(checker.private_email('person@example.com ' + address))
+        # Construct rejected chains so the publication gate can scan this fixture.
+        chains = ('x' + '@' + 'test' + '@' + 'gmail.com',
+                  'x' + '@' + 'jane.test' + '@' + 'corp.io',
+                  'x' + '@' + 'localhost' + '@' + 'corp.io',
+                  'a' + '@' + 'example.com' + '@' + 'gmail.com',
+                  'x' + '@' + 'users.noreply.github.com' + '@' + 'gmail.com',
+                  'x' + '@' + 'test' + '@' + 'example.com',
+                  'x' + '@' + '@' + 'example.com')
+        for address in chains:
+            with self.subTest(chain=address):
+                self.assertIn('non-public email address', checker.hits(address))
         # Reserved domains do not bypass the independent denylist rule.
         self.assertIn('denied identifier', checker.hits('agent-zeta' + '@' + 'example.invalid'))
         self.assertFalse(checker.hits('unit charset [A-Za-z0-9_.@-]+'))

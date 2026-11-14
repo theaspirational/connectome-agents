@@ -15,6 +15,8 @@ NOREPLY_DOMAIN = 'users.noreply.github.com'
 RESERVED_EMAIL_DOMAINS = ('example.com', 'example.net', 'example.org',
                           'invalid', 'example', 'test', 'localhost')
 EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
+# Include every local-part character so overlapping addresses stay in one token.
+EMAIL_TOKEN = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~@-]+")
 ALLOWED_REPOS = {
     'anima-research': {'connectome-host', 'agent-framework', 'connectome-cook',
                        'slack-mcpl', 'github-mcpl', 'terminal-sessions-mcp', 'heartbeat-mcpl'},
@@ -25,6 +27,9 @@ ALLOWED_REPOS = {
 
 
 def private_email(content):
+    # Allowances must never hide another address in a malformed multi-at-sign chain.
+    if any(token.group().count('@') > 1 for token in EMAIL_TOKEN.finditer(content)):
+        return True
     return any(domain != NOREPLY_DOMAIN and not any(
                domain == reserved or domain.endswith('.' + reserved)
                for reserved in RESERVED_EMAIL_DOMAINS) for domain in
