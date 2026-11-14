@@ -14,9 +14,17 @@ NOREPLY_DOMAIN = 'users.noreply.github.com'
 # RFC 2606 / RFC 6761 names, matched only at whole DNS-label boundaries.
 RESERVED_EMAIL_DOMAINS = ('example.com', 'example.net', 'example.org',
                           'invalid', 'example', 'test', 'localhost')
-EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?")
-# Include every local-part character so overlapping addresses stay in one token.
-EMAIL_TOKEN = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~@-]+")
+# A final alphabetic label excludes package versions; do not accept a prefix
+# of a longer DNS label/domain. A sentence's trailing period is not a label.
+EMAIL_DOMAIN = (r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*"
+                r"[A-Za-z]{2,}(?![A-Za-z0-9-]|\.[A-Za-z0-9-])")
+# Slash and apostrophe delimit paths/package scopes and quoted imports, rather
+# than supplying a local part for an otherwise bare at-sign.
+EMAIL = re.compile(r"[A-Za-z0-9.!#$%&*+=?^_`{|}~-]+@" + EMAIL_DOMAIN)
+EMAIL_TOKEN = re.compile(r"[A-Za-z0-9.!#$%&*+=?^_`{|}~@-]+")
+# Require something before the first at-sign and after the second, plus an
+# address-like domain: version/revision chains are not email addresses.
+EMAIL_CHAIN = re.compile(r"[^@]@[^@]*@" + EMAIL_DOMAIN)
 ALLOWED_REPOS = {
     'anima-research': {'connectome-host', 'agent-framework', 'connectome-cook',
                        'slack-mcpl', 'github-mcpl', 'terminal-sessions-mcp', 'heartbeat-mcpl'},
@@ -28,7 +36,7 @@ ALLOWED_REPOS = {
 
 def private_email(content):
     # Allowances must never hide another address in a malformed multi-at-sign chain.
-    if any(token.group().count('@') > 1 for token in EMAIL_TOKEN.finditer(content)):
+    if any(EMAIL_CHAIN.search(token.group()) for token in EMAIL_TOKEN.finditer(content)):
         return True
     return any(domain != NOREPLY_DOMAIN and not any(
                domain == reserved or domain.endswith('.' + reserved)

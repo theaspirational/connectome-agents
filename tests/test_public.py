@@ -381,6 +381,76 @@ class PublicTests(unittest.TestCase):
         self.assertIn('denied identifier', checker.hits('agent-zeta' + '@' + 'example.invalid'))
         self.assertFalse(checker.hits('unit charset [A-Za-z0-9_.@-]+'))
 
+    # Split real-address fixtures so the publication gate can scan its tests.
+    EMAIL_REVIEW_PROBES = (
+        ('@@ -1,2 +1,2 @@', False),
+        ('@@decorator', False),
+        ('@scope/pkg@^1.2.3', False),
+        ('"@types/node@^22.0.0"', False),
+        ('"@types/node@^22.0.0", ...', False),
+        ('npm install @scope/pkg@^1.2.3', False),
+        ('@scope/pkg@1.2.3', False),
+        ('"@types/node@22.0.0"', False),
+        ('lodash@4.17.21', False),
+        ('name@1.0.0@abc123', False),
+        ("import x from '@scope/pkg'", False),
+        ("'@scope/pkg'", False),
+        ('node_modules/@types/node', False),
+        ('"node_modules/@types/node": {', False),
+        ('resolved "https://registry.yarnpkg.com/@types/node/-/node-22.0.0.tgz#abc123"', False),
+        ('@Component({})', False),
+        ('a @ b', False),
+        ('"@types/node": "^22"', False),
+        ('@scope/pkg', False),
+        (' @scope/pkg', False),
+        ('"@scope/pkg"', False),
+        ('/@scope/pkg', False),
+        ('(@scope/pkg)', False),
+        ('[@scope/pkg]', False),
+        ('@1.2.3', False),
+        ('@4.17.21', False),
+        ('@22.0.0', False),
+        ('x' + '@' + 'test' + '@' + 'gmail.com', True),
+        ('x' + '@' + 'test.' + '@' + 'gmail.com', True),
+        ('x' + '@' + 'test-' + '@' + 'gmail.com', True),
+        ('x' + '@' + 'test.-' + '@' + 'gmail.com', True),
+        ('x' + '@' + 'users.noreply.github.com.' + '@' + 'gmail.com', True),
+        ('x@test,' + '@gmail.com', False),
+        ('x@test:' + '@gmail.com', False),
+        ('x@test ' + '@gmail.com', False),
+        ('jane.doe' + '@' + 'corp.io', True),
+        ('j+tag' + '@' + 'mail.company.co.uk', True),
+        ('git' + '@' + 'github.com:org/repo', True),
+        ('git' + '@' + 'github.com:anima-research/repo', True),
+        # Keep label-bounded allowances and sentence punctuation working.
+        ('name' + '@' + 'example.com.evil.io', True),
+        ('name' + '@' + 'corp.io.', True),
+    )
+
+    def test_email_review_probes(self):
+        for content, rejected in self.EMAIL_REVIEW_PROBES:
+            with self.subTest(content=content, rejected=rejected):
+                self.assertEqual(checker.private_email(content), rejected)
+                self.assertEqual('non-public email address' in checker.hits(content), rejected)
+
+    def test_cli_npm_and_patch_content_allowed(self):
+        root = Path(__file__).resolve().parents[1]
+        fixtures = (
+            ('README.md', 'npm install @scope/pkg@^1.2.3\n'),
+            ('lodash+4.17.21.patch', '@@ -1,2 +1,2 @@\n'),
+            ('package-lock.json', '{"packages": {"node_modules/@types/node": {}}}\n'),
+            ('yarn.lock', '"@types/node@^22.0.0":\n'
+             '  resolved "https://registry.yarnpkg.com/@types/node/-/node-22.0.0.tgz#abc123"\n'),
+        )
+        for name, body in fixtures:
+            with self.subTest(name=name, body=body):
+                probe = Path(self.tmp.name) / name
+                probe.write_text(body, encoding='utf-8')
+                result = subprocess.run(
+                    [sys.executable, str(root / 'scripts/check_public.py'), name],
+                    cwd=self.tmp.name, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_commit_range_messages_and_both_identities_scanned(self):
         root = Path(__file__).resolve().parents[1]
         (root / '.cache').mkdir(exist_ok=True)
