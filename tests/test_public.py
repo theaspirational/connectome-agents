@@ -410,6 +410,7 @@ class PublicTests(unittest.TestCase):
         ('@1.2.3', False),
         ('@4.17.21', False),
         ('@22.0.0', False),
+        ('pkg@1.2.3', False),
         ('x' + '@' + 'test' + '@' + 'gmail.com', True),
         ('x' + '@' + 'test.' + '@' + 'gmail.com', True),
         ('x' + '@' + 'test-' + '@' + 'gmail.com', True),
@@ -425,6 +426,14 @@ class PublicTests(unittest.TestCase):
         # Keep label-bounded allowances and sentence punctuation working.
         ('name' + '@' + 'example.com.evil.io', True),
         ('name' + '@' + 'corp.io.', True),
+        # Punycode TLDs are address-like, unlike numeric package versions.
+        ('jane' + '@' + 'corp.xn--p1ai', True),
+        ('jane' + '@' + 'xn--80ak6aa92e.xn--p1ai', True),
+        ('jane' + '@' + 'corp.xn--fiqs8s', True),
+        # A standalone hyphen or prose dash does not extend a DNS label.
+        ('jane' + '@' + 'corp.io-', True),
+        ('jane' + '@' + 'corp.io--she said', True),
+        ('jane' + '@' + 'corp.io-x', False),
     )
 
     def test_email_review_probes(self):

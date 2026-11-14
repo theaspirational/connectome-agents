@@ -14,10 +14,11 @@ NOREPLY_DOMAIN = 'users.noreply.github.com'
 # RFC 2606 / RFC 6761 names, matched only at whole DNS-label boundaries.
 RESERVED_EMAIL_DOMAINS = ('example.com', 'example.net', 'example.org',
                           'invalid', 'example', 'test', 'localhost')
-# A final alphabetic label excludes package versions; do not accept a prefix
-# of a longer DNS label/domain. A sentence's trailing period is not a label.
+# A final alphabetic or punycode label excludes package versions; do not accept
+# a prefix of a longer DNS label/domain. Trailing punctuation is not a label.
 EMAIL_DOMAIN = (r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*"
-                r"[A-Za-z]{2,}(?![A-Za-z0-9-]|\.[A-Za-z0-9-])")
+                r"(?:[A-Za-z]{2,}|xn--[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)"
+                r"(?![A-Za-z0-9]|-[A-Za-z0-9]|\.[A-Za-z0-9-])")
 # Slash and apostrophe delimit paths/package scopes and quoted imports, rather
 # than supplying a local part for an otherwise bare at-sign.
 EMAIL = re.compile(r"[A-Za-z0-9.!#$%&*+=?^_`{|}~-]+@" + EMAIL_DOMAIN)
