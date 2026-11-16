@@ -1,7 +1,7 @@
 ---
 # Thin layer over connectome-kitchen for one deployment without a catalog. See docs/kitchen.md.
 # One run is one operation on one agent:
-#   name | plan | prepare | verify | start | rollback | readback
+#   name | plan | prepare | verify | start | rollback | readback | clear
 connectome_kitchen_operation: ""
 
 # The kitchen install: a directory with dist/, scripts/takeover.mjs and KITCHEN_COMMIT.
@@ -70,11 +70,14 @@ connectome_kitchen_watch_seconds: 120
 connectome_kitchen_runner_timeout_seconds: 300
 # On a failed start or a failed watch, put the previous build back at once.
 connectome_kitchen_auto_rollback: true
-# Start although the secrets file gives the new process another environment than the running one has.
+# Start although the secrets file gives the new process another environment than the running one has: every
+# difference, named or not (a rotated key, another base URL). The names that differ are printed by `verify`; no value is.
 connectome_kitchen_secrets_differ_ok: false
 # The secret files (by the name of their environment variable) this request adds: the running deployment has none of
-# them. With them named, `start` takes an environment file that differs for what it is, as long as every other secret
-# file is what the start would write and none of the named ones is there yet. Any other difference still refuses.
+# them. With them named, `start` takes an environment file that has exactly these names more and differs in nothing
+# else, name by name (files/kitchen-secrets.mjs), as long as every other secret file is what the start would write and
+# none of the named ones is there yet. A direct value that changed, or any other name added or removed, still refuses:
+# naming a new file authorizes that file and nothing beside it. `clear` removes exactly these files after a rollback.
 connectome_kitchen_secret_files_new: []
 
 # What `verify` and `readback` hold the recipe to. Paths are RFC 6901 pointers into the recipe.

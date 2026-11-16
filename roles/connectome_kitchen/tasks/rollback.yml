@@ -1,6 +1,8 @@
 ---
 # The way back to the build prepare saved: code and configuration only (files/kitchen-pointers.sh says exactly what).
-# The gates of a restart were passed in main.yml.
+# The gates of a restart were passed in main.yml. Exit 0 of `back` means: the three links, the drop-in and
+# ownership.json are the saved ones and the agent runs the saved build, or nothing had to be put back. A way back that
+# failed part way is taken up again by the next one, which puts all five back before it says so.
 
 - name: Put the saved build back and start the agent on it
   ansible.builtin.command:
@@ -12,7 +14,7 @@
 
 - name: Show the way back
   ansible.builtin.debug:
-    msg: "{{ ck_back.stdout_lines + ['back: exit ' + (ck_back.rc | string) + ' (' + {0: 'the agent runs the saved build', 60: 'refused before any change', 61: 'put back, but the agent is not running: IT MAY BE DOWN', 62: 'a step failed part way: IT MAY BE DOWN'}.get(ck_back.rc, 'unexpected') + ')'] }}"
+    msg: "{{ ck_back.stdout_lines + ['back: exit ' + (ck_back.rc | string) + ' (' + {0: 'the agent runs the saved build', 60: 'refused before any change', 61: 'put back, but the agent is not running: IT MAY BE DOWN', 62: 'a step failed part way: IT MAY BE DOWN. The way back is not complete; run it again when the cause is gone'}.get(ck_back.rc, 'unexpected') + ')'] + ((['left as they are: the secret files this window introduced (' + (connectome_kitchen_secret_files_new | sort | join(', ')) + '). Before a retry: the same play with connectome_kitchen_operation=clear']) if (connectome_kitchen_secret_files_new | length) > 0 and ck_back.rc == 0 and 'Nothing to put back' not in ck_back.stdout else []) }}"
 
 - name: Stop unless the agent runs the saved build
   ansible.builtin.assert:

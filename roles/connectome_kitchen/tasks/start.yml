@@ -5,7 +5,8 @@
 #   1. nothing moved since verify, and verify once more
 #   2. kitchen start: the engine writes the environment file, moves the pointer and the unit links, reloads, restarts
 #      the one unit once and asks its health. If a step of that fails the engine itself puts the previous build back.
-#   3. the agent runs the new build, in another process
+#   3. the agent runs the new build, in another process, and the environment file the engine wrote differs from the
+#      previous build's in exactly the names that were held before the start
 #   4. the same process still runs after connectome_kitchen_watch_seconds
 #   5. verify again, and readback
 # If 2, 3 or 4 fails and the agent is not running the previous build, the previous build is put back (rollback.yml)
@@ -50,7 +51,11 @@
       - ck_result.plan.prepare.changed is false
       - ck_result.plan.activate.changed is true
       - ck_environment != 'ANOTHER-ENVIRONMENT' or (connectome_kitchen_secrets_differ_ok | bool)
-    fail_msg: "Not started: the plan is not build prepared and activation due, or the secrets file would give the new process another environment or secret file than the running one has, beyond the secret files named as new (if you know why: connectome_kitchen_secrets_differ_ok=true). Nothing was changed, no restart."
+    fail_msg: "Not started: the plan is not build prepared and activation due, or the secrets file would give the new process another environment or secret file than the running one has, beyond the secret files named as new. {{ ck_environment_words }}. A changed, added or removed name that is not a secret file named as new is never taken with them; if you know why it differs: connectome_kitchen_secrets_differ_ok=true takes every difference. Nothing was changed, no restart."
+
+- name: Keep the names that were held, for after the start
+  ansible.builtin.set_fact:
+    ck_held_secrets: "{{ ck_secrets }}"
 
 - name: The start, and what follows from it
   block:
@@ -83,6 +88,31 @@
           - ck_after.stdout_lines[-1] is match('^process [1-9][0-9]* [0-9]+$')
           - ck_after.stdout_lines[-1].split(' ')[1] != ck_before.stdout_lines[-1].split(' ')[1]
         fail_msg: "start exited 0 but the agent is not active and running on the new build in a new process"
+
+    # The engine reads the secrets file again when it starts. What it wrote is held to what was held before.
+    - name: Ask in which names the environment file the engine wrote differs from the previous build's (names, never a value)
+      ansible.builtin.command:
+        argv: "{{ ck_as + [connectome_kitchen_node, role_path + '/files/kitchen-secrets.mjs', connectome_kitchen_home, ck_keep + '/inputs/request.json', 'written'] }}"
+        chdir: "{{ connectome_kitchen_home }}"
+      changed_when: false
+      failed_when: false
+      no_log: true
+      register: ck_wrote
+
+    - name: Read those names
+      ansible.builtin.set_fact:
+        ck_written: "{{ (ck_wrote.stdout | from_json) if (ck_wrote.rc in [0, 3] and ck_wrote.stdout[:1] == '{') else {'compared': false, 'reason': 'the comparison could not be run (exit ' + (ck_wrote.rc | string) + ')'} }}"
+
+    - name: Stop here unless the environment file the engine wrote differs in exactly the names held before the start
+      ansible.builtin.assert:
+        that:
+          - ck_written.compared
+          - ck_held_secrets.compared
+          - ck_written.changed == ck_held_secrets.changed
+          - ck_written.added == ck_held_secrets.added
+          - ck_written.removed == ck_held_secrets.removed
+        fail_msg: "the environment file the engine wrote for the new build does not differ from the previous build's in exactly the names held before the start ({{ ('changed: ' + (ck_written.changed | join(', ') | default('none', true)) + '; added: ' + (ck_written.added | join(', ') | default('none', true)) + '; removed: ' + (ck_written.removed | join(', ') | default('none', true))) if ck_written.compared else ck_written.reason }}): the secrets file changed between the check and the start"
+      when: not (connectome_kitchen_secrets_differ_ok | bool)
 
     - name: "Wait {{ connectome_kitchen_watch_seconds }} s: the same process must still run"
       ansible.builtin.command:
@@ -150,6 +180,7 @@
   ansible.builtin.debug:
     msg:
       - "STARTED: {{ ck_name }} runs build {{ connectome_kitchen_build[:8] }}; {{ ck_stable.stdout_lines[-1] }} (pid, restarts), the same after {{ connectome_kitchen_watch_seconds }} s"
+      - "environment file as written, against the previous build's: {{ ('changed: ' + (ck_written.changed | join(', ') | default('none', true)) + '; added: ' + (ck_written.added | join(', ') | default('none', true)) + '; removed: ' + (ck_written.removed | join(', ') | default('none', true))) if ck_written.compared else ck_written.reason }}"
       - "verify after the start: {{ 'nothing to change' if ck_result.plan.changed is false else 'LOOK: the plan still has something to change' }}"
       - "readback: {{ 'every line ok' if (ck_inspect_rc | int) == 0 else 'LOOK lines above (a budget line appears only after the first turn: run readback again then)' }}"
       - "The check that counts is the agent's own: does it answer, with its history and offsets where they were."

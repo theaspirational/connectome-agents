@@ -1,7 +1,9 @@
 ---
 # One step of the runner of kitchen (scripts/takeover.mjs MODE --input FILE), as the account, in a closed environment.
 # In: ck_mode (check, prepare, verify, start). Out: ck_result: rc, plan, same_environment, environment_file, secret_files,
-# unclosed (files/kitchen-step.py); ck_environment: same-environment, new-secret-files or ANOTHER-ENVIRONMENT.
+# unclosed (files/kitchen-step.py). After verify also: ck_secrets, the names in which the environment file of a start
+# would differ from the running build's (files/kitchen-secrets.mjs), and ck_environment: same-environment,
+# new-secret-files or ANOTHER-ENVIRONMENT, with ck_environment_words to say it.
 # The step helper prints the closed part of what the runner wrote. An engine failure that is not one of its refusals has
 # the text of an exception; that line is not shown and stays in the log of the account.
 
@@ -16,11 +18,32 @@
   ansible.builtin.set_fact:
     ck_result: "{{ ck_run.stdout_lines[-1][7:] | from_json }}"
 
-# new-secret-files: the environment file differs, every secret file but the ones named as new is what the start would
-# write, and each of the named ones is not there yet. What else the environment file differs in is not known here.
+# The runner answers yes or no for the environment file as a whole. Which names differ is asked here, of the same
+# secrets file and the same request, with kitchen's own reading of the layers. Names only leave the helper.
+- name: "Ask in which names the environment file would differ from the running build's (names, never a value): {{ ck_mode }}"
+  ansible.builtin.command:
+    argv: "{{ ck_as + [connectome_kitchen_node, role_path + '/files/kitchen-secrets.mjs', connectome_kitchen_home, ck_keep + '/inputs/request.json', 'proposed'] }}"
+    chdir: "{{ connectome_kitchen_home }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+  register: ck_compared
+  when: ck_mode == 'verify'
+
+- name: "Read the names: {{ ck_mode }}"
+  ansible.builtin.set_fact:
+    ck_secrets: "{{ (ck_compared.stdout | from_json) if (ck_compared.rc in [0, 3] and ck_compared.stdout[:1] == '{') else {'compared': false, 'reason': 'the comparison could not be run (exit ' + (ck_compared.rc | string) + ')'} }}"
+  when: ck_mode == 'verify'
+
+# same-environment: the runner says so and no name differs.
+# new-secret-files: nothing is changed and nothing removed; what is added is exactly the secret files named as new, each
+# a secret file of the request; and, by the runner, every other secret file is what the start would write and none of
+# the named ones is there yet. Any other difference, or no comparison: ANOTHER-ENVIRONMENT.
 - name: "Say what the secrets file gives the new process: {{ ck_mode }}"
   ansible.builtin.set_fact:
-    ck_environment: "{{ 'same-environment' if ck_result.same_environment else ('new-secret-files' if ((connectome_kitchen_secret_files_new | length) > 0 and ck_result.environment_file is false and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='key') | sort) == (connectome_kitchen_secret_files_new | sort) and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='value') | reject('none') | list | length) == 0) else 'ANOTHER-ENVIRONMENT') }}"
+    ck_environment: "{{ 'ANOTHER-ENVIRONMENT' if not ck_secrets.compared else ('same-environment' if (ck_result.same_environment and ((ck_secrets.changed + ck_secrets.added + ck_secrets.removed) | length) == 0) else ('new-secret-files' if ((connectome_kitchen_secret_files_new | length) > 0 and ck_result.environment_file is false and (ck_secrets.changed | length) == 0 and (ck_secrets.removed | length) == 0 and (ck_secrets.added | sort) == (connectome_kitchen_secret_files_new | sort) and (connectome_kitchen_secret_files_new | reject('in', ck_secrets.secret_files) | list | length) == 0 and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='key') | sort) == (connectome_kitchen_secret_files_new | sort) and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='value') | reject('none') | list | length) == 0) else 'ANOTHER-ENVIRONMENT')) }}"
+    ck_environment_words: "{{ ('names of the environment file: ' + (ck_secrets.same | length | string) + ' the same; changed: ' + (ck_secrets.changed | join(', ') | default('none', true)) + '; added: ' + (ck_secrets.added | join(', ') | default('none', true)) + '; removed: ' + (ck_secrets.removed | join(', ') | default('none', true)) + '. Secret files that are not what the start would write: ' + (ck_result.secret_files | dict2items | selectattr('value', 'false') | map(attribute='key') | sort | join(', ') | default('none', true)) + '; not there: ' + (ck_result.secret_files | dict2items | selectattr('value', 'none') | map(attribute='key') | sort | join(', ') | default('none', true))) if ck_secrets.compared else ('the environment file could not be held name by name: ' + ck_secrets.reason) }}"
+  when: ck_mode == 'verify'
 
 - name: "Show the answer of kitchen: {{ ck_mode }}"
   ansible.builtin.debug:

@@ -7,6 +7,7 @@
 #   kitchen-pointers.sh back          put code and configuration back to the saved build and start the agent on it
 #   kitchen-pointers.sh mark BUILD WORD WORD   keep what verify found of BUILD, and the digest of ownership.json, for the start
 #   kitchen-pointers.sh held BUILD    is BUILD the one verify marked, and ownership.json still what it was then?
+#   kitchen-pointers.sh clear [NAME...]   after a way back: remove the secret files NAME that came after the save
 #
 # Everything it needs is in its environment, set by the role (roles/connectome_kitchen/tasks):
 #   KITCHEN_NAME KITCHEN_ACCOUNT KITCHEN_UID KITCHEN_OPERATOR_UID KITCHEN_ACCOUNT_HOME KITCHEN_RUNTIME_DIR
@@ -26,6 +27,18 @@
 # cook-config or cook-credentials. Nothing old is restored into the agent's state: the old code starts on the state as
 # the new build left it. It stops and starts the unit: one interruption.
 #
+# `back` is done when all five are the saved ones AND the agent runs the saved build. While it is putting them back it
+# keeps <save>/back.incomplete. A `back` that failed part way leaves that file, and the next `back` puts all five back
+# again, whatever the links already say, before it says anything is done. That file is what tells "a way back that did
+# not finish" from "the new build was prepared and never started": there the links and the drop-in are the saved ones
+# too, ownership.json rightly holds what prepare added, and nothing is put back.
+#
+# `clear` is for the retry after a way back. A start writes the secret files the request adds; the way back leaves them,
+# and the saved deployment does not declare them, so the engine refuses to verify or start beside them. `clear` removes
+# NAME from <root>/state/secret-files only if all of this holds: the way back is complete (all five saved ones, no
+# back.incomplete) and the agent runs the saved build; NAME was not there when `save` listed that directory; the
+# environment file of the saved build has no line for NAME; and NAME is a regular file. Nothing else is removed.
+#
 # Exit status:
 #   0   save: saved (or already saved, the same). look, runs: yes. back: the agent runs the saved build; if it already
 #       did, nothing was changed and nothing restarted
@@ -33,6 +46,7 @@
 #   60  refused before any change
 #   61  back: everything was put back but the agent is not active and running on the saved build. IT MAY BE DOWN
 #   62  back: a step failed part way; the line above says which. IT MAY BE DOWN
+#   63  clear: a removal failed. The agent is not touched by clear
 set -u
 umask 077
 for v in KITCHEN_NAME KITCHEN_ACCOUNT KITCHEN_UID KITCHEN_OPERATOR_UID KITCHEN_ACCOUNT_HOME KITCHEN_RUNTIME_DIR KITCHEN_ROOT KITCHEN_UNIT_DIR KITCHEN_SAVE KITCHEN_OLD KITCHEN_SYSTEMCTL; do
@@ -53,10 +67,11 @@ sc() { t $KITCHEN_SYSTEMCTL --user "$@"; }
 prop() { sc show -p "$1" --value $U 2>/dev/null; }
 
 case "$MODE" in
-  save|look|back) [ $# -eq 1 ] || refuse "usage: kitchen-pointers.sh save|look|back|runs BUILD|mark BUILD WORD WORD|held BUILD" ;;
+  save|look|back) [ $# -eq 1 ] || refuse "usage: kitchen-pointers.sh save|look|back|runs BUILD|mark BUILD WORD WORD|held BUILD|clear [NAME...]" ;;
+  clear) for n in "${@:2}"; do [[ $n =~ ^[A-Z_][A-Z0-9_]*$ ]] || refuse "usage: kitchen-pointers.sh clear [NAME...], each the environment name of a secret file"; done ;;
   runs|held) [ $# -eq 2 ] && [[ $BUILD =~ $HEX ]] || refuse "usage: kitchen-pointers.sh $MODE BUILD" ;;
   mark) [ $# -eq 4 ] && [[ $BUILD =~ $HEX ]] && [[ $3 =~ ^[A-Za-z-]+$ ]] && [[ $4 =~ ^[A-Za-z-]+$ ]] || refuse "usage: kitchen-pointers.sh mark BUILD WORD WORD" ;;
-  *) refuse "usage: kitchen-pointers.sh save|look|back|runs BUILD|mark BUILD WORD WORD|held BUILD" ;;
+  *) refuse "usage: kitchen-pointers.sh save|look|back|runs BUILD|mark BUILD WORD WORD|held BUILD|clear [NAME...]" ;;
 esac
 [[ $OLD =~ $HEX ]] || refuse "KITCHEN_OLD is not a build name"
 [ "$(id -u)" = "$KITCHEN_OPERATOR_UID" ] || refuse "run it as the operator (uid $KITCHEN_OPERATOR_UID)"
@@ -132,9 +147,11 @@ if [ "$MODE" = save ]; then
   printf '%s\n' "$NEW_LINKS" > $SAVE/links.new || refuse "cannot write in $SAVE"
   cp $UD/$U.d/90-connectome-env.conf $SAVE/90-connectome-env.conf && cp $R/state/ownership.json $SAVE/ownership.json || refuse "cannot copy the drop-in or ownership.json"
   ls -A $UD/$U.d > $SAVE/dropins; ls -A $R/builds > $SAVE/builds
+  # The names of the secret files that are there now (no content): what `clear` may never remove.
+  if [ -e $R/state/secret-files ]; then ls -A $R/state/secret-files > $SAVE/secret-files; else : > $SAVE/secret-files; fi || refuse "cannot list $R/state/secret-files"
   mv $SAVE/links.new $SAVE/links
   where | tee $SAVE/where.before
-  say "saved in $SAVE: the three links, the drop-in, ownership.json ($(sha256sum < $SAVE/ownership.json | cut -c1-64))"
+  say "saved in $SAVE: the three links, the drop-in, ownership.json ($(sha256sum < $SAVE/ownership.json | cut -c1-64)), the names of $(grep -c . $SAVE/secret-files) secret files"
   exit 0
 fi
 
@@ -146,32 +163,87 @@ grep -qx "EnvironmentFile=$R/builds/$OLD/secrets.env" $SAVE/90-connectome-env.co
 for f in .prepared run.sh managed-units/$U secrets.env; do [ -e $R/builds/$OLD/$f ] || refuse "build ${OLD:0:8} has no $f"; done
 
 files_old() { links_at $OLD && cmp -s $SAVE/90-connectome-env.conf $UD/$U.d/90-connectome-env.conf; }
+owned_old() { cmp -s $SAVE/ownership.json $R/state/ownership.json; }
+# A way back that began and did not end. Written before its first change, removed after its last check.
+INCOMPLETE=$SAVE/back.incomplete
+owned_word() { if owned_old; then echo "ownership.json is the saved one"; else echo "ownership.json is not the saved one"; fi; }
 
-if files_old && runs $OLD; then
+if [ "$MODE" = clear ]; then
+  [ -e $SAVE/secret-files ] || refuse "$SAVE has no list of the secret files that were there before the window (a save of an earlier role)"
+  [ ! -e $INCOMPLETE ] || { where; refuse "a way back did not finish ($INCOMPLETE): run rollback first"; }
+  files_old && owned_old && runs $OLD || { where; say "$(owned_word)"; refuse "the agent does not run the saved build ${OLD:0:8} with the links, the drop-in and ownership.json as saved: clear is for after a complete way back"; }
+  D=$R/state/secret-files
+  for n in "${@:2}"; do
+    grep -qxF -- "$n" $SAVE/secret-files && refuse "$n was a secret file before the window (it is in the save): not one this window introduced"
+    grep -q -- "^$n=" $R/builds/$OLD/secrets.env && refuse "the environment file of the saved build names $n: the running agent may read that file"
+    [ -e $D/$n ] || [ -L $D/$n ] || continue
+    [ -f $D/$n ] && [ ! -L $D/$n ] || refuse "$D/$n is not a regular file"
+  done
+  failed=0
+  for n in "${@:2}"; do
+    if [ -e $D/$n ]; then
+      if t rm -f -- $D/$n && [ ! -e $D/$n ]; then say "removed $D/$n (introduced by this window; the saved deployment does not declare it)"; else say "COULD NOT remove $D/$n"; failed=1; fi
+    else
+      say "$n: not there, nothing to remove"
+    fi
+  done
+  # As the engine leaves it: no empty directory.
+  if [ -d $D ] && [ -z "$(ls -A $D)" ]; then t rmdir $D && say "removed the empty $D" || failed=1; fi
+  [ $failed = 0 ] || { say "a removal failed. The agent is not touched by clear. Exit 63."; exit 63; }
+  say "secret files there now: $(if [ -d $D ]; then ls -A $D | tr '\n' ' '; fi)(names; before the window: $(tr '\n' ' ' < $SAVE/secret-files))"
+  say "cleared: nothing this window introduced is in the way of a retry. Nothing restarted."
+  exit 0
+fi
+
+if [ -e $INCOMPLETE ]; then
+  if files_old && owned_old && runs $OLD; then
+    where
+    if [ "$MODE" = back ]; then
+      rm -f $INCOMPLETE || refuse "cannot remove $INCOMPLETE"
+      say "an earlier way back had not finished, and all five things are the saved ones now and the agent runs the saved build ${OLD:0:8}: the way back is complete. Nothing changed, nothing restarted."
+    else
+      say "the agent runs the saved build ${OLD:0:8} and all five things are the saved ones; $INCOMPLETE is still there: \`back\` would remove it and change nothing else."
+    fi
+    exit 0
+  fi
+elif files_old && runs $OLD; then
   where
-  say "the agent runs the saved build ${OLD:0:8}. Nothing to put back; nothing changed, nothing restarted."
+  say "the agent runs the saved build ${OLD:0:8}; $(owned_word)$(owned_old || echo ' (as after a prepare that was never started, or a start the engine took back itself)'). Nothing to put back; nothing changed, nothing restarted."
   exit 0
 fi
 if [ "$MODE" = look ]; then
   where
-  say "the agent does not run the saved build ${OLD:0:8}. \`back\` would stop it, put the five things back and start it."
+  if [ -e $INCOMPLETE ]; then
+    say "AN EARLIER WAY BACK DID NOT FINISH ($(owned_word)). \`back\` would stop the agent, put all five things back and start it."
+  else
+    say "the agent does not run the saved build ${OLD:0:8}. \`back\` would stop it, put the five things back and start it."
+  fi
   exit 1
 fi
 
 grep -q "$U" /proc/self/cgroup && refuse "this shell is inside $U: the stop would end it half way"
 step() { say "step: $*"; "$@" || { say "STEP FAILED (status $?): $*"; where; say "THE AGENT MAY BE DOWN. Exit 62."; exit 62; }; }
-say "putting code and configuration back to build ${OLD:0:8}; the agent's state directory is not touched"
 where
-if files_old; then
-  say "the links and the drop-in already name the saved build: only the unit is started; ownership.json is left as it is"
-  step sc stop $U
+if [ ! -e $INCOMPLETE ] && files_old; then
+  # No start was made, or the engine took its own start back: the unit is down on the saved build. ownership.json is the
+  # engine's own record of that and is left.
+  restore=no
+  say "the links and the drop-in name the saved build and no way back was left unfinished: only the unit is started; $(owned_word) and is left as it is"
 else
-  step sc stop $U
+  restore=yes
+  [ -e $INCOMPLETE ] && say "AN EARLIER WAY BACK DID NOT FINISH ($(owned_word)): all five things are put back again"
+  say "putting code and configuration back to build ${OLD:0:8}; the agent's state directory is not touched"
+  : >> $INCOMPLETE || refuse "cannot write $INCOMPLETE"
+fi
+step sc stop $U
+if [ $restore = yes ]; then
   step t ln -sfn "$L1" $R/current
   step t ln -sfn "$L2" $UD/$U
   step t ln -sfn "$L3" $UD/default.target.wants/$U
   step install -o $KITCHEN_ACCOUNT -g $KITCHEN_ACCOUNT -m 600 $SAVE/90-connectome-env.conf $UD/$U.d/90-connectome-env.conf
   step install -o $KITCHEN_ACCOUNT -g $KITCHEN_ACCOUNT -m 600 $SAVE/ownership.json $R/state/ownership.json
+  # Done is what is there, not what a step said.
+  files_old && owned_old || { say "STEP FAILED: after the five steps the links, the drop-in or ownership.json are not the saved ones ($(owned_word))"; where; say "THE AGENT MAY BE DOWN. Exit 62."; exit 62; }
 fi
 step sc daemon-reload
 sc reset-failed $U 2>/dev/null
@@ -181,12 +253,17 @@ until runs $OLD; do
   [ $waited -ge $WAIT ] && break
   sleep 2; waited=$((waited + 2))
 done
-if runs $OLD && files_old; then
+if runs $OLD && files_old && { [ $restore = no ] || owned_old; }; then
   pid=$(prop MainPID)
   sleep $SETTLE
   if runs $OLD && [ "$(prop MainPID)" = "$pid" ]; then
     where
-    say "the agent runs the saved build ${OLD:0:8}, same process after $SETTLE s. State, auth and offsets are as the new build left them."
+    if [ $restore = yes ]; then
+      rm -f $INCOMPLETE || say "note: could not remove $INCOMPLETE; the next rollback finds everything in place and removes it"
+      say "the agent runs the saved build ${OLD:0:8}, same process after $SETTLE s. The links, the drop-in and ownership.json are the saved ones. State, auth and offsets are as the new build left them."
+    else
+      say "the agent runs the saved build ${OLD:0:8}, same process after $SETTLE s. Nothing but the unit was touched."
+    fi
     exit 0
   fi
   say "the process changed or stopped within $SETTLE s of the start"

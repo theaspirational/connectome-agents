@@ -6,7 +6,7 @@
 - name: Refuse an unusable invocation before anything is read
   ansible.builtin.assert:
     that:
-      - connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback']
+      - connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback', 'clear']
       - not ansible_check_mode
       - ansible_connection == 'local'
       - connectome_kitchen_home is match('^/[A-Za-z0-9_./@+-]+$')
@@ -23,7 +23,9 @@
       - connectome_agent.activation | default('start') == 'start'
       - connectome_kitchen_save_dir is match('^/[A-Za-z0-9_./@+-]+$')
       - not (connectome_kitchen_save_dir + '/').startswith(connectome_kitchen_account_home + '/')
-    fail_msg: "Unusable connectome_kitchen invocation. One operation (name, plan, prepare, verify, start, rollback, readback) on one agent, on the host of the agent, not in check mode (plan is the dry run), with the kitchen install, its commit, the Node, the account with its home and uid, a save directory outside that home, the live build and (but for name and plan) the build this request must give. Nothing was changed."
+      - connectome_kitchen_secret_files_new is sequence and connectome_kitchen_secret_files_new is not string
+      - connectome_kitchen_secret_files_new | reject('match', '^[A-Z_][A-Z0-9_]*$') | list | length == 0
+    fail_msg: "Unusable connectome_kitchen invocation. One operation (name, plan, prepare, verify, start, rollback, readback, clear) on one agent, on the host of the agent, not in check mode (plan is the dry run), with the kitchen install, its commit, the Node, the account with its home and uid, a save directory outside that home, the live build and (but for name and plan) the build this request must give. Nothing was changed."
 
 - name: Name what the operation works on
   ansible.builtin.set_fact:
@@ -247,11 +249,12 @@
   ansible.builtin.debug:
     msg:
       - "verify: build {{ connectome_kitchen_build[:8] }} is prepared beside the running {{ connectome_kitchen_live_build[:8] }}; nothing of the running deployment was changed"
-      - "the secrets file gives the new process {{ {'same-environment': 'the environment the running one has', 'new-secret-files': 'the secret files the running one has and the new ones named (' + (connectome_kitchen_secret_files_new | sort | join(', ')) + '), which are not there yet; the environment file differs, as it must with them', 'ANOTHER-ENVIRONMENT': 'ANOTHER environment or secret file than the running one has: know why before the start (connectome_kitchen_secrets_differ_ok)'}[ck_environment] }}"
+      - "the secrets file gives the new process {{ {'same-environment': 'the environment the running one has', 'new-secret-files': 'the environment and the secret files the running one has and the new ones named (' + (connectome_kitchen_secret_files_new | sort | join(', ')) + '), which are not there yet; the environment file differs in those names and in no other', 'ANOTHER-ENVIRONMENT': 'ANOTHER environment or secret file than the running one has, beyond what is named as new: the start refuses. Know why first (connectome_kitchen_secrets_differ_ok takes every difference, named or not)'}[ck_environment] }}"
+      - "{{ ck_environment_words }}"
       - "{{ 'the comparison with the running build has no LOOK line' if (ck_inspect_rc | int) == 0 else 'the comparison with the running build has LOOK lines above: read them before the start' }}"
   when: connectome_kitchen_operation == 'verify'
 
-# start: the one restart. rollback: the way back. readback: what the agent shows afterwards.
+# start: the one restart. rollback: the way back. readback: what the agent shows afterwards. clear: before a retry.
 
 - name: Start the agent on the prepared build
   ansible.builtin.include_tasks: start.yml
@@ -271,3 +274,25 @@
   ansible.builtin.debug:
     msg: "{{ 'readback: every line ok' if (ck_inspect_rc | int) == 0 else 'readback: LOOK lines above. Nothing was changed by reading' }}"
   when: connectome_kitchen_operation == 'readback'
+
+# clear: after a way back, the secret files this request introduced are files the saved deployment does not declare,
+# and the engine refuses them. Exactly those are removed; nothing else is, and nothing restarts.
+- name: Remove the secret files this window introduced, where the agent runs the saved build again
+  ansible.builtin.command:
+    argv: "{{ ck_pointers + ['clear'] + (connectome_kitchen_secret_files_new | sort) }}"
+  environment: "{{ ck_pointers_env }}"
+  changed_when: "'removed ' in ck_cleared.stdout"
+  failed_when: false
+  register: ck_cleared
+  when: connectome_kitchen_operation == 'clear'
+
+- name: Show what was cleared
+  ansible.builtin.debug:
+    msg: "{{ ck_cleared.stdout_lines + ['clear: exit ' + (ck_cleared.rc | string) + ' (' + {0: 'nothing of this window is in the way of a retry', 60: 'refused before any change', 63: 'a removal failed; the agent is not touched by it'}.get(ck_cleared.rc, 'unexpected') + ')'] }}"
+  when: connectome_kitchen_operation == 'clear'
+
+- name: Stop unless it was cleared
+  ansible.builtin.assert:
+    that: ck_cleared.rc == 0
+    fail_msg: "clear of {{ ck_name }} exited {{ ck_cleared.rc }}. Nothing restarts in this operation; read its lines above."
+  when: connectome_kitchen_operation == 'clear'

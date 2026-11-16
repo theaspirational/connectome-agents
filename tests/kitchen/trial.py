@@ -2,12 +2,12 @@
 """Sandbox trial of roles/connectome_kitchen: every operation through ansible-playbook, on a case of kitchen's deploy corpus.
 
     trial.py --kitchen CLONE --ansible ANSIBLE_DIR --scratch DIR [--corpus DIR] --case NAME
-             [--scenario full|fail-start|short-lived]
+             [--scenario full|fail-start|short-lived|rotated-at-start]
              [--new-recipe FILE --expect-leaf POINTER ... --changed-leaf POINTER ... --lock-leaf POINTER ... --new-secret-file SECRET=ENV ...]
 
 Not part of `scripts/test.sh`: it needs a built kitchen clone (with its test harness), ansible-core and Node.
 
-What is real: the role and its three scripts; ansible-playbook; kitchen's runner and engine (scripts/takeover.mjs,
+What is real: the role and its five scripts; ansible-playbook; kitchen's runner and engine (scripts/takeover.mjs,
 src/engine.ts) and its adapter; the case's layers, pins and recipe, moved under a sandbox root; and, for a case that
 holds the files of a real build, that build's real cook lock.
 What stands in, as in kitchen's own tests of its runner: the host model and the adapter seam of the corpus
@@ -46,7 +46,7 @@ def main():
     parser.add_argument('--scratch', required=True)
     parser.add_argument('--corpus', help='a deploy corpus; default: the synthetic one of the clone')
     parser.add_argument('--case', required=True)
-    parser.add_argument('--scenario', default='full', choices=('full', 'fail-start', 'short-lived'))
+    parser.add_argument('--scenario', default='full', choices=('full', 'fail-start', 'short-lived', 'rotated-at-start'))
     parser.add_argument('--new-recipe')
     parser.add_argument('--expect-leaf', action='append', default=[])
     parser.add_argument('--changed-leaf', action='append', default=[])
@@ -113,10 +113,15 @@ def main():
     commit = subprocess.run(['git', '-C', str(kitchen), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
     (install / 'KITCHEN_COMMIT').write_text(commit + '\n')
     stub = sandbox / 'node-stub'
-    corpus.write(stub, '#!/bin/sh\nscript=$1; shift\ncase "$script" in\n'
-                 '  */takeover.mjs) exec %s %s "$1" "$3" %s %s ;;\n'
-                 '  */kitchen-name.mjs) exec %s %s %s "$2" %s %s ;;\nesac\necho "node-stub: unexpected script $script" >&2; exit 64\n' % (
-                     node, kitchen / 'test/corpus/takeover_driver.mjs', sandbox, world.account, node, HERE / 'name_seam.mjs', kitchen, sandbox, world.account), 0o755)
+    # Knob secrets-at-start: its bytes become the secrets file at the moment the runner is started for `start`, after
+    # the role held the environment and before the engine reads it. Once.
+    corpus.write(stub, '#!/bin/sh\nscript=$1; shift\nknob=%s/knobs/secrets-at-start\ncase "$script" in\n'
+                 '  */takeover.mjs) if [ "$1" = start ] && [ -f $knob ]; then /usr/bin/cat $knob > %s; /usr/bin/rm $knob; fi\n'
+                 '    exec %s %s "$1" "$3" %s %s ;;\n'
+                 '  */kitchen-name.mjs) exec %s %s %s "$2" %s %s ;;\n'
+                 # The role's own comparison of the environment files needs no seam: it is run as it is on a host.
+                 '  */roles/connectome_kitchen/files/kitchen-secrets.mjs) exec %s "$script" "$@" ;;\nesac\necho "node-stub: unexpected script $script" >&2; exit 64\n' % (
+                     sandbox, world.effective['secrets_file'], node, kitchen / 'test/corpus/takeover_driver.mjs', sandbox, world.account, node, HERE / 'name_seam.mjs', kitchen, sandbox, world.account, node), 0o755)
 
     # The layers as files and variables, as an inventory gives them to the Python role.
     inputs = scratch / 'inputs'
@@ -277,6 +282,37 @@ def main():
     ok('start with another agent\'s IDLE: refused, no restart', status != 0 and show('MainPID') == pid0 and at(old), out)
     status, out = op('rollback', connectome_kitchen_idle=idle())
     ok('rollback while the agent runs the saved build: exit 0, nothing changed, nothing restarted', status == 0 and 'Nothing to put back' in out and show('MainPID') == pid0 and pointers() == after, out)
+    ok('rollback there says what it is: a prepare that was never started, not a way back that did not finish',
+       'ownership.json is not the saved one (as after a prepare that was never started' in out and 'DID NOT FINISH' not in out and not (save / 'back.incomplete').exists(), out)
+    status, out = op('clear')
+    ok('clear before any start: refused (it is for after a complete way back), nothing changed', status != 0 and 'clear is for after a complete way back' in out and pointers() == after and show('MainPID') == pid0, out)
+
+    # A direct secret that changed since the running process was started: never taken with the new files, never shown.
+    import connectome_deploy
+    direct = connectome_deploy.direct_secret_names(world.effective)
+    secrets_file, filled = Path(world.effective['secrets_file']), Path(world.effective['secrets_file']).read_text()
+    if direct:
+        target = next((name for name in direct if 'ANTHROPIC' in name), direct[0])
+        rotated, was = 'ROTATED-VALUE-OF-THE-TRIAL', json.loads(filled)[target]
+        shown = lambda text: rotated in text or (len(was) >= 12 and was in text)
+        secrets_file.write_text(json.dumps({**json.loads(filled), target: rotated}, sort_keys=True))
+        seen = len(calls())
+        status, out = op('verify')
+        ok('verify with the direct secret %s changed: it says ANOTHER environment and names that name as changed' % target, status == 0 and 'ANOTHER environment or secret file' in out and 'changed: %s;' % target in out, out)
+        status, out = op('start', connectome_kitchen_idle=idle())
+        ok('start with the direct secret %s changed%s: refused, no restart, the name said' % (target, ' beside the named new file' if new_files else ''),
+           status != 0 and 'another environment or secret file' in out and 'changed: %s;' % target in out and show('MainPID') == pid0 and at(old) and calls()[seen:] == [], (calls()[seen:], out))
+        keep = home / 'kitchen-takeover' / name
+        ok('neither value of %s is in what the plays printed, in the runner\'s log or in the request' % target,
+           not shown(out) and not shown(log.read_text()) and not any(shown(path.read_text(errors='replace')) for path in keep.rglob('*') if path.is_file() and 'cook-recipe' not in path.name))
+        secrets_file.write_text(json.dumps({key: value for key, value in json.loads(filled).items() if key != target}, sort_keys=True))
+        status, out = op('start', connectome_kitchen_idle=idle())
+        ok('start with %s gone from the secrets file: refused, no restart' % target, status != 0 and show('MainPID') == pid0 and at(old) and calls()[seen:] == [], (calls()[seen:], out))
+        secrets_file.write_text(filled)
+        status, out = op('verify')
+        ok('verify with the secrets file as it was: exit 0, no name changed', status == 0 and 'changed: none;' in out and 'ANOTHER environment' not in out, out)
+    else:
+        print('note the case declares no direct secret: the changed-direct-secret checks do not apply')
 
     if new_files:
         status, out = op('start', connectome_kitchen_idle=idle(), connectome_kitchen_secret_files_new=[])
@@ -301,6 +337,21 @@ def main():
         ok('the same with auto_rollback false: refused before a restart, since ownership.json is the saved one (verify has to run again)', status != 0 and at(old), out)
         return finish(sc, unit, log)
 
+    if args.scenario == 'rotated-at-start':
+        # The secrets file changes after the role held it and before the engine reads it: the engine starts the new build
+        # with a value nobody held. What it wrote is held after the restart, and that is a failed start.
+        old_env = (root / 'builds' / old / 'secrets.env').read_bytes()
+        (sandbox / 'knobs/secrets-at-start').write_text(json.dumps({**json.loads(filled), target: rotated}, sort_keys=True))
+        seen = len(calls())
+        status, out = op('start', connectome_kitchen_idle=idle())
+        ok('a secrets file that changes between the check and the start: the play fails, names %s as changed in what the engine wrote, and rolls back' % target,
+           status != 0 and 'ROLLED BACK' in out and 'the secrets file changed between the check and the start' in out and ('(changed: %s; added: ' % target) in out and not (sandbox / 'knobs/secrets-at-start').exists(), out)
+        ok('there: the agent runs the previous build again on its own environment file, pointers and ownership.json as saved; no value shown',
+           at(old) and show('ActiveState') == 'active' and pointers() == before and (root / 'builds' / old / 'secrets.env').read_bytes() == old_env and calls()[seen:] == ['daemon-reload', 'restart', 'stop', 'daemon-reload', 'start']
+           and not shown(out) and not shown(log.read_text()), calls()[seen:])
+        secrets_file.write_text(filled)
+        return finish(sc, unit, log)
+
     journal.write_text(lines(280800))
     seen = len(calls())
     status, out = op('start', connectome_kitchen_idle=idle())
@@ -309,6 +360,8 @@ def main():
     ok('start: one daemon-reload and one restart, no stop', calls()[seen:] == ['daemon-reload', 'restart'], calls()[seen:])
     ok('start: the agent runs the new build in another process, the same after the wait', at(new) and show('ActiveState') == 'active' and pid1 not in ('0', pid0))
     ok('start: verify afterwards finds nothing to change', 'verify after the start: nothing to change' in out, out)
+    written = "environment file as written, against the previous build's: changed: none; added: %s; removed: none" % (', '.join(sorted(new_files)) or 'none')
+    ok('start: the environment file the engine wrote differs from the previous build\'s in %s' % ('exactly the named new ' + ', '.join(sorted(new_files)) if new_files else 'no name'), written in out, out)
     for env in new_files:
         ok('start: the new secret file %s was written by the engine, for the account alone' % env, (root / 'state/secret-files' / env).is_file() and ((root / 'state/secret-files' / env).stat().st_mode & 0o777) == 0o600)
     status, out = op('readback')
@@ -333,6 +386,8 @@ def main():
 
     status, out = op('rollback')
     ok('rollback without the agent\'s IDLE: refused, no restart', status != 0 and show('MainPID') == pid1 and at(new), out)
+    status, out = op('clear')
+    ok('clear while the agent runs the new build: refused, nothing removed', status != 0 and 'clear is for after a complete way back' in out and all((root / 'state/secret-files' / env).is_file() for env in new_files) and show('MainPID') == pid1, out)
     seen = len(calls())
     status, out = op('rollback', connectome_kitchen_idle=idle())
     ok('rollback: exit 0', status == 0 and 'the agent runs the saved build' in out, out)
@@ -344,6 +399,58 @@ def main():
     shutil.rmtree(build); shutil.rmtree(root / 'cook-config' / new, ignore_errors=True); shutil.rmtree(root / 'cook-credentials' / new, ignore_errors=True)
     status, out = op('plan')
     ok('with that directory removed, plan is as before the window: exit 0, a build to make', status == 0, out)
+
+    # The retry, as docs/kitchen.md words it: the three directories are gone; clear; plan, prepare, verify, start.
+    files = root / 'state/secret-files'
+    listed = lambda: sorted(path.name for path in files.iterdir()) if files.is_dir() else []
+    was_listed = (save / 'secret-files').read_text().split()
+    pid2, seen = show('MainPID'), len(calls())
+    if new_files:
+        ok('after rollback the secret file the start wrote is still there, and the saved deployment does not declare it', listed() == sorted(was_listed + new_files), listed())
+        if was_listed:
+            status, out = op('clear', connectome_kitchen_secret_files_new=was_listed[:1])
+            ok('clear of a secret file that was there before the window (%s): refused, nothing removed' % was_listed[0], status != 0 and 'was a secret file before the window' in out and listed() == sorted(was_listed + new_files), out)
+        digests = {leaf: hashlib.sha256((files / leaf).read_bytes()).hexdigest() for leaf in was_listed}
+        status, out = op('clear')
+        ok('clear: exit 0, it removed exactly %s; every secret file from before the window is byte for byte there; nothing restarted' % ', '.join(new_files),
+           status == 0 and listed() == was_listed and digests == {leaf: hashlib.sha256((files / leaf).read_bytes()).hexdigest() for leaf in was_listed}
+           and all('removed <S>' in out and ('/state/secret-files/%s (introduced by this window' % env) in out for env in new_files) and show('MainPID') == pid2 and calls()[seen:] == [] and pointers() == before, out)
+    status, out = op('clear')
+    ok('clear with nothing of this window there: exit 0, nothing removed, nothing restarted', status == 0 and 'removed ' not in out and listed() == was_listed and show('MainPID') == pid2 and calls()[seen:] == [] and pointers() == before, out)
+    status, out = op('plan')
+    ok('retry: plan exit 0', status == 0, out)
+    status, out = op('prepare')
+    ok('retry: prepare exit 0, the build is prepared again and the first save is kept', status == 0 and (build / '.prepared').is_file() and 'already saved' in out and (save / 'ownership.json').read_text() == before[4] and show('MainPID') == pid2, out)
+    cooked(new)
+    status, out = op('verify')
+    ok('retry: verify exit 0, with the environment %s' % ('of the running process and the named new file, not there' if new_files else 'of the running process'),
+       status == 0 and (('and the new ones named (%s), which are not there yet' % ', '.join(sorted(new_files))) if new_files else 'gives the new process the environment the running one has') in out, out)
+    journal.write_text(lines(280800))
+    seen = len(calls())
+    status, out = op('start', connectome_kitchen_idle=idle())
+    pid3 = show('MainPID')
+    ok('retry: start exit 0, with no bypass of the secrets check', status == 0 and 'STARTED: ' in out and written in out, out)
+    ok('retry: one daemon-reload and one restart; the agent runs the new build in another process', calls()[seen:] == ['daemon-reload', 'restart'] and at(new) and show('ActiveState') == 'active' and pid3 not in ('0', pid2), calls()[seen:])
+    for env in new_files:
+        ok('retry: the start wrote %s again, for the account alone' % env, (files / env).is_file() and ((files / env).stat().st_mode & 0o777) == 0o600)
+
+    # A way back that fails at ownership.json, and the next one: it must put ownership.json back before it says done.
+    state_mode = (root / 'state').stat().st_mode & 0o777
+    os.chmod(root / 'state', 0o500)
+    try:
+        status, out = op('rollback', connectome_kitchen_idle=idle())
+    finally:
+        os.chmod(root / 'state', state_mode)
+    ok('a way back that cannot write ownership.json: exit 62, the play fails, and it is kept as unfinished',
+       status != 0 and 'back: exit 62' in out and 'STEP FAILED' in out and (save / 'back.incomplete').exists() and at(old) and pointers()[4] != before[4], out)
+    seen = len(calls())
+    status, out = op('rollback', connectome_kitchen_agent_is_down=True)
+    ok('the next way back: it says the earlier one did not finish, puts all five back, and only then exit 0',
+       status == 0 and 'AN EARLIER WAY BACK DID NOT FINISH' in out and 'ownership.json are the saved ones' in out and pointers() == before and at(old) and show('ActiveState') == 'active' and not (save / 'back.incomplete').exists(), out)
+    ok('the next way back: one stop, one daemon-reload, one start', calls()[seen:] == ['stop', 'daemon-reload', 'start'], calls()[seen:])
+    pid4, seen = show('MainPID'), len(calls())
+    status, out = op('rollback', connectome_kitchen_idle=idle())
+    ok('rollback once more: nothing to put back, ownership.json is the saved one, nothing restarted', status == 0 and 'Nothing to put back' in out and 'ownership.json is the saved one.' in out and show('MainPID') == pid4 and calls()[seen:] == [], out)
     return finish(sc, unit, log)
 
 

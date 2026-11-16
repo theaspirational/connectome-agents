@@ -30,6 +30,7 @@ One run is one operation: `-e connectome_kitchen_operation=<name>`. Ansible's ch
 | `start` | runner `verify`, then `start` (`apply`, both phases) | the environment file, `current`, the unit links, the drop-in | **once** |
 | `rollback` | none (`files/kitchen-pointers.sh back`) | `current`, the unit links, the drop-in, `state/ownership.json`, from the save | **once** (stop, start) |
 | `readback` | none (`files/kitchen-inspect.py readback`) | nothing | no |
+| `clear` | none (`files/kitchen-pointers.sh clear`) | removes the secret files named in `connectome_kitchen_secret_files_new`, after a rollback, if this window introduced them | no |
 
 `name` asks the engine what it calls the build of the request and prints it. Every other operation that reaches the
 engine needs that name pinned as `connectome_kitchen_build`, and the name of the build that runs now as
@@ -90,14 +91,31 @@ engine reads the target secrets file in place; an agent whose secrets come from 
 runs the saved build, a fresh `verify` says "build prepared, activation due", and the secrets file gives the new
 process the environment the running one has (`connectome_kitchen_secrets_differ_ok` to start all the same).
 
+The runner answers yes or no for the environment file as a whole. The role asks further, name by name
+(`files/kitchen-secrets.mjs`, as the account, with kitchen's own reading of the layers): the environment file of the
+running build against the one a start would write from the secrets file now. It prints which names are the same,
+changed, added or removed. It prints names only: no value, no length and no digest of a value leaves it.
+
 A request that adds a secret file gives the new process another environment file by design. Name the file's
-environment variable in `connectome_kitchen_secret_files_new`: `start` then takes the difference when every other
-secret file is what the start would write and none of the named ones is there yet. What it cannot see is whether the
-environment file differs in more than those names: the runner answers yes or no for the file as a whole.
+environment variable in `connectome_kitchen_secret_files_new`: `start` then takes the difference only when
+
+- no name of the environment file is changed and none is removed;
+- the names added are exactly the named ones, and each is a secret file of the request;
+- every other secret file is what the start would write, and none of the named ones is there yet.
+
+Naming a new file authorizes that file and nothing beside it. A direct value that changed in the secrets file since
+the running process was started (a rotated `ANTHROPIC_API_KEY`, another `ANTHROPIC_BASE_URL`) refuses the start, with
+or without a named new file, and `verify` says which name it is. The one way to start all the same is the separate
+`connectome_kitchen_secrets_differ_ok=true`, which takes every difference.
+
+The engine reads the secrets file again when it starts. So after the restart the role holds the environment file the
+engine wrote against the previous build's in the same way: it must differ in exactly the names that were held before
+the start. If the secrets file changed in between, that is a failed start (below).
 
 ## What `start` does after the restart
 
-1. The agent must run the new build in another process (the links, the loaded unit file and environment file).
+1. The agent must run the new build in another process (the links, the loaded unit file and environment file), and
+   the environment file the engine wrote must differ from the previous build's in exactly the names held before.
 2. The same process, with the same restart count, must still run after `connectome_kitchen_watch_seconds` (120). The
    engine's own health check is one question right after the restart; a process that ends ten seconds later passes it.
 3. If the start or one of these fails and the agent does not run the previous build, the previous build is put back
@@ -132,23 +150,53 @@ turn of the new process: until then `readback` says `LOOK` for it.
 
 Both print words, names, counts and numbers. Neither prints a text value of a recipe, a secret or a journal line.
 
+## When a rollback is done
+
+`rollback` ends with 0 only when the three links, the drop-in **and `state/ownership.json`** are the saved ones and
+the agent runs the saved build in the same process ten seconds later, or when nothing had to be put back. While it
+puts things back it keeps `<save>/back.incomplete`. If a step fails (exit 62) that file stays, and the next `rollback`
+puts all five back again before it says anything is done, also where the links and the drop-in already name the saved
+build: a way back that stopped before `ownership.json` is not taken for a finished one.
+
+That file is also what tells an unfinished way back from a build that was prepared and never started. There the links
+and the drop-in are the saved ones too, `ownership.json` rightly holds what `prepare` added, and `rollback` says
+`Nothing to put back`, with which of the two `ownership.json` is.
+
 ## After a rollback
 
 `state/ownership.json` is the saved one, so the engine does not know the new build directory and refuses it as
-unmanaged. To try again: remove `builds/<new>`, `cook-config/<new>` and `cook-credentials/<new>`, then `plan`,
-`prepare`, `verify` and `start` as before. To stay: nothing has to be done; the new build is files nothing names.
+unmanaged. And a secret file the start wrote for the new build (`connectome_kitchen_secret_files_new`) is still in
+`state/secret-files`, where the saved deployment does not declare it: the engine refuses to verify or start beside it
+(`secret file must be declared`).
+
+To try again:
+
+1. remove `builds/<new>`, `cook-config/<new>` and `cook-credentials/<new>`;
+2. `clear`. It removes each named new secret file, and only if the way back is complete and the agent runs the saved
+   build, the file was not there when `prepare` saved (the save lists the names), the saved build's environment file
+   has no line for it, and it is a regular file. It removes nothing else, restarts nothing and needs no IDLE. Without
+   named new files it says so and changes nothing;
+3. `plan`, `prepare`, `verify` and `start` as before. The save is kept: the way back stays the same.
+
+No bypass is part of this: `connectome_kitchen_secrets_differ_ok` is not needed for a retry and would not help.
+
+To stay: nothing has to be done for the build; the new build is files nothing names. `clear` removes the introduced
+secret file there too.
 
 ## By hand
 
 If `rollback` ends with 61 or 62 the agent may be down. Its steps are the last lines of
 `files/kitchen-pointers.sh`: stop the unit, three `ln -sfn` from `<save>/links`, the drop-in and `ownership.json`
-installed from the save with the account as owner and mode 0600, `daemon-reload`, `start`. If the unit then fails on
-the previous build too, the cause is not the build.
+installed from the save with the account as owner and mode 0600, `daemon-reload`, `start`. Then run `rollback` once
+more: it finds all five in place and the agent running, removes `back.incomplete`, and changes and restarts nothing;
+or it says what is still not the saved one. If the unit fails on the previous build too, the cause is not the build.
 
 ## Trying it without a host
 
 `tests/kitchen/trial.py` runs every operation through `ansible-playbook` on a sandbox of kitchen's deploy corpus, with
 a stand-in service manager that keeps real processes: the gates, a start, a start the engine takes back, a build that
-does not stay up, the way back, and the retry after it. `tests/kitchen/render.yml` words the request without a host,
+does not stay up, the way back, and the retry after it through `clear`, `prepare`, `verify` and a second real
+start; a way back that fails at `ownership.json` and the next one; a direct secret that changed, with and without
+a named new file, before the start and (`--scenario rotated-at-start`) between the check and the start. `tests/kitchen/render.yml` words the request without a host,
 so that it can be held against a request that is known. Neither is part of `scripts/test.sh`: they need a built
 kitchen clone, ansible-core and Node.
