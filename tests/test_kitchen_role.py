@@ -252,6 +252,7 @@ class Scripts(unittest.TestCase):
         self.assertNotIn('PRIVATE', json.dumps(seen))
         self.assertIn("for name in sorted(c.get('servers_connected', [])):", (ROLE / 'files/kitchen-inspect.py').read_text())
         self.assertEqual(yaml.safe_load((ROLE / 'defaults/main.yml').read_text())['connectome_kitchen_servers_connected'], [])
+        self.assertIs(yaml.safe_load((ROLE / 'defaults/main.yml').read_text())['connectome_kitchen_budget_reported_only'], False)
 
 
 if __name__ == '__main__':

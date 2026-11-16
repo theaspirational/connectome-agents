@@ -309,7 +309,11 @@ def readback(c):
         say('LOOK', 'no [plan-vs-actual] line since the start yet: the process has not planned a context. Run readback again after its first turn')
     else:
         print('      planner: ' + ' '.join('%s=%s' % (key, plan[key]) for key in sorted(plan)))
-        if before and before.get('hard_budget') is not None:
+        if before and before.get('hard_budget') is not None and c.get('budget_reported_only'):
+            # A window that changes the budget of the recipe. What the planner then works with also depends on settings
+            # the process keeps in its own state, which nothing here reads or writes: both numbers are said, none is held.
+            print('      hardBudget of the planner: %s before the start, %s now (reported, not held to the one before)' % (before['hard_budget'], plan.get('hardBudget')))
+        elif before and before.get('hard_budget') is not None:
             check('hardBudget is the one of the process before the start (%s)' % before['hard_budget'], plan.get('hardBudget') == before['hard_budget'], 'now %s' % plan.get('hardBudget'))
         else:
             say('LOOK', 'hardBudget=%s, and there is no value from before the start to hold it to' % plan.get('hardBudget'))
