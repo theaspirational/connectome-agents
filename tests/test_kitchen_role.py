@@ -250,6 +250,8 @@ class Scripts(unittest.TestCase):
         self.assertEqual(seen, {'answered': True, 'lines': 8, 'servers': {'zulip': 'connected', 'slack': 'connected', 'github': 'FAILED'},
                                 'plan': {'planned': '2', 'actual': '2', 'budgetMet': 'false', 'exhausted': 'false', 'floor': '2', 'hardBudget': '280800'}})
         self.assertNotIn('PRIVATE', json.dumps(seen))
+        self.assertIn("for name in sorted(c.get('servers_connected', [])):", (ROLE / 'files/kitchen-inspect.py').read_text())
+        self.assertEqual(yaml.safe_load((ROLE / 'defaults/main.yml').read_text())['connectome_kitchen_servers_connected'], [])
 
 
 if __name__ == '__main__':

@@ -291,6 +291,10 @@ def readback(c):
             free.remove(match)
         check('MCP %s: a child process is there (pid %s) and the journal says nothing against it (%s)' % (name, match[0] if match else 'none', word or 'no line'),
               match is not None and word in (None, 'connected'))
+    # A server the window is for (a new one, or one that did not start before): no line against it is not enough.
+    for name in sorted(c.get('servers_connected', [])):
+        check('MCP %s: its last connection line in the journal says connected' % name, seen['servers'].get(name) == 'connected',
+              (seen['servers'].get(name) or 'no line yet') + ('' if name in servers else '; and the recipe has no server of that name'))
     for name in sorted(set(seen['servers']) - set(servers)):
         print('      MCP %s is named in the journal and not in the recipe: %s' % (name, seen['servers'][name]))
     check('the journal of the unit can be read', seen['answered'])

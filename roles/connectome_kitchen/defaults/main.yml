@@ -85,5 +85,8 @@ connectome_kitchen_recipe_present: []
 # The leaves of the cook lock that name servers, engines, requirements or credentials and are to differ, as above. The
 # lock's lists of named things are read by name: one server more is `/external/<name>`, a credential `/credentials/<NAME>`.
 connectome_kitchen_lock_changes: []
+# MCP servers (by their name in the recipe) whose last connection line in the journal must say connected at `readback`.
+# For the others no line against them is enough.
+connectome_kitchen_servers_connected: []
 connectome_kitchen_journalctl: /usr/bin/journalctl
 connectome_kitchen_python: /usr/bin/python3

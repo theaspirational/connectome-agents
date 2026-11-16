@@ -17,6 +17,7 @@
       recipe_absent: "{{ connectome_kitchen_recipe_absent }}"
       recipe_present: "{{ connectome_kitchen_recipe_present }}"
       lock_changes: "{{ connectome_kitchen_lock_changes }}"
+      servers_connected: "{{ connectome_kitchen_servers_connected }}"
       as_account: "{{ connectome_kitchen_as_account }}"
       environment: "{{ connectome_kitchen_environment }}"
       systemctl: "{{ connectome_kitchen_systemctl }}"

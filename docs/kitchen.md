@@ -123,7 +123,8 @@ whether it did. A difference is a `LOOK` line, not a refusal; `start` does not r
 (`connectome_kitchen_recipe_absent`, `connectome_kitchen_recipe_present`) in the staged recipe and in the copy the
 process was started with; one child process below the main process for each MCP server the recipe starts as a process;
 of the unit's journal, per MCP server the word of its last connection line, and the `hardBudget` of the last
-`[plan-vs-actual]` line against the one `verify` kept from the process before. That line appears only after the first
+`[plan-vs-actual]` line against the one `verify` kept from the process before. For a server named in
+`connectome_kitchen_servers_connected` that word must be `connected`; for the others no word against them is enough. That line appears only after the first
 turn of the new process: until then `readback` says `LOOK` for it.
 
 Both print words, names, counts and numbers. Neither prints a text value of a recipe, a secret or a journal line.

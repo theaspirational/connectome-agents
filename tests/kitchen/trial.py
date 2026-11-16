@@ -52,6 +52,7 @@ def main():
     parser.add_argument('--changed-leaf', action='append', default=[])
     parser.add_argument('--lock-leaf', action='append', default=[])
     parser.add_argument('--new-secret-file', action='append', default=[])
+    parser.add_argument('--connected', action='append', default=[], help='an MCP server whose journal line must say connected at readback')
     parser.add_argument('--node', default=shutil.which('node'))
     args = parser.parse_args()
     kitchen, scratch, node = Path(args.kitchen).resolve(), Path(args.scratch).resolve(), args.node
@@ -163,7 +164,7 @@ def main():
         'connectome_kitchen_live_build': old, 'connectome_kitchen_build': '', 'connectome_kitchen_save_dir': str(sandbox / 'save'),
         'connectome_kitchen_watch_seconds': 3, 'connectome_kitchen_recipe_changes': changes,
         'connectome_kitchen_recipe_absent': args.expect_leaf if args.new_recipe else [], 'connectome_kitchen_recipe_present': args.changed_leaf if args.new_recipe else [],
-        'connectome_kitchen_lock_changes': args.lock_leaf, 'connectome_kitchen_secret_files_new': new_files,
+        'connectome_kitchen_lock_changes': args.lock_leaf, 'connectome_kitchen_secret_files_new': new_files, 'connectome_kitchen_servers_connected': args.connected,
     }
     play = scratch / 'play.yml'
     play.write_text('- hosts: localhost\n  connection: local\n  gather_facts: false\n  roles:\n    - role: %s\n' % (REPO / 'roles/connectome_kitchen'))
@@ -312,6 +313,11 @@ def main():
     ok('readback: exit 0, every line ok', status == 0 and 'readback: every line ok' in out, out)
     ok('readback: one child process for each of the %d MCP servers of the recipe' % len(servers), all(('ok    MCP %s: a child process is there' % server) in out or ('ok    MCP %s (no child process' % server) in out for server in servers), out)
     ok('readback: hardBudget is the one from before the start', 'ok    hardBudget is the one of the process before the start (280800)' in out, out)
+    for server in args.connected:
+        ok('readback: the journal says %s is connected' % server, 'ok    MCP %s: its last connection line in the journal says connected' % server in out, out)
+        journal.write_text(lines(280800).replace('MCPL server "%s" reconnected successfully\n' % server, ''))
+        status, out = op('readback')
+        ok('readback with no line of %s in the journal: LOOK' % server, 'LOOK  MCP %s: its last connection line in the journal says connected: no line yet' % server in out, out)
     journal.write_text(lines(302400).replace('reconnected successfully', 'reconnect failed: text that must not be shown', 1))
     status, out = op('readback')
     ok('readback with another budget and a failed server: LOOK lines, and no text of the journal line', 'LOOK  hardBudget' in out and 'LOOK  MCP ' in out and 'must not be shown' not in out and 'readback: LOOK lines above' in out, out)
