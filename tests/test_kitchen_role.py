@@ -2,7 +2,7 @@
 
 The role on a sandbox, through ansible-playbook and a real kitchen, is tests/kitchen/trial.py.
 """
-import importlib.util, json, os, shutil, subprocess, sys, tempfile, unittest
+import hashlib, importlib.util, json, os, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 import yaml
@@ -119,6 +119,7 @@ class Scripts(unittest.TestCase):
         out = done.stdout.splitlines()
         result = json.loads(out[-1][len('result '):])
         self.assertEqual((result['rc'], result['same_environment'], result['unclosed'], result['plan']['prepare']['build_dir']), (3, True, 1, '/r/builds/' + NEW))
+        self.assertEqual((result['environment_file'], result['secret_files']), (True, {'A': True}))
         self.assertNotIn('TEXT-OF-AN-EXCEPTION', done.stdout)
         self.assertNotIn('environment_names', done.stdout)
         self.assertIn('takeover: the runner refused', out)
@@ -129,11 +130,19 @@ class Scripts(unittest.TestCase):
             lines[2]['secret_files_are_what_start_would_write'] = change
             runner.write_text('#!/bin/sh\ncat >&2 <<"EOF"\n%s\nEOF\n' % '\n'.join(json.dumps(line) for line in lines))
             done = subprocess.run([sys.executable, '-I', str(ROLE / 'files/kitchen-step.py'), 'verify', str(runner)], capture_output=True, text=True)
-            self.assertIs(json.loads(done.stdout.splitlines()[-1][7:])['same_environment'], False)
+            result = json.loads(done.stdout.splitlines()[-1][7:])
+            self.assertIs(result['same_environment'], False)
+            self.assertEqual(result['secret_files'], change)
+        # Only yes, no and null leave the step, whatever the runner wrote.
+        lines[2] = {'step': 'secrets file', 'environment_file_of_current_build_is_what_start_would_write': 'TEXT', 'secret_files_are_what_start_would_write': {'A': 'TEXT'}}
+        runner.write_text('#!/bin/sh\ncat >&2 <<"EOF"\n%s\nEOF\n' % '\n'.join(json.dumps(line) for line in lines))
+        done = subprocess.run([sys.executable, '-I', str(ROLE / 'files/kitchen-step.py'), 'verify', str(runner)], capture_output=True, text=True)
+        result = json.loads(done.stdout.splitlines()[-1][7:])
+        self.assertEqual((result['same_environment'], result['environment_file'], result['secret_files']), (False, None, {'A': None}))
         self.assertEqual(subprocess.run([sys.executable, '-I', str(ROLE / 'files/kitchen-step.py'), 'restart', str(runner)], capture_output=True).returncode, 2)
         self.assertEqual(subprocess.run([sys.executable, '-I', str(ROLE / 'files/kitchen-step.py'), 'check', str(self.work / 'absent')], capture_output=True).returncode, 2)
 
-    def builds(self, new_recipe):
+    def builds(self, new_recipe, lock=None, lock_changes=()):
         root = self.work / 'root'
         recipe = {'agent': {'systemPrompt': 'SECRET-PROMPT-TEXT', 'strategy': {'keep': 1, 'dropped': True, 'curve': 0}}, 'mcpServers': {}, 'path': '/x/builds/%s/app' % OLD}
         for build, document in ((OLD, recipe), (NEW, new_recipe(json.loads(json.dumps(recipe).replace(OLD, NEW))))):
@@ -142,8 +151,11 @@ class Scripts(unittest.TestCase):
                 target.write_text(json.dumps(document))
             for leaf, text in (('connectome-x.service', 'ExecStart=/x/builds/%s/run.sh\n'), ('run.sh', 'exec bun /x/builds/%s/app\n'), ('.prepared', '%s'), ('connectome.lock', '{"createdAt": "%s", "engines": {"bun": "1"}}')):
                 (root / 'builds' / build / leaf).write_text(text % build)
+            if lock:
+                digest = hashlib.sha256((root / 'builds' / build / 'cook-recipe.json').read_bytes()).hexdigest()
+                (root / 'builds' / build / 'connectome.lock').write_text(json.dumps(lock(build == NEW, digest)))
         config = {'old': OLD, 'new': NEW, 'root': str(root), 'unit': 'connectome-x.service', 'recipe_changes': ['/agent/strategy/curve', '/agent/strategy/dropped'], 'recipe_absent': ['/agent/strategy/dropped', '/agent/strategy/curve'],
-                  'recipe_present': ['/agent/strategy/keep'], 'as_account': [], 'environment': [], 'systemctl': '/bin/false', 'journalctl': '/bin/false', 'baseline_file': str(self.work / 'baseline.json'), 'baseline_since': '-1h'}
+                  'recipe_present': ['/agent/strategy/keep'], 'lock_changes': list(lock_changes), 'as_account': [], 'environment': [], 'systemctl': '/bin/false', 'journalctl': '/bin/false', 'baseline_file': str(self.work / 'baseline.json'), 'baseline_since': '-1h'}
         (self.work / 'inspect.json').write_text(json.dumps(config))
         return subprocess.run([sys.executable, '-I', str(ROLE / 'files/kitchen-inspect.py'), 'compare', str(self.work / 'inspect.json')], capture_output=True, text=True)
 
@@ -173,6 +185,58 @@ class Scripts(unittest.TestCase):
         done = self.builds(lambda document: document)
         self.assertEqual(done.returncode, 5)
         self.assertIn('LOOK  staged recipe: /agent/strategy/dropped is absent: present: true', done.stdout.splitlines())
+
+    def test_compare_reads_the_lock_by_name(self):
+        def drop(document):
+            del document['agent']['strategy']['dropped'], document['agent']['strategy']['curve']
+            return document
+        no, some = 'the lock differs in no leaf of the external servers, engines, requirements, credentials, host or pinned packages', \
+            'the lock differs in exactly the 2 expected leaves of the external servers, engines, requirements, credentials, host or pinned packages'
+
+        def lock(more, wrong=False):
+            return lambda new, digest: {'recipe': {'sha256': 'f' * 64 if wrong and new else digest}, 'credentials': ['A_KEY'] + (['B_FILE'] if new and more else []),
+                                        'external': [{'name': name, 'command': '/c'} for name in ['a'] + (['b'] if new and more else []) + ['c']]}
+        # Another recipe, so another digest of it in the lock: not a leaf to stop at, as long as each lock names its own staged recipe.
+        done = self.builds(drop, lock(False))
+        self.assertEqual(done.returncode, 0, done.stdout)
+        for line in ('      lock /recipe/sha256: <str> -> <str>', 'ok    the lock of the new build names its staged recipe by digest', 'ok    ' + no):
+            self.assertIn(line, done.stdout.splitlines())
+        # One server and one credential more: two leaves by their names, a LOOK unless they are the expected ones.
+        done = self.builds(drop, lock(True))
+        self.assertEqual(done.returncode, 5)
+        self.assertIn("LOOK  %s: unexpected ['/credentials/B_FILE', '/external/b']; missing []" % no, done.stdout.splitlines())
+        done = self.builds(drop, lock(True), ['/external/b', '/credentials/B_FILE'])
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn('ok    ' + some, done.stdout.splitlines())
+        self.assertIn('      lock /external/b: absent -> <dict>', done.stdout.splitlines())
+        # An expected leaf that is not there, and a lock that names another recipe than the staged one.
+        done = self.builds(drop, lock(False), ['/external/b', '/credentials/B_FILE'])
+        self.assertIn("LOOK  %s: unexpected []; missing ['/credentials/B_FILE', '/external/b']" % some, done.stdout.splitlines())
+        done = self.builds(drop, lock(False, wrong=True))
+        self.assertEqual(done.returncode, 5)
+        self.assertIn('LOOK  the lock of the new build names its staged recipe by digest', done.stdout.splitlines())
+        self.assertIn("LOOK  %s: unexpected ['/recipe/sha256']; missing []" % no, done.stdout.splitlines())
+
+    def test_new_secret_files_are_the_only_other_environment_a_start_takes(self):
+        runner = yaml.safe_load((ROLE / 'tasks/runner.yml').read_text())
+        expression = next(task for task in runner if 'ck_environment' in task.get('ansible.builtin.set_fact', {}))['ansible.builtin.set_fact']['ck_environment']
+        try:
+            import jinja2
+        except ImportError:
+            self.skipTest('no jinja2 here; tests/kitchen/trial.py holds the same through ansible-playbook')
+        environment = jinja2.Environment()
+        environment.filters['dict2items'] = lambda record: [{'key': key, 'value': value} for key, value in record.items()]  # as ansible.builtin.dict2items
+        render = lambda new, same, env, files: environment.from_string(expression).render(
+            connectome_kitchen_secret_files_new=new, ck_result={'same_environment': same, 'environment_file': env, 'secret_files': files}).strip()
+        self.assertEqual(render([], True, True, {'A': True}), 'same-environment')
+        self.assertEqual(render(['B'], True, True, {'A': True, 'B': True}), 'same-environment')
+        self.assertEqual(render(['B'], False, False, {'A': True, 'B': None}), 'new-secret-files')
+        for new, env, files in (([], False, {'A': True, 'B': None}), (['B'], False, {'A': False, 'B': None}), (['B'], False, {'A': None, 'B': None}), (['B'], False, {'A': True, 'B': False}),
+                                (['B'], None, {'A': True, 'B': None}), (['B'], False, {'A': True}), (['B'], False, {}), (['B', 'C'], False, {'A': True, 'B': None}), ([], False, {'A': True})):
+            self.assertEqual(render(new, False, env, files), 'ANOTHER-ENVIRONMENT', (new, env, files))
+        start = (ROLE / 'tasks/start.yml').read_text()
+        self.assertIn("- ck_environment != 'ANOTHER-ENVIRONMENT' or (connectome_kitchen_secrets_differ_ok | bool)", start)
+        self.assertEqual(yaml.safe_load((ROLE / 'defaults/main.yml').read_text())['connectome_kitchen_secret_files_new'], [])
 
     def test_the_journal_is_read_and_never_printed(self):
         inspect = load(ROLE / 'files/kitchen-inspect.py', 'kitchen_inspect')

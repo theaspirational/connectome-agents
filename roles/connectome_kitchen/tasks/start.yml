@@ -49,8 +49,8 @@
     that:
       - ck_result.plan.prepare.changed is false
       - ck_result.plan.activate.changed is true
-      - ck_result.same_environment or (connectome_kitchen_secrets_differ_ok | bool)
-    fail_msg: "Not started: the plan is not build prepared and activation due, or the secrets file would give the new process another environment or secret file than the running one has (if you know why: connectome_kitchen_secrets_differ_ok=true). Nothing was changed, no restart."
+      - ck_environment != 'ANOTHER-ENVIRONMENT' or (connectome_kitchen_secrets_differ_ok | bool)
+    fail_msg: "Not started: the plan is not build prepared and activation due, or the secrets file would give the new process another environment or secret file than the running one has, beyond the secret files named as new (if you know why: connectome_kitchen_secrets_differ_ok=true). Nothing was changed, no restart."
 
 - name: The start, and what follows from it
   block:

@@ -11,7 +11,8 @@ scripts/takeover.mjs, MODE, --input, the request), waits, and prints:
     has an exception's text: that line is counted and not printed; it stays in the account's log;
   - a last line, `result ` and one JSON object: the runner's exit status (`rc`), the engine's answer to `plan` (`plan`),
     whether the secrets file gives the new process the environment and the secret files the running one has
-    (`same_environment`; verify and start), and the count of lines not printed (`unclosed`).
+    (`same_environment`; verify and start) with the two answers it is made of (`environment_file`: yes, no or null;
+    `secret_files`: the name of each with yes, no or null), and the count of lines not printed (`unclosed`).
 
 Exit status 0 when the runner could be started and ended, whatever its own status; 2 otherwise.
 """
@@ -31,7 +32,7 @@ def main(argv):
     except OSError as error:
         print('kitchen-step: the runner could not be started (%s)' % type(error).__name__)
         return 2
-    result = {'rc': done.returncode, 'plan': {}, 'same_environment': False, 'unclosed': 0}
+    result = {'rc': done.returncode, 'plan': {}, 'same_environment': False, 'environment_file': None, 'secret_files': {}, 'unclosed': 0}
     for line in done.stderr.splitlines():
         if line.startswith('takeover:'):
             print(line[:900])
@@ -50,6 +51,9 @@ def main(argv):
             result['plan'] = entry['core']
         if step == 'secrets file':
             files = entry.get('secret_files_are_what_start_would_write')
+            answer = entry.get('environment_file_of_current_build_is_what_start_would_write')
+            result['environment_file'] = answer if isinstance(answer, bool) else None
+            result['secret_files'] = {str(name): value if isinstance(value, bool) else None for name, value in files.items()} if isinstance(files, dict) else {}
             result['same_environment'] = entry.get('environment_file_of_current_build_is_what_start_would_write') is True and isinstance(files, dict) and all(value is True for value in files.values())
     print('runner %s: exit %d (%s)' % (argv[1], done.returncode, MEANING.get(done.returncode, 'see the log of the account')))
     if result['unclosed']:

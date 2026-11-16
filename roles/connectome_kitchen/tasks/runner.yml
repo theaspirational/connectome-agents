@@ -1,6 +1,7 @@
 ---
 # One step of the runner of kitchen (scripts/takeover.mjs MODE --input FILE), as the account, in a closed environment.
-# In: ck_mode (check, prepare, verify, start). Out: ck_result: rc, plan, same_environment, unclosed (files/kitchen-step.py).
+# In: ck_mode (check, prepare, verify, start). Out: ck_result: rc, plan, same_environment, environment_file, secret_files,
+# unclosed (files/kitchen-step.py); ck_environment: same-environment, new-secret-files or ANOTHER-ENVIRONMENT.
 # The step helper prints the closed part of what the runner wrote. An engine failure that is not one of its refusals has
 # the text of an exception; that line is not shown and stays in the log of the account.
 
@@ -14,6 +15,18 @@
 - name: "Read the answer of kitchen: {{ ck_mode }}"
   ansible.builtin.set_fact:
     ck_result: "{{ ck_run.stdout_lines[-1][7:] | from_json }}"
+
+# new-secret-files: the environment file differs, every secret file but the ones named as new is what the start would
+# write, and each of the named ones is not there yet. What else the environment file differs in is not known here.
+- name: "Say what the secrets file gives the new process: {{ ck_mode }}"
+  ansible.builtin.set_fact:
+    ck_environment: >-
+      {{ 'same-environment' if ck_result.same_environment else
+         ('new-secret-files' if ((connectome_kitchen_secret_files_new | length) > 0
+            and ck_result.environment_file is false
+            and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='key') | sort) == (connectome_kitchen_secret_files_new | sort)
+            and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='value') | reject('none') | list | length) == 0)
+          else 'ANOTHER-ENVIRONMENT') }}
 
 - name: "Show the answer of kitchen: {{ ck_mode }}"
   ansible.builtin.debug:

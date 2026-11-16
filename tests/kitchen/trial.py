@@ -2,7 +2,8 @@
 """Sandbox trial of roles/connectome_kitchen: every operation through ansible-playbook, on a case of kitchen's deploy corpus.
 
     trial.py --kitchen CLONE --ansible ANSIBLE_DIR --scratch DIR [--corpus DIR] --case NAME
-             [--scenario full|fail-start|short-lived] [--new-recipe FILE --expect-leaf POINTER ...]
+             [--scenario full|fail-start|short-lived]
+             [--new-recipe FILE --expect-leaf POINTER ... --changed-leaf POINTER ... --lock-leaf POINTER ... --new-secret-file SECRET=ENV ...]
 
 Not part of `scripts/test.sh`: it needs a built kitchen clone (with its test harness), ansible-core and Node.
 
@@ -20,6 +21,9 @@ is too.
 
 `--new-recipe` puts another recipe in place before the new build is asked for (the running build keeps the case's own),
 and cook is then the corpus stand-in, since a real lock can only be replayed for the recipe it was made from.
+`--expect-leaf` names a leaf of the recipe that goes, `--changed-leaf` one that comes or changes, `--lock-leaf` a leaf of
+the lock that follows from them. `--new-secret-file` adds a secret file to the agent layer and a placeholder under its
+name to the sandbox's secrets file, after the running build was made: the running deployment then has no such file.
 Prints one line a check; exit status 1 if one failed.
 """
 import argparse, copy, hashlib, json, os, shutil, subprocess, sys, time
@@ -45,6 +49,9 @@ def main():
     parser.add_argument('--scenario', default='full', choices=('full', 'fail-start', 'short-lived'))
     parser.add_argument('--new-recipe')
     parser.add_argument('--expect-leaf', action='append', default=[])
+    parser.add_argument('--changed-leaf', action='append', default=[])
+    parser.add_argument('--lock-leaf', action='append', default=[])
+    parser.add_argument('--new-secret-file', action='append', default=[])
     parser.add_argument('--node', default=shutil.which('node'))
     args = parser.parse_args()
     kitchen, scratch, node = Path(args.kitchen).resolve(), Path(args.scratch).resolve(), args.node
@@ -123,10 +130,25 @@ def main():
         text = world.moved(Path(args.new_recipe).read_bytes().decode('utf-8')).encode('utf-8')
         recipe_path.write_bytes(text)
         agent['recipe_file']['sha256'] = hashlib.sha256(text).hexdigest()
-        changes = args.expect_leaf
+        changes = sorted(args.expect_leaf + args.changed_leaf)
+        # What a host-installed server of the new recipe points at, where the case's own recipe has no such server
+        # (as the corpus lays it out for the case: test/corpus/corpus.py, World.build).
+        import connectome_deploy
+        for server in (json.loads(text).get('mcpServers') or {}).values():
+            if isinstance(server, dict) and isinstance(server.get('source'), dict) and 'external' in server['source']:
+                for value in [server['command']] + [connectome_deploy.path_like_arg(raw) for raw in server.get('args', [])]:
+                    if value and value.startswith(str(world.sandbox) + '/') and not Path(value).exists():
+                        corpus.write(value, '#!/bin/sh\n# stand-in of the trial: never executed\nexit 64\n', 0o755 if value == server['command'] else 0o644)
         # A real lock is the lock of one recipe. For another recipe cook is the corpus stand-in.
         corpus.write(world.tools_moved['runtime'], '#!%s -I\nimport runpy, sys\nsys.dont_write_bytecode = True\nrunpy.run_path(%r, run_name="__main__")\n' % (
             sys.executable, str(kitchen / 'test/corpus/stand_in_cook.py')), 0o755)
+    new_files = []
+    for pair in args.new_secret_file:
+        secret, env = pair.split('=')
+        agent['secret_files'] = list(agent.get('secret_files') or []) + [{'secret': secret, 'env': env}]
+        secrets_file = Path(world.effective['secrets_file'])
+        secrets_file.write_text(json.dumps({**json.loads(secrets_file.read_text()), secret: 'placeholder-of-the-trial-' + secret}, sort_keys=True))
+        new_files.append(env)
     world.raw_layers['agent'], world.layers[3] = agent, agent
     import connectome_config
     world.effective = connectome_config.merge_layers(copy.deepcopy(world.layers))
@@ -140,7 +162,8 @@ def main():
         'connectome_kitchen_defaults_file': str(inputs / 'defaults.yml'), 'connectome_kitchen_catalog_dir': str(inputs / 'connectors'),
         'connectome_kitchen_live_build': old, 'connectome_kitchen_build': '', 'connectome_kitchen_save_dir': str(sandbox / 'save'),
         'connectome_kitchen_watch_seconds': 3, 'connectome_kitchen_recipe_changes': changes,
-        'connectome_kitchen_recipe_absent': changes if args.new_recipe else [], 'connectome_kitchen_recipe_present': [],
+        'connectome_kitchen_recipe_absent': args.expect_leaf if args.new_recipe else [], 'connectome_kitchen_recipe_present': args.changed_leaf if args.new_recipe else [],
+        'connectome_kitchen_lock_changes': args.lock_leaf, 'connectome_kitchen_secret_files_new': new_files,
     }
     play = scratch / 'play.yml'
     play.write_text('- hosts: localhost\n  connection: local\n  gather_facts: false\n  roles:\n    - role: %s\n' % (REPO / 'roles/connectome_kitchen'))
@@ -189,6 +212,18 @@ def main():
     status, out = op('start', connectome_kitchen_idle=idle())
     ok('start before prepare: refused, no restart', status != 0 and pointers() == before and show('MainPID') == pid0 and 'verify has not run' in out, out)
 
+    if new_files:
+        # The secrets file without the new secret: what a host shows where the agent has not filled it in yet.
+        secrets_file, filled = Path(world.effective['secrets_file']), Path(world.effective['secrets_file']).read_text()
+        secrets_file.write_text(json.dumps({key: value for key, value in json.loads(filled).items() if key not in [pair.split('=')[0] for pair in args.new_secret_file]}, sort_keys=True))
+        status, out = op('prepare')
+        # Whether the build is made without the secret is the engine's affair (here it is: prepare reads no secret). What
+        # must hold: the running deployment is as it was, and no verify passes, so no start can follow.
+        ok('prepare while the secrets file lacks the new secret (exit %d, %s under the build\'s name): the running deployment is as it was' % (status, 'a directory' if build.exists() else 'nothing'),
+           pointers()[:4] == before[:4] and show('MainPID') == pid0, out)
+        status, out = op('verify')
+        ok('verify while it lacks it: refused, nothing marked for a start', status != 0 and ('does not hold every declared name' in out or 'is not prepared' in out) and not (sandbox / 'save/verified').exists(), out)
+        secrets_file.write_text(filled)
     status, out = op('prepare')
     after = pointers()
     ok('prepare: exit 0, the build is prepared', status == 0 and (build / '.prepared').is_file() and (build / '.prepared').read_text() == new, out)
@@ -204,6 +239,7 @@ def main():
             real.get('cook', {}).get('version'), len(real.get('hostDependencies', [])), len(real.get('external', []) or [])),
            made.get('cook') == real.get('cook') and len(made.get('hostDependencies', [])) == len(real.get('hostDependencies', [])) and (made.get('external') is None) == (real.get('external') is None))
     cooked(new)
+    servers = sorted(json.loads((build / 'cook-recipe.json').read_text()).get('mcpServers') or {})
     status, out = op('prepare')
     ok('prepare again: exit 0, the save is kept and nothing is built twice', status == 0 and 'already saved' in out and (save / 'ownership.json').read_text() == before[4], out)
 
@@ -216,9 +252,18 @@ def main():
         ok('verify: %s %s' % ('LOOK (the builds are of two cooks)' if mixed else 'ok', word), (('LOOK  ' if mixed else 'ok    ') + word) in out, [line for line in out.splitlines() if word[:20] in line])
     for word in ('staged recipe differs from the running build\'s in exactly the %d expected leaves' % len(changes), 'cooked recipe differs from the running build\'s in exactly the %d expected leaves' % len(changes)):
         ok('verify: ok ' + word, ('ok    ' + word) in out, [line for line in out.splitlines() if word[:20] in line])
-    for leaf in changes:
+    for leaf in args.expect_leaf if args.new_recipe else []:
         ok('verify: %s is absent from the new build\'s recipe' % leaf, 'ok    staged recipe: %s is absent' % leaf in out)
-    ok('verify: the secrets file gives the new process the running one\'s environment', 'gives the new process the environment the running one has' in out, out)
+    for leaf in args.changed_leaf if args.new_recipe else []:
+        ok('verify: %s is present in the new build\'s recipe' % leaf, 'ok    cooked recipe: %s is present' % leaf in out)
+    if not mixed:
+        word = 'the lock differs in %s of the external servers' % ('exactly the %d expected leaves' % len(args.lock_leaf) if args.lock_leaf else 'no leaf')
+        ok('verify: ok ' + word, ('ok    ' + word) in out and 'ok    the lock of the new build names its staged recipe by digest' in out, [line for line in out.splitlines() if 'lock' in line])
+    if new_files:
+        ok('verify: the secrets file gives the new process the running one\'s secret files and the new %s, not there yet' % ', '.join(new_files),
+           'and the new ones named (%s), which are not there yet' % ', '.join(sorted(new_files)) in out and not any((root / 'state/secret-files' / env).exists() for env in new_files), out)
+    else:
+        ok('verify: the secrets file gives the new process the running one\'s environment', 'gives the new process the environment the running one has' in out, out)
     ok('verify: nothing of the running deployment changed', pointers()[:4] == before[:4] and show('MainPID') == pid0)
 
     status, out = op('start')
@@ -229,6 +274,12 @@ def main():
     ok('start with another agent\'s IDLE: refused, no restart', status != 0 and show('MainPID') == pid0 and at(old), out)
     status, out = op('rollback', connectome_kitchen_idle=idle())
     ok('rollback while the agent runs the saved build: exit 0, nothing changed, nothing restarted', status == 0 and 'Nothing to put back' in out and show('MainPID') == pid0 and pointers() == after, out)
+
+    if new_files:
+        status, out = op('start', connectome_kitchen_idle=idle(), connectome_kitchen_secret_files_new=[])
+        ok('start with the new secret file not named as new: refused, no restart', status != 0 and 'another environment or secret file' in out and show('MainPID') == pid0 and at(old), out)
+        status, out = op('verify')
+        ok('verify again, with it named: exit 0', status == 0, out)
 
     if args.scenario == 'fail-start':
         (sandbox / 'knobs' / ('fail-start-' + new[:8])).write_text('')
@@ -255,6 +306,8 @@ def main():
     ok('start: one daemon-reload and one restart, no stop', calls()[seen:] == ['daemon-reload', 'restart'], calls()[seen:])
     ok('start: the agent runs the new build in another process, the same after the wait', at(new) and show('ActiveState') == 'active' and pid1 not in ('0', pid0))
     ok('start: verify afterwards finds nothing to change', 'verify after the start: nothing to change' in out, out)
+    for env in new_files:
+        ok('start: the new secret file %s was written by the engine, for the account alone' % env, (root / 'state/secret-files' / env).is_file() and ((root / 'state/secret-files' / env).stat().st_mode & 0o777) == 0o600)
     status, out = op('readback')
     ok('readback: exit 0, every line ok', status == 0 and 'readback: every line ok' in out, out)
     ok('readback: one child process for each of the %d MCP servers of the recipe' % len(servers), all(('ok    MCP %s: a child process is there' % server) in out or ('ok    MCP %s (no child process' % server) in out for server in servers), out)

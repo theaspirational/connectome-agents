@@ -222,6 +222,14 @@
     ck_mode: "{{ {'plan': 'check', 'prepare': 'prepare', 'verify': 'verify'}[connectome_kitchen_operation] }}"
   when: connectome_kitchen_operation in ['prepare', 'verify'] or (connectome_kitchen_operation == 'plan' and connectome_kitchen_build != '')
 
+# A prepare the engine refused or that failed may leave an unfinished directory under the build's name. The plan then
+# still says there is a build to make: there is nothing to hold against the running build, and nothing to mark.
+- name: Refuse to verify a build that is not prepared
+  ansible.builtin.assert:
+    that: ck_result.plan.prepare.changed is false
+    fail_msg: "Build {{ connectome_kitchen_build[:8] }} is not prepared: the plan still has it to make (prepare has not run, was refused, or failed). Nothing was held, nothing was marked for a start. Read what prepare said, then prepare again."
+  when: connectome_kitchen_operation == 'verify'
+
 - name: Hold the new build against the running one, and keep the baseline of the process for readback
   ansible.builtin.include_tasks: inspect.yml
   vars:
@@ -230,7 +238,7 @@
 
 - name: Hold what verify found, for the start
   ansible.builtin.command:
-    argv: "{{ ck_pointers + ['mark', connectome_kitchen_build, 'same-environment' if ck_result.same_environment else 'ANOTHER-ENVIRONMENT', 'inspection-ok' if (ck_inspect_rc | int) == 0 else 'inspection-LOOK'] }}"
+    argv: "{{ ck_pointers + ['mark', connectome_kitchen_build, ck_environment, 'inspection-ok' if (ck_inspect_rc | int) == 0 else 'inspection-LOOK'] }}"
   environment: "{{ ck_pointers_env }}"
   changed_when: true
   when: connectome_kitchen_operation == 'verify'
@@ -239,7 +247,7 @@
   ansible.builtin.debug:
     msg:
       - "verify: build {{ connectome_kitchen_build[:8] }} is prepared beside the running {{ connectome_kitchen_live_build[:8] }}; nothing of the running deployment was changed"
-      - "the secrets file gives the new process {{ 'the environment the running one has' if ck_result.same_environment else 'ANOTHER environment or secret file than the running one has: know why before the start (connectome_kitchen_secrets_differ_ok)' }}"
+      - "the secrets file gives the new process {{ {'same-environment': 'the environment the running one has', 'new-secret-files': 'the secret files the running one has and the new ones named (' + (connectome_kitchen_secret_files_new | sort | join(', ')) + '), which are not there yet; the environment file differs, as it must with them', 'ANOTHER-ENVIRONMENT': 'ANOTHER environment or secret file than the running one has: know why before the start (connectome_kitchen_secrets_differ_ok)'}[ck_environment] }}"
       - "{{ 'the comparison with the running build has no LOOK line' if (ck_inspect_rc | int) == 0 else 'the comparison with the running build has LOOK lines above: read them before the start' }}"
   when: connectome_kitchen_operation == 'verify'
 

@@ -15,7 +15,7 @@ numbers of the last `[plan-vs-actual]` line.
 Exit status: 0 every line is `ok`; 5 a line says `LOOK` (something differs from what was expected, or could not be
 seen yet); 2 unusable invocation or configuration.
 """
-import json, os, re, subprocess, sys
+import hashlib, json, os, re, subprocess, sys
 
 ABSENT = object()
 looks = 0
@@ -83,6 +83,20 @@ def leaves(old_bytes, new_bytes):
     return found
 
 
+def by_name(lock):
+    """The lock with its lists of named things as records by name: one server more is then one leaf with the name of
+    that server, and not a list of another length."""
+    lock = dict(lock) if isinstance(lock, dict) else {}
+    for key in ('external', 'requirements', 'credentials'):
+        rows = lock.get(key)
+        if not isinstance(rows, list):
+            continue
+        names = [row if isinstance(row, str) else row.get('name') if isinstance(row, dict) else None for row in rows]
+        if all(isinstance(name, str) for name in names) and len(set(names)) == len(names):
+            lock[key] = {name: True if isinstance(row, str) else row for name, row in zip(names, rows)}
+    return lock
+
+
 def compare(c):
     old, new, root, unit = c['old'], c['new'], c['root'], c['unit']
     a, b = os.path.join(root, 'builds', old), os.path.join(root, 'builds', new)
@@ -117,12 +131,23 @@ def compare(c):
     if x is None or y is None:
         check('lock: both files are there', False)
     else:
-        found = leaves(x, y)
-        stops = [line for path, line in found if re.match(r'/(external|engines|requirements|credentials|connectomeHost|recipe)(/|$)', path)
-                 or re.match(r'/hostDependencies/[^/]+/(version|sha256)$', path)]
+        found = []
+        walk(by_name(json.loads(x)), by_name(json.loads(y)), '', found)
+        # The lock names its recipe by digest. That leaf differs whenever the recipe does. Where each lock names the staged
+        # recipe of its own build, whose leaves are held above, the leaf says nothing more and is not counted here.
+        own = True
+        for label, build, lock in (('running', a, x), ('new', b, y)):
+            staged, named = read(os.path.join(build, 'cook-recipe.json')), pointer(json.loads(lock), '/recipe/sha256')
+            own = own and staged is not None and named == hashlib.sha256(staged).hexdigest()
+            if named is not ABSENT:
+                check('the lock of the %s build names its staged recipe by digest' % label, staged is not None and named == hashlib.sha256(staged).hexdigest())
+        allowed = sorted(c.get('lock_changes', []))
+        stops = sorted(path for path, _ in found if not (own and path == '/recipe/sha256') and (re.match(r'/(external|engines|requirements|credentials|connectomeHost|recipe)(/|$)', path)
+                                                                                         or re.match(r'/hostDependencies/[^/]+/(version|sha256)$', path)))
         for path, line in found:
             print('      lock %s' % line)
-        check('the lock differs in no leaf of the external servers, engines, requirements, credentials, host or pinned packages', not stops, '%d such leaves' % len(stops))
+        check('the lock differs in %s of the external servers, engines, requirements, credentials, host or pinned packages' % ('exactly the %d expected leaves' % len(allowed) if allowed else 'no leaf'),
+              stops == allowed, 'unexpected %s; missing %s' % (sorted(set(stops) - set(allowed)), sorted(set(allowed) - set(stops))))
     keys(c, b, cooked(new))
     for build in (old, new):
         print('      web-ui-%s %s' % ('built' if os.path.exists(os.path.join(root, 'builds', build, 'app', 'dist', 'web')) else 'absent', build[:8]))

@@ -72,11 +72,18 @@ connectome_kitchen_runner_timeout_seconds: 300
 connectome_kitchen_auto_rollback: true
 # Start although the secrets file gives the new process another environment than the running one has.
 connectome_kitchen_secrets_differ_ok: false
+# The secret files (by the name of their environment variable) this request adds: the running deployment has none of
+# them. With them named, `start` takes an environment file that differs for what it is, as long as every other secret
+# file is what the start would write and none of the named ones is there yet. Any other difference still refuses.
+connectome_kitchen_secret_files_new: []
 
 # What `verify` and `readback` hold the recipe to. Paths are RFC 6901 pointers into the recipe.
 # The leaves in which the new cooked recipe may differ from the live one (after the build's name is replaced).
 connectome_kitchen_recipe_changes: []
 connectome_kitchen_recipe_absent: []
 connectome_kitchen_recipe_present: []
+# The leaves of the cook lock that name servers, engines, requirements or credentials and are to differ, as above. The
+# lock's lists of named things are read by name: one server more is `/external/<name>`, a credential `/credentials/<NAME>`.
+connectome_kitchen_lock_changes: []
 connectome_kitchen_journalctl: /usr/bin/journalctl
 connectome_kitchen_python: /usr/bin/python3

@@ -90,6 +90,11 @@ engine reads the target secrets file in place; an agent whose secrets come from 
 runs the saved build, a fresh `verify` says "build prepared, activation due", and the secrets file gives the new
 process the environment the running one has (`connectome_kitchen_secrets_differ_ok` to start all the same).
 
+A request that adds a secret file gives the new process another environment file by design. Name the file's
+environment variable in `connectome_kitchen_secret_files_new`: `start` then takes the difference when every other
+secret file is what the start would write and none of the named ones is there yet. What it cannot see is whether the
+environment file differs in more than those names: the runner answers yes or no for the file as a whole.
+
 ## What `start` does after the restart
 
 1. The agent must run the new build in another process (the links, the loaded unit file and environment file).
@@ -106,7 +111,11 @@ process the environment the running one has (`connectome_kitchen_secrets_differ_
 `verify` holds the new build against the running one (`files/kitchen-inspect.py compare`): the unit, the launcher,
 `bunfig.toml` and `app/bun.lock` equal but for the build's name; the staged recipe and cook's copy of it differing in
 exactly the leaves named in `connectome_kitchen_recipe_changes`; the lock differing in no leaf of the external
-servers, engines, requirements, credentials, host or pinned packages. Under adapter contract `/2` Bun installs from
+servers, engines, requirements, credentials, host or pinned packages but the ones named in
+`connectome_kitchen_lock_changes`. The lock's lists of named things are read by name, so one server more is
+`/external/<name>` and one credential more `/credentials/<NAME>`. The lock names its recipe by digest; that leaf is
+held to the staged recipe of each build and is not counted. `verify` refuses a build that is not prepared (a refused
+or failed `prepare` may leave an unfinished directory under the build's name). Under adapter contract `/2` Bun installs from
 an empty cache of the build's own and may resolve an unpinned range to a newer version: the `bun-lock` line says
 whether it did. A difference is a `LOOK` line, not a refusal; `start` does not read them, the operator does.
 
