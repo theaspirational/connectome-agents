@@ -1,0 +1,20 @@
+---
+# The request the connectome_kitchen role words, without a host: its request.yml alone, written to a file.
+# Driven by tests/kitchen/render.py, which holds the result against a request that is known.
+#   -e render_out=<file> and the role's variables.
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Name what request.yml needs of main.yml
+      ansible.builtin.set_fact:
+        ck_keep: "{{ connectome_kitchen_account_home }}/kitchen-takeover/{{ connectome_agent.name }}"
+    - name: Word the request as the role does
+      ansible.builtin.include_role:
+        name: "{{ playbook_dir }}/../../roles/connectome_kitchen"
+        tasks_from: request
+    - name: Write it down
+      ansible.builtin.copy:
+        dest: "{{ render_out }}"
+        mode: "0600"
+        content: "{{ ck_document | to_nice_json }}"

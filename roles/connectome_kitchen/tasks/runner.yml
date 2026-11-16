@@ -1,0 +1,28 @@
+---
+# One step of the runner of kitchen (scripts/takeover.mjs MODE --input FILE), as the account, in a closed environment.
+# In: ck_mode (check, prepare, verify, start). Out: ck_result: rc, plan, same_environment, unclosed (files/kitchen-step.py).
+# The step helper prints the closed part of what the runner wrote. An engine failure that is not one of its refusals has
+# the text of an exception; that line is not shown and stays in the log of the account.
+
+- name: "Run kitchen: {{ ck_mode }}"
+  ansible.builtin.command:
+    argv: "{{ [connectome_kitchen_python, '-I', role_path + '/files/kitchen-step.py', ck_mode, '/usr/bin/timeout', '-k', '15', connectome_kitchen_runner_timeout_seconds | string] + ck_as + [connectome_kitchen_node, connectome_kitchen_home + '/scripts/takeover.mjs', ck_mode, '--input', ck_keep + '/inputs/request.json'] }}"
+    chdir: "{{ connectome_kitchen_home }}"
+  changed_when: ck_mode in ['prepare', 'start']
+  register: ck_run
+
+- name: "Read the answer of kitchen: {{ ck_mode }}"
+  ansible.builtin.set_fact:
+    ck_result: "{{ ck_run.stdout_lines[-1][7:] | from_json }}"
+
+- name: "Show the answer of kitchen: {{ ck_mode }}"
+  ansible.builtin.debug:
+    msg: "{{ ck_run.stdout_lines[:-1] }}"
+
+- name: "Stop unless kitchen is done and plans the pinned build: {{ ck_mode }}"
+  ansible.builtin.assert:
+    that:
+      - ck_result.rc == 0
+      - ck_result.plan.prepare.build_dir == connectome_root + '/builds/' + connectome_kitchen_build
+    fail_msg: "kitchen {{ ck_mode }} exited {{ ck_result.rc }}, or its plan names another build than {{ connectome_kitchen_build }}. Nothing of the running deployment was changed by this step."
+  when: ck_mode != 'start'

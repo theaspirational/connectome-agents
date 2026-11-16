@@ -1,0 +1,156 @@
+---
+# The window of one agent: the one restart, on a build prepare made and verify held. The gates of a restart (an
+# executor outside the unit, the agent's own IDLE) were passed in main.yml.
+#
+#   1. nothing moved since verify, and verify once more
+#   2. kitchen start: the engine writes the environment file, moves the pointer and the unit links, reloads, restarts
+#      the one unit once and asks its health. If a step of that fails the engine itself puts the previous build back.
+#   3. the agent runs the new build, in another process
+#   4. the same process still runs after connectome_kitchen_watch_seconds
+#   5. verify again, and readback
+# If 2, 3 or 4 fails and the agent is not running the previous build, the previous build is put back (rollback.yml)
+# unless connectome_kitchen_auto_rollback is false. The play then ends failed and says where the agent is.
+
+- name: Hold that nothing moved since verify
+  ansible.builtin.command:
+    argv: "{{ ck_pointers + ['held', connectome_kitchen_build] }}"
+  environment: "{{ ck_pointers_env }}"
+  changed_when: false
+  failed_when: false
+  register: ck_held
+
+- name: Refuse unless verify held this build and nothing was deployed since
+  ansible.builtin.assert:
+    that: ck_held.rc == 0
+    fail_msg: "{{ ck_held.stdout_lines | join(' ') }} Not started: no restart."
+
+- name: Ask where the agent is before the start
+  ansible.builtin.command:
+    argv: "{{ ck_pointers + ['runs', connectome_kitchen_live_build] }}"
+  environment: "{{ ck_pointers_env }}"
+  changed_when: false
+  failed_when: false
+  register: ck_before
+
+- name: Refuse unless the agent runs the saved build, as prepare saved it
+  ansible.builtin.assert:
+    that:
+      - ck_before.rc == 0
+      - ck_before.stdout_lines[-1] is match('^process [1-9][0-9]* [0-9]+$')
+    fail_msg: "{{ ck_name }} does not run build {{ connectome_kitchen_live_build[:8] }} (or the start has been done already). Nothing was changed, no restart."
+
+- name: Verify once more, as the last thing before the start
+  ansible.builtin.include_tasks: runner.yml
+  vars:
+    ck_mode: verify
+
+- name: Refuse unless the build is prepared, the activation is due, and the environment is the one of the running process
+  ansible.builtin.assert:
+    that:
+      - ck_result.plan.prepare.changed is false
+      - ck_result.plan.activate.changed is true
+      - ck_result.same_environment or (connectome_kitchen_secrets_differ_ok | bool)
+    fail_msg: "Not started: the plan is not build prepared and activation due, or the secrets file would give the new process another environment or secret file than the running one has (if you know why: connectome_kitchen_secrets_differ_ok=true). Nothing was changed, no restart."
+
+- name: The start, and what follows from it
+  block:
+    - name: Start
+      ansible.builtin.include_tasks: runner.yml
+      vars:
+        ck_mode: start
+
+    - name: Stop here if the start of kitchen did not end well
+      ansible.builtin.assert:
+        that: ck_result.rc == 0
+        fail_msg: "kitchen start exited {{ ck_result.rc }}"
+
+    - name: Ask where the agent is after the start
+      ansible.builtin.command:
+        argv: "{{ ck_pointers + ['runs', connectome_kitchen_build] }}"
+      environment: "{{ ck_pointers_env }}"
+      changed_when: false
+      failed_when: false
+      register: ck_after
+
+    - name: Show where the agent is after the start
+      ansible.builtin.debug:
+        var: ck_after.stdout_lines
+
+    - name: Stop here unless the agent runs the new build in another process
+      ansible.builtin.assert:
+        that:
+          - ck_after.rc == 0
+          - ck_after.stdout_lines[-1] is match('^process [1-9][0-9]* [0-9]+$')
+          - ck_after.stdout_lines[-1].split(' ')[1] != ck_before.stdout_lines[-1].split(' ')[1]
+        fail_msg: "start exited 0 but the agent is not active and running on the new build in a new process"
+
+    - name: "Wait {{ connectome_kitchen_watch_seconds }} s: the same process must still run"
+      ansible.builtin.command:
+        argv: ["/usr/bin/sleep", "{{ connectome_kitchen_watch_seconds | string }}"]
+      changed_when: false
+
+    - name: Ask where the agent is after the wait
+      ansible.builtin.command:
+        argv: "{{ ck_pointers + ['runs', connectome_kitchen_build] }}"
+      environment: "{{ ck_pointers_env }}"
+      changed_when: false
+      failed_when: false
+      register: ck_stable
+
+    - name: Stop here unless it is the same process with the same restart count
+      ansible.builtin.assert:
+        that:
+          - ck_stable.rc == 0
+          - ck_stable.stdout_lines[-1] == ck_after.stdout_lines[-1]
+        fail_msg: "after {{ connectome_kitchen_watch_seconds }} s the agent is not running the new build in the process the start made: the new build does not stay up"
+
+  rescue:
+    - name: Ask whether the agent runs the previous build
+      ansible.builtin.command:
+        argv: "{{ ck_pointers + ['look'] }}"
+      environment: "{{ ck_pointers_env }}"
+      changed_when: false
+      failed_when: false
+      register: ck_looked
+
+    - name: Show where the agent is
+      ansible.builtin.debug:
+        var: ck_looked.stdout_lines
+
+    - name: End where the agent runs the previous build and nothing has to be put back
+      ansible.builtin.fail:
+        msg: "NOT STARTED on {{ connectome_kitchen_build[:8] }}. {{ ck_name }} runs the previous build {{ connectome_kitchen_live_build[:8] }} {{ 'in the same process as before: the start was refused or failed before a restart' if ck_looked.stdout is search('MainPID=' + ck_before.stdout_lines[-1].split(' ')[1] + ' ') else 'in a NEW process: the start failed, and the engine put the previous build back and restarted it. Tell the agent it was restarted' }}. Nothing has to be put back."
+      when: ck_looked.rc == 0
+
+    - name: End where nothing is put back, on your word
+      ansible.builtin.fail:
+        msg: "FAILED, and connectome_kitchen_auto_rollback is false: nothing was put back. {{ ck_name }} does not run the previous build as prepare saved it. Decide now: the same play with connectome_kitchen_operation=rollback."
+      when: not (connectome_kitchen_auto_rollback | bool)
+
+    - name: Put the previous build back
+      ansible.builtin.include_tasks: rollback.yml
+
+    - name: End where the previous build was put back
+      ansible.builtin.fail:
+        msg: "ROLLED BACK. The start of {{ connectome_kitchen_build[:8] }} or the health of the agent after it failed; {{ ck_name }} now runs the previous build {{ connectome_kitchen_live_build[:8] }} in a new process, on its state as the new build left it. Tell the agent it was restarted."
+
+# From here on the agent runs the new build and is stable. What follows changes nothing and puts nothing back.
+
+- name: Verify after the start
+  ansible.builtin.include_tasks: runner.yml
+  vars:
+    ck_mode: verify
+
+- name: Read back what the agent shows
+  ansible.builtin.include_tasks: inspect.yml
+  vars:
+    ck_inspections: [readback]
+
+- name: Say where the start leaves it
+  ansible.builtin.debug:
+    msg:
+      - "STARTED: {{ ck_name }} runs build {{ connectome_kitchen_build[:8] }}; {{ ck_stable.stdout_lines[-1] }} (pid, restarts), the same after {{ connectome_kitchen_watch_seconds }} s"
+      - "verify after the start: {{ 'nothing to change' if ck_result.plan.changed is false else 'LOOK: the plan still has something to change' }}"
+      - "readback: {{ 'every line ok' if (ck_inspect_rc | int) == 0 else 'LOOK lines above (a budget line appears only after the first turn: run readback again then)' }}"
+      - "The check that counts is the agent's own: does it answer, with its history and offsets where they were."
+      - "The way back, at any time: the same play with connectome_kitchen_operation=rollback and a fresh IDLE."

@@ -1,0 +1,52 @@
+---
+# The request for kitchen, from the same layers and files the Python role takes. Controller side only: nothing here
+# asks or touches the host of the agent, so it can be rendered and held against a known request anywhere
+# (tests/kitchen/render.yml). Kitchen merges the layers itself (src/config.ts); this gathers them.
+# In: the role's variables, ck_keep. Out: ck_layers, ck_engines, ck_document.
+
+- name: Read public agent defaults
+  ansible.builtin.include_vars:
+    file: "{{ connectome_kitchen_defaults_file }}"
+    name: ck_defaults
+
+- name: Read public connector descriptors
+  ansible.builtin.include_vars:
+    dir: "{{ connectome_kitchen_catalog_dir }}"
+    extensions: [yml]
+    name: ck_catalog
+
+- name: Read pinned versions
+  ansible.builtin.include_vars:
+    file: "{{ connectome_versions_file }}"
+    name: ck_versions
+
+- name: Gather the four layers without merging them
+  ansible.builtin.set_fact:
+    ck_layers:
+      - "{{ ck_defaults | connectome_kitchen_public_catalog(ck_catalog) }}"
+      - "{{ connectome_private }}"
+      - "{{ connectome_group }}"
+      - "{{ connectome_agent }}"
+    ck_engines: "{{ connectome_kitchen_engines if connectome_kitchen_engines else (connectome_cook_command | connectome_kitchen_engines) }}"
+
+- name: Word the request document for kitchen's runner
+  ansible.builtin.set_fact:
+    ck_document:
+      schema: connectome.kitchen-takeover/v1
+      request:
+        base: "{{ connectome_base }}"
+        root: "{{ connectome_root }}"
+        unit_dir: "{{ connectome_unit_dir }}"
+        layers: "{{ ck_layers }}"
+        versions: "{{ ck_versions }}"
+        engines: "{{ ck_engines }}"
+      systemctl: ["{{ connectome_kitchen_systemctl }}", "--user"]
+      files: "{{ dict(connectome_agent.cook.host_dependencies | default([]) | map(attribute='archive') | zip(connectome_agent.cook.host_dependencies | default([]) | map(attribute='sha256'))) }}"
+      recipe:
+        source: "{{ ck_keep }}/inputs/cook-recipe.{{ connectome_agent.recipe_file.sha256 }}.json"
+      expect:
+        home: "{{ connectome_kitchen_account_home }}"
+        account: "{{ connectome_kitchen_account }}"
+        # `name` asks for the name; the runner is never started with this placeholder.
+        request_id: "{{ connectome_kitchen_build if connectome_kitchen_build != '' else '0' * 64 }}"
+        live_build: "{{ connectome_kitchen_live_build }}"

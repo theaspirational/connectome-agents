@@ -1,0 +1,82 @@
+---
+# Thin layer over connectome-kitchen for one deployment without a catalog. See docs/kitchen.md.
+# One run is one operation on one agent:
+#   name | plan | prepare | verify | start | rollback | readback
+connectome_kitchen_operation: ""
+
+# The kitchen install: a directory with dist/, scripts/takeover.mjs and KITCHEN_COMMIT.
+connectome_kitchen_home: ""
+# The commit that install must be (40 hex). The role refuses any other KITCHEN_COMMIT.
+connectome_kitchen_commit: ""
+# Optional: a SHA256SUMS file whose directory holds the install; checked before every operation.
+connectome_kitchen_sums_file: ""
+# The Node that runs kitchen (absolute).
+connectome_kitchen_node: ""
+
+# The account of the agent. The engine runs as it, never as root.
+connectome_kitchen_account: ""
+# The home of that account, as the account database has it. No default: it is named, not guessed.
+connectome_kitchen_account_home: ""
+connectome_kitchen_account_uid: ""
+connectome_kitchen_runtime_dir: "/run/user/{{ connectome_kitchen_account_uid }}"
+connectome_kitchen_systemctl: /usr/bin/systemctl
+# The uid this play must run as (the operator: root on a host).
+connectome_kitchen_operator_uid: 0
+# How a command becomes the account's. Empty only where the play already runs as the account (a sandbox).
+connectome_kitchen_as_account: [/usr/sbin/runuser, -u, "{{ connectome_kitchen_account }}", --]
+# The whole environment of every kitchen process. Nothing of the caller's reaches it.
+connectome_kitchen_environment:
+  - "HOME={{ connectome_kitchen_account_home }}"
+  - "USER={{ connectome_kitchen_account }}"
+  - "LOGNAME={{ connectome_kitchen_account }}"
+  - PATH=/usr/bin:/bin
+  - LANG=C.UTF-8
+  - "XDG_RUNTIME_DIR={{ connectome_kitchen_runtime_dir }}"
+  - "DBUS_SESSION_BUS_ADDRESS=unix:path={{ connectome_kitchen_runtime_dir }}/bus"
+
+# The same variables the Python role takes, so an inventory serves both.
+connectome_base: "{{ connectome_kitchen_account_home }}/.local/share/connectome"
+connectome_root: "{{ connectome_base }}/{{ connectome_agent.name }}"
+connectome_unit_dir: "{{ connectome_kitchen_account_home }}/.config/systemd/user"
+connectome_private: {}
+connectome_group: {}
+connectome_agent: {}
+connectome_versions_file: "{{ role_path }}/../../versions.yml"
+connectome_cook_command: []
+# Public defaults and connector descriptors. A deployed agent pins the public commit it was built from: point these at
+# that checkout, or the request (and so the build's name) is another one.
+connectome_kitchen_defaults_file: "{{ role_path }}/../../defaults/agent.yml"
+connectome_kitchen_catalog_dir: "{{ role_path }}/../../connectors"
+# The closed record of contract v1. Default: the four paths of the role's cook command.
+connectome_kitchen_engines: {}
+
+# The build `current` names now, and the build this request must give (64 hex each). Both are pins: the runner refuses
+# when the host says otherwise. `name` works without the second and prints it.
+connectome_kitchen_live_build: ""
+connectome_kitchen_build: ""
+
+# Where `prepare` keeps what `rollback` needs. The operator's, mode 0700, outside the home of the account.
+connectome_kitchen_save_dir: "/var/lib/connectome-kitchen/save/{{ connectome_agent.name }}"
+
+# `start` and `rollback` restart the agent. They need the agent's own word that it is idle, given for this run:
+#   -e connectome_kitchen_idle="IDLE <name> <UTC time, YYYY-MM-DDTHH:MMZ>"
+# and refuse a word older than this many minutes, or one from the future.
+connectome_kitchen_idle: ""
+connectome_kitchen_idle_max_age_minutes: 15
+# `rollback` of an agent that is down has nobody to ask. Then, and only then: true.
+connectome_kitchen_agent_is_down: false
+# After `start`: the same process must still run after this many seconds.
+connectome_kitchen_watch_seconds: 120
+connectome_kitchen_runner_timeout_seconds: 300
+# On a failed start or a failed watch, put the previous build back at once.
+connectome_kitchen_auto_rollback: true
+# Start although the secrets file gives the new process another environment than the running one has.
+connectome_kitchen_secrets_differ_ok: false
+
+# What `verify` and `readback` hold the recipe to. Paths are RFC 6901 pointers into the recipe.
+# The leaves in which the new cooked recipe may differ from the live one (after the build's name is replaced).
+connectome_kitchen_recipe_changes: []
+connectome_kitchen_recipe_absent: []
+connectome_kitchen_recipe_present: []
+connectome_kitchen_journalctl: /usr/bin/journalctl
+connectome_kitchen_python: /usr/bin/python3

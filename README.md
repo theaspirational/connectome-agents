@@ -23,6 +23,16 @@ in a separate private repository. The only example agent is `example`.
   [contract](docs/lock-contract.md); absent offline prerequisites skip the real
   build test, not a claim of compatibility qualification.
 
+## Two entry points
+
+- `roles/connectome_agent`: the Python engine. Catalog deployments and spawn stay here.
+- `roles/connectome_kitchen`: one operation of connectome-kitchen on one agent whose recipe is a pinned file (no
+  catalog): `name`, `plan`, `prepare`, `verify`, `start`, `rollback`, `readback`. It gathers the same layers, hands
+  the request to the runner of kitchen and keeps the gates of a restart. See [the thin layer](docs/kitchen.md).
+
+The two name the build of one request differently. **Never run both on one agent**: the other role would cook a
+build under its own name and restart the agent onto it.
+
 ## Threat model
 
 Deployment runs as the agent's own user in its own directories, never as a

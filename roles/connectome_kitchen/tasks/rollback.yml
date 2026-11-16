@@ -1,0 +1,20 @@
+---
+# The way back to the build prepare saved: code and configuration only (files/kitchen-pointers.sh says exactly what).
+# The gates of a restart were passed in main.yml.
+
+- name: Put the saved build back and start the agent on it
+  ansible.builtin.command:
+    argv: "{{ ck_pointers + ['back'] }}"
+  environment: "{{ ck_pointers_env }}"
+  changed_when: "'Nothing to put back' not in ck_back.stdout"
+  failed_when: false
+  register: ck_back
+
+- name: Show the way back
+  ansible.builtin.debug:
+    msg: "{{ ck_back.stdout_lines + ['back: exit ' + (ck_back.rc | string) + ' (' + {0: 'the agent runs the saved build', 60: 'refused before any change', 61: 'put back, but the agent is not running: IT MAY BE DOWN', 62: 'a step failed part way: IT MAY BE DOWN'}.get(ck_back.rc, 'unexpected') + ')'] }}"
+
+- name: Stop unless the agent runs the saved build
+  ansible.builtin.assert:
+    that: ck_back.rc == 0
+    fail_msg: "rollback of {{ ck_name }} exited {{ ck_back.rc }}. Look now: docs/kitchen.md, By hand."

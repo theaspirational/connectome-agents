@@ -1,0 +1,265 @@
+---
+# One operation of connectome-kitchen on one agent. Nothing here builds, links or restarts by itself: the runner of
+# kitchen (scripts/takeover.mjs over src/engine.ts) does, as the account of the agent. This file gathers the request,
+# hands it over, reads the answer, and keeps the gates of a window. It never calls the module of the Python role.
+
+- name: Refuse an unusable invocation before anything is read
+  ansible.builtin.assert:
+    that:
+      - connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback']
+      - not ansible_check_mode
+      - ansible_connection == 'local'
+      - connectome_kitchen_home is match('^/[A-Za-z0-9_./@+-]+$')
+      - connectome_kitchen_node is match('^/[A-Za-z0-9_./@+-]+$')
+      - connectome_kitchen_commit is match('^[0-9a-f]{40}$')
+      - connectome_kitchen_account is match('^[a-z_][a-z0-9_-]{0,31}$')
+      - connectome_kitchen_account_home is match('^/[A-Za-z0-9_./@+-]+$')
+      - (connectome_kitchen_account_uid | string) is match('^[1-9][0-9]*$')
+      - connectome_kitchen_live_build is match('^[0-9a-f]{64}$')
+      - connectome_kitchen_build == '' or connectome_kitchen_build is match('^[0-9a-f]{64}$')
+      - connectome_kitchen_build != connectome_kitchen_live_build
+      - connectome_kitchen_operation in ['name', 'plan'] or connectome_kitchen_build != ''
+      - connectome_agent.name is defined and connectome_agent.name is match('^[a-z0-9][a-z0-9-]{0,62}$')
+      - connectome_agent.activation | default('start') == 'start'
+      - connectome_kitchen_save_dir is match('^/[A-Za-z0-9_./@+-]+$')
+      - not (connectome_kitchen_save_dir + '/').startswith(connectome_kitchen_account_home + '/')
+    fail_msg: "Unusable connectome_kitchen invocation. One operation (name, plan, prepare, verify, start, rollback, readback) on one agent, on the host of the agent, not in check mode (plan is the dry run), with the kitchen install, its commit, the Node, the account with its home and uid, a save directory outside that home, the live build and (but for name and plan) the build this request must give. Nothing was changed."
+
+- name: Name what the operation works on
+  ansible.builtin.set_fact:
+    ck_name: "{{ connectome_agent.name }}"
+    ck_unit: "connectome-{{ connectome_agent.name }}.service"
+    ck_keep: "{{ connectome_kitchen_account_home }}/kitchen-takeover/{{ connectome_agent.name }}"
+    ck_as: "{{ connectome_kitchen_as_account + ['/usr/bin/env', '-i'] + connectome_kitchen_environment }}"
+    ck_restarts: "{{ connectome_kitchen_operation in ['start', 'rollback'] }}"
+    ck_engine: "{{ connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start'] }}"
+    ck_pointers: ["/bin/bash", "{{ role_path }}/files/kitchen-pointers.sh"]
+    ck_pointers_env:
+      KITCHEN_NAME: "{{ connectome_agent.name }}"
+      KITCHEN_ACCOUNT: "{{ connectome_kitchen_account }}"
+      KITCHEN_UID: "{{ connectome_kitchen_account_uid | string }}"
+      KITCHEN_OPERATOR_UID: "{{ connectome_kitchen_operator_uid | string }}"
+      KITCHEN_ACCOUNT_HOME: "{{ connectome_kitchen_account_home }}"
+      KITCHEN_RUNTIME_DIR: "{{ connectome_kitchen_runtime_dir }}"
+      KITCHEN_ROOT: "{{ connectome_root }}"
+      KITCHEN_UNIT_DIR: "{{ connectome_unit_dir }}"
+      KITCHEN_SAVE: "{{ connectome_kitchen_save_dir }}"
+      KITCHEN_OLD: "{{ connectome_kitchen_live_build }}"
+      KITCHEN_SYSTEMCTL: "{{ connectome_kitchen_systemctl }}"
+      KITCHEN_AS_ACCOUNT: "{{ connectome_kitchen_as_account | join(' ') }}"
+
+# Who runs this, and with which kitchen.
+
+- name: Ask who runs this play and from where
+  ansible.builtin.shell:
+    cmd: 'id -u; id -u "$ACCOUNT"; cat "$HOME_OF_KITCHEN/KITCHEN_COMMIT"; grep -c -- "$UNIT" /proc/self/cgroup; true'
+  environment:
+    ACCOUNT: "{{ connectome_kitchen_account }}"
+    HOME_OF_KITCHEN: "{{ connectome_kitchen_home }}"
+    UNIT: "{{ ck_unit }}"
+  changed_when: false
+  register: ck_who
+
+- name: Refuse another operator, account or kitchen than the ones named
+  ansible.builtin.assert:
+    that:
+      - ck_who.stdout_lines | length == 4
+      - ck_who.stdout_lines[0] == (connectome_kitchen_operator_uid | string)
+      - ck_who.stdout_lines[1] == (connectome_kitchen_account_uid | string)
+      - ck_who.stdout_lines[1] != '0'
+      - ck_who.stdout_lines[2] == connectome_kitchen_commit
+    fail_msg: "This play must run as uid {{ connectome_kitchen_operator_uid }}, the account {{ connectome_kitchen_account }} must be uid {{ connectome_kitchen_account_uid }} and not root, and KITCHEN_COMMIT of the kitchen install must be {{ connectome_kitchen_commit }}. Nothing was changed."
+
+- name: Hold the kitchen install against its digests
+  ansible.builtin.command:
+    argv: ["/usr/bin/sha256sum", "-c", "--quiet", "{{ connectome_kitchen_sums_file | basename }}"]
+    chdir: "{{ connectome_kitchen_sums_file | dirname }}"
+  changed_when: false
+  when: connectome_kitchen_sums_file != ''
+
+# The gates of a restart: an executor outside the unit of the agent, and the agent's own word that it is idle.
+
+- name: Refuse to restart an agent from inside its own unit
+  ansible.builtin.assert:
+    that: ck_who.stdout_lines[3] == '0'
+    fail_msg: "This play runs inside {{ ck_unit }}: the restart would end it half way. Run it from outside the unit; for an agent that runs its own window, as a transient unit of the system manager (docs/kitchen.md, The executor). Nothing was changed."
+  when: ck_restarts
+
+- name: Read the clock for the idle gate
+  ansible.builtin.command:
+    argv: ["/usr/bin/date", "-u", "+%s"]
+  changed_when: false
+  register: ck_now
+  when: ck_restarts
+
+- name: Refuse a restart without the agent's own IDLE for this run
+  ansible.builtin.assert:
+    that:
+      - connectome_kitchen_idle is match('^IDLE ' + ck_name + ' [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$')
+      - (ck_now.stdout | int) - (ck_idle_at | int) >= -60
+      - (ck_now.stdout | int) - (ck_idle_at | int) <= (connectome_kitchen_idle_max_age_minutes | int) * 60
+    fail_msg: "{{ connectome_kitchen_operation }} restarts {{ ck_name }} and needs its own word that it is idle, given for this run as connectome_kitchen_idle: IDLE {{ ck_name }} and the UTC time of that word as YYYY-MM-DDTHH:MMZ, no older than {{ connectome_kitchen_idle_max_age_minutes }} minutes. Nothing was changed."
+  vars:
+    ck_idle_at: "{{ ((connectome_kitchen_idle.split(' ')[2] | default('1970-01-01T00:00Z')) | to_datetime('%Y-%m-%dT%H:%MZ') - ('1970-01-01T00:00Z' | to_datetime('%Y-%m-%dT%H:%MZ'))).total_seconds() | int }}"
+  when: ck_restarts and not (connectome_kitchen_operation == 'rollback' and connectome_kitchen_agent_is_down | bool)
+
+# The request, from the same layers the Python role takes. Kitchen merges them (src/config.ts); this only gathers.
+
+- name: Gather the request from the layers (controller side; the host is not touched)
+  ansible.builtin.include_tasks: request.yml
+  when: ck_engine
+
+- name: Refuse a deployment this layer does not serve
+  ansible.builtin.assert:
+    that:
+      - connectome_agent.recipe_file is defined
+      - connectome_agent.recipe_file.path is match('^/')
+      - connectome_agent.recipe_file.sha256 is match('^[0-9a-f]{64}$')
+      - connectome_agent.state_dir is defined and connectome_agent.secrets_file is defined
+      - connectome_root == connectome_base + '/' + ck_name
+    fail_msg: "connectome_kitchen serves a deployment with a pinned recipe file (no catalog), a state directory and a secrets file named in the agent layer, under the base directory by its name. Catalog and spawn deployments stay with the Python role. Nothing was changed."
+  when: ck_engine
+
+- name: Make the directory of the account for the log, the receipts and the inputs of kitchen
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ connectome_kitchen_account }}"
+    mode: "0700"
+  loop:
+    - "{{ connectome_kitchen_account_home }}/kitchen-takeover"
+    - "{{ ck_keep }}"
+    - "{{ ck_keep }}/inputs"
+  when: ck_engine
+
+# The recipe is the file of the controller (the operator) and may be unreadable for the account. It is held against its
+# pin here and handed over as a file of the account; the runner holds it against the pin again and the engine stages
+# it in the build. It does not leave the host.
+- name: Read the digest of the pinned recipe
+  ansible.builtin.stat:
+    path: "{{ connectome_agent.recipe_file.path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+    follow: false
+  register: ck_recipe
+  when: ck_engine
+
+- name: Refuse a recipe that is not the pinned bytes
+  ansible.builtin.assert:
+    that:
+      - ck_recipe.stat.exists and ck_recipe.stat.isreg
+      - ck_recipe.stat.checksum == connectome_agent.recipe_file.sha256
+    fail_msg: "The recipe file is not a regular file with the pinned digest. Nothing was changed. (Its text is never shown.)"
+  when: ck_engine
+
+- name: Hand the pinned recipe to the account
+  ansible.builtin.copy:
+    src: "{{ connectome_agent.recipe_file.path }}"
+    dest: "{{ ck_keep }}/inputs/cook-recipe.{{ connectome_agent.recipe_file.sha256 }}.json"
+    remote_src: true
+    owner: "{{ connectome_kitchen_account }}"
+    mode: "0600"
+  no_log: true
+  when: ck_engine
+
+- name: Write the request for the runner of kitchen
+  ansible.builtin.copy:
+    dest: "{{ ck_keep }}/inputs/request.json"
+    owner: "{{ connectome_kitchen_account }}"
+    mode: "0600"
+    content: "{{ ck_document | to_nice_json }}"
+  when: ck_engine
+
+# name: what the engine calls the build of this request. Read-only.
+
+- name: Ask the engine for the name of the build (plan; nothing is written)
+  ansible.builtin.command:
+    argv: "{{ ck_as + [connectome_kitchen_node, role_path + '/files/kitchen-name.mjs', connectome_kitchen_home, ck_keep + '/inputs/request.json'] }}"
+    chdir: "{{ connectome_kitchen_home }}"
+  changed_when: false
+  failed_when: false
+  no_log: true
+  register: ck_named
+  when: connectome_kitchen_operation == 'name' or (connectome_kitchen_operation == 'plan' and connectome_kitchen_build == '')
+
+- name: Show the name
+  ansible.builtin.debug:
+    msg:
+      - "exit {{ ck_named.rc }}"
+      - "{{ (ck_named.stdout | from_json) if ck_named.rc in [0, 1] and ck_named.stdout else (ck_named.stderr_lines | select('match', '^kitchen-name: ') | list) }}"
+      - "{{ ('connectome_kitchen_build: ' + (ck_named.stdout | from_json).build) if ck_named.rc == 0 else 'no name' }}"
+      - "{{ ('the pinned connectome_kitchen_build is ' + ('the same' if ck_named.rc == 0 and (ck_named.stdout | from_json).build == connectome_kitchen_build else 'ANOTHER ONE')) if connectome_kitchen_build != '' else 'pin this name as connectome_kitchen_build for plan, prepare, verify and start' }}"
+  when: ck_named is not skipped
+
+- name: Stop where the engine gave no name, or another one than the pinned
+  ansible.builtin.assert:
+    that:
+      - ck_named.rc == 0
+      - connectome_kitchen_build == '' or (ck_named.stdout | from_json).build == connectome_kitchen_build
+    fail_msg: "The engine did not name the build, or names it otherwise than connectome_kitchen_build. Nothing was changed."
+  when: ck_named is not skipped
+
+# prepare, first: keep what the way back needs, before the engine writes anything.
+
+- name: Keep what rollback needs (the links, the drop-in, ownership.json)
+  ansible.builtin.command:
+    argv: "{{ ck_pointers + ['save'] }}"
+  environment: "{{ ck_pointers_env }}"
+  changed_when: "'already saved' not in ck_saved.stdout"
+  register: ck_saved
+  when: connectome_kitchen_operation == 'prepare'
+
+- name: Show what was kept
+  ansible.builtin.debug:
+    var: ck_saved.stdout_lines
+  when: connectome_kitchen_operation == 'prepare'
+
+# plan, prepare, verify: one step of the runner each.
+
+- name: Run kitchen (check, prepare or verify)
+  ansible.builtin.include_tasks: runner.yml
+  vars:
+    ck_mode: "{{ {'plan': 'check', 'prepare': 'prepare', 'verify': 'verify'}[connectome_kitchen_operation] }}"
+  when: connectome_kitchen_operation in ['prepare', 'verify'] or (connectome_kitchen_operation == 'plan' and connectome_kitchen_build != '')
+
+- name: Hold the new build against the running one, and keep the baseline of the process for readback
+  ansible.builtin.include_tasks: inspect.yml
+  vars:
+    ck_inspections: [compare, baseline]
+  when: connectome_kitchen_operation == 'verify'
+
+- name: Hold what verify found, for the start
+  ansible.builtin.command:
+    argv: "{{ ck_pointers + ['mark', connectome_kitchen_build, 'same-environment' if ck_result.same_environment else 'ANOTHER-ENVIRONMENT', 'inspection-ok' if (ck_inspect_rc | int) == 0 else 'inspection-LOOK'] }}"
+  environment: "{{ ck_pointers_env }}"
+  changed_when: true
+  when: connectome_kitchen_operation == 'verify'
+
+- name: Say where verify leaves it
+  ansible.builtin.debug:
+    msg:
+      - "verify: build {{ connectome_kitchen_build[:8] }} is prepared beside the running {{ connectome_kitchen_live_build[:8] }}; nothing of the running deployment was changed"
+      - "the secrets file gives the new process {{ 'the environment the running one has' if ck_result.same_environment else 'ANOTHER environment or secret file than the running one has: know why before the start (connectome_kitchen_secrets_differ_ok)' }}"
+      - "{{ 'the comparison with the running build has no LOOK line' if (ck_inspect_rc | int) == 0 else 'the comparison with the running build has LOOK lines above: read them before the start' }}"
+  when: connectome_kitchen_operation == 'verify'
+
+# start: the one restart. rollback: the way back. readback: what the agent shows afterwards.
+
+- name: Start the agent on the prepared build
+  ansible.builtin.include_tasks: start.yml
+  when: connectome_kitchen_operation == 'start'
+
+- name: Put the previous build back
+  ansible.builtin.include_tasks: rollback.yml
+  when: connectome_kitchen_operation == 'rollback'
+
+- name: Read back what the agent shows
+  ansible.builtin.include_tasks: inspect.yml
+  vars:
+    ck_inspections: [readback]
+  when: connectome_kitchen_operation == 'readback'
+
+- name: Say what readback found
+  ansible.builtin.debug:
+    msg: "{{ 'readback: every line ok' if (ck_inspect_rc | int) == 0 else 'readback: LOOK lines above. Nothing was changed by reading' }}"
+  when: connectome_kitchen_operation == 'readback'

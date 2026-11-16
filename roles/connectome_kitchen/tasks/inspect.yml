@@ -1,0 +1,40 @@
+---
+# files/kitchen-inspect.py over the builds and the unit. In: ck_inspections (a list of compare, baseline, readback).
+# Out: ck_inspect_rc: 0 every line ok, 5 a LOOK line. Reads only.
+
+- name: Write what the inspection is told (paths, names and expectations; no secret)
+  ansible.builtin.copy:
+    dest: "{{ connectome_kitchen_save_dir }}/inspect.json"
+    mode: "0600"
+    content: "{{ ck_inspect | to_nice_json }}"
+  vars:
+    ck_inspect:
+      old: "{{ connectome_kitchen_live_build }}"
+      new: "{{ connectome_kitchen_build }}"
+      root: "{{ connectome_root }}"
+      unit: "{{ ck_unit }}"
+      recipe_changes: "{{ connectome_kitchen_recipe_changes }}"
+      recipe_absent: "{{ connectome_kitchen_recipe_absent }}"
+      recipe_present: "{{ connectome_kitchen_recipe_present }}"
+      as_account: "{{ connectome_kitchen_as_account }}"
+      environment: "{{ connectome_kitchen_environment }}"
+      systemctl: "{{ connectome_kitchen_systemctl }}"
+      journalctl: "{{ connectome_kitchen_journalctl }}"
+      baseline_file: "{{ connectome_kitchen_save_dir }}/baseline.json"
+      baseline_since: "-6h"
+
+- name: Inspect
+  ansible.builtin.command:
+    argv: ["{{ connectome_kitchen_python }}", "-I", "{{ role_path }}/files/kitchen-inspect.py", "{{ item }}", "{{ connectome_kitchen_save_dir }}/inspect.json"]
+  changed_when: false
+  failed_when: ck_inspected.rc not in [0, 5]
+  register: ck_inspected
+  loop: "{{ ck_inspections }}"
+
+- name: Show the inspection
+  ansible.builtin.debug:
+    msg: "{{ ck_inspected.results | map(attribute='stdout_lines') | flatten }}"
+
+- name: Note whether a line says LOOK
+  ansible.builtin.set_fact:
+    ck_inspect_rc: "{{ ck_inspected.results | map(attribute='rc') | max }}"

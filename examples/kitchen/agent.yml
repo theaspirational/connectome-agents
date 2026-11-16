@@ -1,0 +1,28 @@
+---
+# One operation of connectome-kitchen on one agent whose layers a private checkout holds. A sketch: copy it beside
+# the private playbook of the agent and fill the names. Run it on the host of the agent, as the operator:
+#
+#   ansible-playbook -i <private inventory> agent.yml -e connectome_kitchen_operation=plan
+#
+# The inventory gives what it gives the Python role: connectome_base, connectome_root, connectome_unit_dir,
+# connectome_group and connectome_cook_command. See docs/kitchen.md.
+- name: One kitchen operation on one agent
+  hosts: all
+  connection: local
+  gather_facts: false
+  vars:
+    connectome_versions_file: "{{ playbook_dir }}/release.yml"
+    connectome_private: "{{ lookup('file', playbook_dir + '/overrides/agent.yml') | from_yaml }}"
+    connectome_agent: "{{ lookup('file', playbook_dir + '/agents/example/agent.yml') | from_yaml }}"
+    connectome_kitchen_home: /opt/connectome-kitchen
+    connectome_kitchen_commit: 0000000000000000000000000000000000000000
+    connectome_kitchen_node: /opt/node/bin/node
+    connectome_kitchen_account: example
+    connectome_kitchen_account_home: /var/lib/example
+    connectome_kitchen_account_uid: 1500
+    connectome_kitchen_live_build: 0000000000000000000000000000000000000000000000000000000000000000
+    connectome_kitchen_build: ""
+  tasks:
+    - name: Run the operation
+      ansible.builtin.include_role:
+        name: public/roles/connectome_kitchen
