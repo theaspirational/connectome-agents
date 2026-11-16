@@ -20,13 +20,7 @@
 # write, and each of the named ones is not there yet. What else the environment file differs in is not known here.
 - name: "Say what the secrets file gives the new process: {{ ck_mode }}"
   ansible.builtin.set_fact:
-    ck_environment: >-
-      {{ 'same-environment' if ck_result.same_environment else
-         ('new-secret-files' if ((connectome_kitchen_secret_files_new | length) > 0
-            and ck_result.environment_file is false
-            and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='key') | sort) == (connectome_kitchen_secret_files_new | sort)
-            and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='value') | reject('none') | list | length) == 0)
-          else 'ANOTHER-ENVIRONMENT') }}
+    ck_environment: "{{ 'same-environment' if ck_result.same_environment else ('new-secret-files' if ((connectome_kitchen_secret_files_new | length) > 0 and ck_result.environment_file is false and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='key') | sort) == (connectome_kitchen_secret_files_new | sort) and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='value') | reject('none') | list | length) == 0) else 'ANOTHER-ENVIRONMENT') }}"
 
 - name: "Show the answer of kitchen: {{ ck_mode }}"
   ansible.builtin.debug:
