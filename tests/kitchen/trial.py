@@ -209,8 +209,12 @@ def main():
 
     status, out = op('verify')
     ok('verify: exit 0', status == 0, out)
-    for word in ('unit-same-but-for-the-build-name', 'launcher-same-but-for-the-build-name', 'staged recipe differs from the running build\'s in exactly the %d expected leaves' % len(changes),
-                 'cooked recipe differs from the running build\'s in exactly the %d expected leaves' % len(changes)):
+    # Two cooks made the two builds where a real lock runs and the new recipe is another one: the running build's unit and
+    # launcher are the real build's, the new build's the stand-in's. There the two lines must say LOOK, and do.
+    mixed = replayed and bool(args.new_recipe)
+    for word in ('unit-same-but-for-the-build-name', 'launcher-same-but-for-the-build-name'):
+        ok('verify: %s %s' % ('LOOK (the builds are of two cooks)' if mixed else 'ok', word), (('LOOK  ' if mixed else 'ok    ') + word) in out, [line for line in out.splitlines() if word[:20] in line])
+    for word in ('staged recipe differs from the running build\'s in exactly the %d expected leaves' % len(changes), 'cooked recipe differs from the running build\'s in exactly the %d expected leaves' % len(changes)):
         ok('verify: ok ' + word, ('ok    ' + word) in out, [line for line in out.splitlines() if word[:20] in line])
     for leaf in changes:
         ok('verify: %s is absent from the new build\'s recipe' % leaf, 'ok    staged recipe: %s is absent' % leaf in out)
