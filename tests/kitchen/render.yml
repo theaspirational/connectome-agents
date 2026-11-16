@@ -1,8 +1,8 @@
 ---
 # The request the connectome_kitchen role words, without a host: its request.yml alone, written to a file.
 # Driven by tests/kitchen/render.py, which holds the result against a request that is known.
-#   -e render_out=<file> and the role's variables.
-- hosts: localhost
+#   -i <an inventory with one host> -e render_out=<file> and the variables of the role.
+- hosts: all
   connection: local
   gather_facts: false
   tasks:
