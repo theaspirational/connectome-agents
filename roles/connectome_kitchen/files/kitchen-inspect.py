@@ -198,6 +198,30 @@ def descendants(pid):
     return found
 
 
+def marks_of(entry):
+    """The absolute paths a server's recipe entry starts its process with: those of its arguments, or else its command."""
+    return [arg for arg in entry.get('args', []) if isinstance(arg, str) and arg.startswith('/')] or [entry['command']]
+
+
+def child_of(name, servers, free):
+    """The process of `free` that is the server `name`, as (pid, argv), or None; and whether it was found below a wrapper.
+    First a process whose command line holds every path of the entry. Where the entry starts a wrapper that replaces
+    itself with the server (python3 wrapper.py NODE ENTRY CONFIG becomes NODE ENTRY ...), no command line holds them all:
+    then a process whose every absolute path is one of the entry's, one of them a path no other server's entry holds."""
+    marks = marks_of(servers[name])
+    match = next((item for item in free if all(mark in item[1] for mark in marks)), None)
+    if match:
+        return match, False
+    others = {mark for other, entry in servers.items() if other != name and isinstance(entry, dict) and isinstance(entry.get('command'), str)
+              for mark in marks_of(entry) + [entry['command']]}
+    own = set(marks) - others
+    for item in free:
+        paths = [word for word in item[1] if word.startswith('/')]
+        if paths and all(path in marks for path in paths) and any(path in own for path in paths):
+            return item, True
+    return None, False
+
+
 MCPL = re.compile(r'MCPL server "([^"\s]{1,80})" (.{0,40})')
 WORDS = (('reconnected successfully', 'connected'), ('connected', 'connected'), ('initial connect failed', 'FAILED'), ('reconnect failed', 'FAILED'),
          ('disconnected', 'DISCONNECTED'), ('transport closed', 'DISCONNECTED'), ('capabilities masked', None), ('this host closed', None))
@@ -285,11 +309,11 @@ def readback(c):
             # A server reached over a socket has no child process: the journal is all there is.
             check('MCP %s (no child process: reached over a connection): the journal says nothing against it (%s)' % (name, word or 'no line'), word in (None, 'connected'))
             continue
-        marks = [arg for arg in entry.get('args', []) if isinstance(arg, str) and arg.startswith('/')] or [entry['command']]
-        match = next((item for item in free if all(mark in item[1] for mark in marks)), None)
+        match, wrapped = child_of(name, servers, free)
         if match:
             free.remove(match)
-        check('MCP %s: a child process is there (pid %s) and the journal says nothing against it (%s)' % (name, match[0] if match else 'none', word or 'no line'),
+        check('MCP %s: a child process is there (pid %s) and the journal says nothing against it (%s)' % (
+            name, ('%d, started by the wrapper the recipe names' if wrapped else '%d') % match[0] if match else 'none', word or 'no line'),
               match is not None and word in (None, 'connected'))
     # A server the window is for (a new one, or one that did not start before): no line against it is not enough.
     for name in sorted(c.get('servers_connected', [])):

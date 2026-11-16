@@ -139,7 +139,9 @@ whether it did. A difference is a `LOOK` line, not a refusal; `start` does not r
 
 `readback` reads what the agent shows after the start: recipe keys present or absent
 (`connectome_kitchen_recipe_absent`, `connectome_kitchen_recipe_present`) in the staged recipe and in the copy the
-process was started with; one child process below the main process for each MCP server the recipe starts as a process;
+process was started with; one child process below the main process for each MCP server the recipe starts as a process
+(its command line holds every path of the server's entry; or, where the entry names a wrapper that replaces itself
+with the server, only paths of that entry, one of them no other server's);
 of the unit's journal, per MCP server the word of its last connection line, and the `hardBudget` of the last
 `[plan-vs-actual]` line against the one `verify` kept from the process before. With
 `connectome_kitchen_budget_reported_only` (a window that changes the recipe's budget) both numbers are said and none

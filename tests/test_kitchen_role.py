@@ -465,6 +465,34 @@ elif a[0] == 'daemon-reload': d['build'] = (w / 'root/current').resolve().name
         self.assertEqual(yaml.safe_load((ROLE / 'defaults/main.yml').read_text())['connectome_kitchen_servers_connected'], [])
         self.assertIs(yaml.safe_load((ROLE / 'defaults/main.yml').read_text())['connectome_kitchen_budget_reported_only'], False)
 
+    def test_a_server_started_through_a_wrapper_is_found_by_its_own_path(self):
+        inspect = load(ROLE / 'files/kitchen-inspect.py', 'kitchen_inspect')
+        node, other = '/opt/runtime/bin/node', '/opt/other-runtime/bin/node'
+        servers = {
+            'chat': {'command': '/usr/bin/python3', 'args': ['-I', '/opt/servers/wrap/chat.py', node, '/opt/servers/chat-1/dist/index.js', '/opt/servers/wrap/chat.json']},
+            'beat': {'command': node, 'args': ['/opt/servers/beat-1/dist/index.js', '--stdio']},
+            'mail': {'command': other, 'args': ['--flag', '/opt/servers/mail-1/build/index.js', '--stdio']},
+            'bare': {'command': '/opt/servers/bare-1/bin/serve'},
+            'remote': {'url': 'https://example.invalid/mcp'},
+        }
+        # The wrapper replaced itself with the server: the command line holds two of the entry's four paths.
+        chat, beat, mail, bare = (11, [node, '/opt/servers/chat-1/dist/index.js', '--stdio']), (12, [node, '/opt/servers/beat-1/dist/index.js', '--stdio']), \
+            (13, [other, '--flag', '/opt/servers/mail-1/build/index.js', '--stdio']), (14, ['/opt/servers/bare-1/bin/serve'])
+        free = [beat, mail, chat, bare, (15, [node]), (16, ['/bin/sh', '-c', 'x'])]
+        self.assertEqual(inspect.child_of('chat', servers, free), (chat, True))
+        self.assertEqual(inspect.child_of('beat', servers, free), (beat, False))
+        self.assertEqual(inspect.child_of('mail', servers, free), (mail, False))
+        self.assertEqual(inspect.child_of('bare', servers, free), (bare, False))
+        # A wrapper that is still there with every path is the match, and is not called wrapped.
+        whole = (17, ['/usr/bin/python3'] + servers['chat']['args'])
+        self.assertEqual(inspect.child_of('chat', servers, [chat, whole]), (whole, False))
+        # Not a match: no process; a process of the shared runtime alone; another server's process; one with a path the entry does not hold.
+        for others in ([], [(15, [node])], [beat, mail, bare], [(18, [node, '/opt/servers/chat-1/dist/index.js', '/tmp/else.js'])], [(19, ['node', 'index.js'])]):
+            self.assertEqual(inspect.child_of('chat', servers, others), (None, False), others)
+        # A path two servers share names neither of them.
+        twins = {'a': {'command': '/usr/bin/python3', 'args': ['/opt/wrap/a.py', node, '/opt/servers/twin/index.js']}, 'b': {'command': '/usr/bin/python3', 'args': ['/opt/wrap/b.py', node, '/opt/servers/twin/index.js']}}
+        self.assertEqual(inspect.child_of('a', twins, [(20, [node, '/opt/servers/twin/index.js'])]), (None, False))
+
 
 if __name__ == '__main__':
     unittest.main()
