@@ -2,11 +2,14 @@
 # One operation of connectome-kitchen on one agent. Nothing here builds, links or restarts by itself: the runner of
 # kitchen (scripts/takeover.mjs over src/engine.ts) does, as the account of the agent. This file gathers the request,
 # hands it over, reads the answer, and keeps the gates of a window. It never calls the module of the Python role.
+# With connectome_kitchen_first_install the same operations install an agent from nothing (docs/kitchen.md, A first
+# install): there is no running build to save, to compare with or to go back to, and `remove` is the way out.
 
 - name: Refuse an unusable invocation before anything is read
   ansible.builtin.assert:
     that:
-      - connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback', 'clear']
+      - connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback', 'clear'] or (connectome_kitchen_operation == 'remove' and connectome_kitchen_first_install | bool)
+      - not (connectome_kitchen_first_install | bool) or connectome_kitchen_operation not in ['rollback', 'clear']
       - not ansible_check_mode
       - ansible_connection == 'local'
       - connectome_kitchen_home is match('^/[A-Za-z0-9_./@+-]+$')
@@ -15,17 +18,18 @@
       - connectome_kitchen_account is match('^[a-z_][a-z0-9_-]{0,31}$')
       - connectome_kitchen_account_home is match('^/[A-Za-z0-9_./@+-]+$')
       - (connectome_kitchen_account_uid | string) is match('^[1-9][0-9]*$')
-      - connectome_kitchen_live_build is match('^[0-9a-f]{64}$')
+      - connectome_kitchen_live_build is match('^[0-9a-f]{64}$') or (connectome_kitchen_first_install | bool)
+      - connectome_kitchen_live_build == '' or not (connectome_kitchen_first_install | bool)
       - connectome_kitchen_build == '' or connectome_kitchen_build is match('^[0-9a-f]{64}$')
-      - connectome_kitchen_build != connectome_kitchen_live_build
-      - connectome_kitchen_operation in ['name', 'plan'] or connectome_kitchen_build != ''
+      - connectome_kitchen_build == '' or connectome_kitchen_build != connectome_kitchen_live_build
+      - connectome_kitchen_operation in ['name', 'plan', 'remove'] or connectome_kitchen_build != ''
       - connectome_agent.name is defined and connectome_agent.name is match('^[a-z0-9][a-z0-9-]{0,62}$')
       - connectome_agent.activation | default('start') == 'start'
       - connectome_kitchen_save_dir is match('^/[A-Za-z0-9_./@+-]+$')
       - not (connectome_kitchen_save_dir + '/').startswith(connectome_kitchen_account_home + '/')
       - connectome_kitchen_secret_files_new is sequence and connectome_kitchen_secret_files_new is not string
       - connectome_kitchen_secret_files_new | reject('match', '^[A-Z_][A-Z0-9_]*$') | list | length == 0
-    fail_msg: "Unusable connectome_kitchen invocation. One operation (name, plan, prepare, verify, start, rollback, readback, clear) on one agent, on the host of the agent, not in check mode (plan is the dry run), with the kitchen install, its commit, the Node, the account with its home and uid, a save directory outside that home, the live build and (but for name and plan) the build this request must give. Nothing was changed."
+    fail_msg: "Unusable connectome_kitchen invocation. One operation (name, plan, prepare, verify, start, rollback, readback, clear) on one agent, on the host of the agent, not in check mode (plan is the dry run), with the kitchen install, its commit, the Node, the account with its home and uid, a save directory outside that home, the live build and (but for name and plan) the build this request must give. A first install (connectome_kitchen_first_install) names no live build, has remove in place of rollback and clear, and is the only place for remove. Nothing was changed."
 
 - name: Name what the operation works on
   ansible.builtin.set_fact:
@@ -49,6 +53,15 @@
       KITCHEN_OLD: "{{ connectome_kitchen_live_build }}"
       KITCHEN_SYSTEMCTL: "{{ connectome_kitchen_systemctl }}"
       KITCHEN_AS_ACCOUNT: "{{ connectome_kitchen_as_account | join(' ') }}"
+
+# A first install: nothing is deployed, so there is no build to save, to compare with or to go back to. Its own script
+# stands where files/kitchen-pointers.sh stands for a deployment that runs.
+- name: Name what a first install works with
+  ansible.builtin.set_fact:
+    ck_first: "{{ connectome_kitchen_first_install | bool }}"
+    ck_removes: "{{ connectome_kitchen_operation == 'remove' }}"
+    ck_first_script: ["/bin/bash", "{{ role_path }}/files/kitchen-first.sh"]
+    ck_first_env: "{{ ck_pointers_env | combine({'KITCHEN_STATE_DIR': connectome_agent.state_dir | default('')}) }}"
 
 # Who runs this, and with which kitchen.
 
@@ -85,14 +98,14 @@
   ansible.builtin.assert:
     that: ck_who.stdout_lines[3] == '0'
     fail_msg: "This play runs inside {{ ck_unit }}: the restart would end it half way. Run it from outside the unit; for an agent that runs its own window, as a transient unit of the system manager (docs/kitchen.md, The executor). Nothing was changed."
-  when: ck_restarts
+  when: ck_restarts or ck_removes
 
 - name: Read the clock for the idle gate
   ansible.builtin.command:
     argv: ["/usr/bin/date", "-u", "+%s"]
   changed_when: false
   register: ck_now
-  when: ck_restarts
+  when: ck_restarts or ck_removes
 
 - name: Refuse a restart without the agent's own IDLE for this run
   ansible.builtin.assert:
@@ -103,7 +116,21 @@
     fail_msg: "{{ connectome_kitchen_operation }} restarts {{ ck_name }} and needs its own word that it is idle, given for this run as connectome_kitchen_idle: IDLE {{ ck_name }} and the UTC time of that word as YYYY-MM-DDTHH:MMZ, no older than {{ connectome_kitchen_idle_max_age_minutes }} minutes. Nothing was changed."
   vars:
     ck_idle_at: "{{ ((connectome_kitchen_idle.split(' ')[2] | default('1970-01-01T00:00Z')) | to_datetime('%Y-%m-%dT%H:%MZ') - ('1970-01-01T00:00Z' | to_datetime('%Y-%m-%dT%H:%MZ'))).total_seconds() | int }}"
-  when: ck_restarts and not (connectome_kitchen_operation == 'rollback' and connectome_kitchen_agent_is_down | bool)
+  when: ck_restarts and not ck_first and not (connectome_kitchen_operation == 'rollback' and connectome_kitchen_agent_is_down | bool)
+
+# A first install has no agent to say it is idle. What stands in its place is the operator's own word for this run, named
+# and dated: that this agent is to be started for the first time, or that its first install is to be removed.
+- name: Refuse a first start or a removal without the operator's own dated word for this run
+  ansible.builtin.assert:
+    that:
+      - connectome_kitchen_operator_word is match('^' + ck_word + ' ' + ck_name + ' [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$')
+      - (ck_now.stdout | int) - (ck_word_at | int) >= -60
+      - (ck_now.stdout | int) - (ck_word_at | int) <= (connectome_kitchen_idle_max_age_minutes | int) * 60
+    fail_msg: "{{ connectome_kitchen_operation }} of a first install {{ 'starts' if ck_restarts else 'stops and removes' }} {{ ck_name }} and needs your own word for this run, as connectome_kitchen_operator_word: {{ ck_word }} {{ ck_name }} and the UTC time of that word as YYYY-MM-DDTHH:MMZ, no older than {{ connectome_kitchen_idle_max_age_minutes }} minutes. Nothing was changed."
+  vars:
+    ck_word: "{{ 'FIRST-START' if ck_restarts else 'REMOVE' }}"
+    ck_word_at: "{{ ((connectome_kitchen_operator_word.split(' ')[2] | default('1970-01-01T00:00Z')) | to_datetime('%Y-%m-%dT%H:%MZ') - ('1970-01-01T00:00Z' | to_datetime('%Y-%m-%dT%H:%MZ'))).total_seconds() | int }}"
+  when: ck_first and (ck_restarts or ck_removes)
 
 # The request, from the same layers the Python role takes. Kitchen merges them (src/config.ts); this only gathers.
 
@@ -209,12 +236,33 @@
   environment: "{{ ck_pointers_env }}"
   changed_when: "'already saved' not in ck_saved.stdout"
   register: ck_saved
-  when: connectome_kitchen_operation == 'prepare'
+  when: connectome_kitchen_operation == 'prepare' and not ck_first
 
 - name: Show what was kept
   ansible.builtin.debug:
     var: ck_saved.stdout_lines
-  when: connectome_kitchen_operation == 'prepare'
+  when: connectome_kitchen_operation == 'prepare' and not ck_first
+
+# prepare of a first install, first: there is nothing to keep. What is held instead is that nothing is deployed.
+- name: Hold that nothing is deployed, and keep the marker of a first install
+  ansible.builtin.command:
+    argv: "{{ ck_first_script + ['hold', connectome_kitchen_build] }}"
+  environment: "{{ ck_first_env }}"
+  changed_when: "'already held' not in ck_first_holds.stdout"
+  failed_when: false
+  register: ck_first_holds
+  when: connectome_kitchen_operation == 'prepare' and ck_first
+
+- name: Show what was held
+  ansible.builtin.debug:
+    var: ck_first_holds.stdout_lines
+  when: connectome_kitchen_operation == 'prepare' and ck_first
+
+- name: Stop unless nothing is deployed
+  ansible.builtin.assert:
+    that: ck_first_holds.rc == 0
+    fail_msg: "{{ ck_first_holds.stdout_lines[-1] | default('kitchen-first.sh hold exited ' + (ck_first_holds.rc | string)) }} Nothing was built."
+  when: connectome_kitchen_operation == 'prepare' and ck_first
 
 # plan, prepare, verify: one step of the runner each.
 
@@ -236,14 +284,14 @@
   ansible.builtin.include_tasks: inspect.yml
   vars:
     ck_inspections: [compare, baseline]
-  when: connectome_kitchen_operation == 'verify'
+  when: connectome_kitchen_operation == 'verify' and not ck_first
 
 - name: Hold what verify found, for the start
   ansible.builtin.command:
     argv: "{{ ck_pointers + ['mark', connectome_kitchen_build, ck_environment, 'inspection-ok' if (ck_inspect_rc | int) == 0 else 'inspection-LOOK'] }}"
   environment: "{{ ck_pointers_env }}"
   changed_when: true
-  when: connectome_kitchen_operation == 'verify'
+  when: connectome_kitchen_operation == 'verify' and not ck_first
 
 - name: Say where verify leaves it
   ansible.builtin.debug:
@@ -252,13 +300,44 @@
       - "the secrets file gives the new process {{ {'same-environment': 'the environment the running one has', 'new-secret-files': 'the environment and the secret files the running one has and the new ones named (' + (connectome_kitchen_secret_files_new | sort | join(', ')) + '), which are not there yet; the environment file differs in those names and in no other', 'ANOTHER-ENVIRONMENT': 'ANOTHER environment or secret file than the running one has, beyond what is named as new: the start refuses. Know why first (connectome_kitchen_secrets_differ_ok takes every difference, named or not)'}[ck_environment] }}"
       - "{{ ck_environment_words }}"
       - "{{ 'the comparison with the running build has no LOOK line' if (ck_inspect_rc | int) == 0 else 'the comparison with the running build has LOOK lines above: read them before the start' }}"
-  when: connectome_kitchen_operation == 'verify'
+  when: connectome_kitchen_operation == 'verify' and not ck_first
+
+# verify of a first install: no build runs, so the new build is held by itself, and no baseline is kept.
+- name: Hold the new build by itself
+  ansible.builtin.include_tasks: inspect.yml
+  vars:
+    ck_inspections: [alone]
+  when: connectome_kitchen_operation == 'verify' and ck_first
+
+- name: Hold what verify found of the first build, for the start
+  ansible.builtin.command:
+    argv: "{{ ck_first_script + ['mark', connectome_kitchen_build, ck_environment, 'inspection-ok' if (ck_inspect_rc | int) == 0 else 'inspection-LOOK'] }}"
+  environment: "{{ ck_first_env }}"
+  changed_when: true
+  when: connectome_kitchen_operation == 'verify' and ck_first
+
+- name: Say where verify leaves a first install
+  ansible.builtin.debug:
+    msg:
+      - "verify: build {{ connectome_kitchen_build[:8] }} is prepared; nothing is installed and nothing runs"
+      - "{{ {'first-environment': 'the secrets file holds every declared name, there is no environment file yet, and none of the secret files the start writes is there', 'NOT-A-FIRST-ENVIRONMENT': 'NOT what a first install finds: an environment file or a secret file of this deployment is there already. The start refuses'}[ck_environment] }}"
+      - "{{ ck_environment_words }}"
+      - "{{ 'the build has no LOOK line' if (ck_inspect_rc | int) == 0 else 'the build has LOOK lines above: read them before the start' }}"
+  when: connectome_kitchen_operation == 'verify' and ck_first
 
 # start: the one restart. rollback: the way back. readback: what the agent shows afterwards. clear: before a retry.
 
 - name: Start the agent on the prepared build
   ansible.builtin.include_tasks: start.yml
-  when: connectome_kitchen_operation == 'start'
+  when: connectome_kitchen_operation == 'start' and not ck_first
+
+- name: Start the agent for the first time
+  ansible.builtin.include_tasks: start-first.yml
+  when: connectome_kitchen_operation == 'start' and ck_first
+
+- name: Stop the agent and remove its first install
+  ansible.builtin.include_tasks: remove.yml
+  when: ck_removes
 
 - name: Put the previous build back
   ansible.builtin.include_tasks: rollback.yml

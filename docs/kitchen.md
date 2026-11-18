@@ -31,11 +31,15 @@ One run is one operation: `-e connectome_kitchen_operation=<name>`. Ansible's ch
 | `rollback` | none (`files/kitchen-pointers.sh back`) | `current`, the unit links, the drop-in, `state/ownership.json`, from the save | **once** (stop, start) |
 | `readback` | none (`files/kitchen-inspect.py readback`) | nothing | no |
 | `clear` | none (`files/kitchen-pointers.sh clear`) | removes the secret files named in `connectome_kitchen_secret_files_new`, after a rollback, if this window introduced them | no |
+| `remove` | none (`files/kitchen-first.sh remove`) | a first install only: removes the unit links, the drop-in and the deployment root | no (**one stop**) |
 
 `name` asks the engine what it calls the build of the request and prints it. Every other operation that reaches the
 engine needs that name pinned as `connectome_kitchen_build`, and the name of the build that runs now as
 `connectome_kitchen_live_build`. The runner refuses when the host says otherwise, so a request that is not the one
 that was looked at cannot be built or started under these pins.
+
+These are the operations on an agent that runs: a takeover. An agent that does not exist yet is installed by the same
+operations with `connectome_kitchen_first_install` and no live build: see [A first install](#a-first-install).
 
 ## What the role keeps, and what kitchen owns
 
@@ -185,6 +189,52 @@ No bypass is part of this: `connectome_kitchen_secrets_differ_ok` is not needed 
 To stay: nothing has to be done for the build; the new build is files nothing names. `clear` removes the introduced
 secret file there too.
 
+## A first install
+
+`-e connectome_kitchen_first_install=true`, with `connectome_kitchen_live_build` left empty, installs an agent from
+nothing: no deployment root, no unit, no build, nothing running. It needs a kitchen whose runner takes
+`expect.live_build: null` (the commit after `e62b4cf` that adds the first install). The account, its linger, its
+secrets file, the state directory and whatever the recipe's servers need are the operator's and are there before.
+The operations are `name`, `plan`, `prepare`, `verify`, `start`, `readback` and `remove`; `rollback` and `clear` are
+refused, since there is nothing to go back to. Everything of a takeover that is held against a running build has
+another thing in its place:
+
+| Operation | A takeover | A first install |
+| --- | --- | --- |
+| the request | names the live build | `expect.live_build` is `null`: the runner holds that `builds` has no build but the new one, that `current` is not there, and that the account has no unit link, enable link or drop-in directory of this deployment |
+| `prepare`, first | saves the links, the drop-in and `ownership.json` | `files/kitchen-first.sh hold`: none of the four is there, the unit is down, no other build; keeps the marker `<save>/first-install` and saves nothing. Refuses a save directory that holds a takeover's save |
+| `verify` | compares with the running build, keeps a baseline | `files/kitchen-inspect.py alone`: the build is prepared and has its launcher, unit, recipe and lock; the lock names the staged recipe; the recipe keys; each server of `connectome_kitchen_servers_connected` is one of the recipe. No comparison, no baseline |
+| the environment | name by name against the running build's file | from the runner alone: the secrets file holds every declared name, there is no environment file yet, and none of the secret files the start writes is there |
+| the gate of `start` | the agent's own IDLE | the operator's own word: `-e connectome_kitchen_operator_word="FIRST-START <name> <UTC time, YYYY-MM-DDTHH:MMZ>"`, as fresh as an IDLE must be; and the executor gate as before |
+| before the start | the agent runs the saved build | nothing is installed and the unit is down; `verify` ran for this build |
+| a start that fails | the engine puts the previous build back | the engine stops the unit and removes what it installed (the guard's `first-start` mode lets that one `stop` through). The play ends `NOT STARTED`: nothing is installed, the prepared build stays; `verify` and `start` again, or `remove` |
+| after the start | another process on the new build; the written environment against the previous one's | the unit runs the new build; the same process after `connectome_kitchen_watch_seconds`; then `verify`, which must find the environment file and the secret files the engine wrote to be what the secrets file gives |
+| a build that does not stay up | `rollback` | `remove` at once (the state directory stays), and the play ends `REMOVED`; with `connectome_kitchen_auto_rollback=false` nothing is removed and it ends `FAILED`, with the unit installed and enabled |
+| `readback` | holds the process and the planner's budget to the baseline | says `first install: no process ran before this one`; the planner's `hardBudget` is reported and held to nothing |
+
+`remove` is the way out, at any time while the deployment still is what a first install leaves:
+
+    -e connectome_kitchen_operation=remove -e connectome_kitchen_operator_word="REMOVE <name> <UTC time, YYYY-MM-DDTHH:MMZ>"
+
+It stops the one unit, removes the enable link and the unit link (only where they name a build of this deployment), the
+drop-in `90-connectome-env.conf` and its directory if that leaves it empty, reloads the service manager, and removes the
+deployment root with everything in it: the builds, cook's configuration and credentials, the engine's bookkeeping, its
+copies of the secret files, and the agent's workspace where that lies in the root (`<root>/workspace`). It never touches the secrets file, another unit or the account's `kitchen-takeover` log. The state
+directory stays unless `-e connectome_kitchen_remove_state=true`; left, it is what the process made of it and no longer
+the fresh state of before. It is refused without the marker (a deployment this role did not install from nothing),
+from inside the unit, without the dated word, and where `builds` holds more than one build: an agent that has had a
+window since its first install is not removed here. After it, `prepare`, `verify` and `start` install from nothing
+again; the build is cooked again. Exit 62 means a step failed part way: run it again when the cause is gone.
+
+Once the agent runs, its next window is a takeover: `connectome_kitchen_first_install` off, the build of the first
+install as `connectome_kitchen_live_build`, and a save directory of its own (the first install's holds its marker and
+is refused for a save). `plan` and `prepare` of the first-install request are refused on the running agent, by the
+runner and by the role.
+
+What a first install does not do: it creates no account, writes no secret, installs no other unit (a server the recipe
+reaches over a socket has to listen before the first start), sets nothing in the agent's own settings, and cannot say
+that a state directory is fresh: `prepare` prints the names of what is in it, for the operator to read.
+
 ## By hand
 
 If `rollback` ends with 61 or 62 the agent may be down. Its steps are the last lines of
@@ -199,6 +249,9 @@ or it says what is still not the saved one. If the unit fails on the previous bu
 a stand-in service manager that keeps real processes: the gates, a start, a start the engine takes back, a build that
 does not stay up, the way back, and the retry after it through `clear`, `prepare`, `verify` and a second real
 start; a way back that fails at `ownership.json` and the next one; a direct secret that changed, with and without
-a named new file, before the start and (`--scenario rotated-at-start`) between the check and the start. `tests/kitchen/render.yml` words the request without a host,
+a named new file, before the start and (`--scenario rotated-at-start`) between the check and the start.
+`--scenario first-install` begins where nothing is deployed: the refusals, a first start the engine takes back, the
+first start, `readback`, `remove`, the install again from nothing, a build that does not stay up with and without
+`connectome_kitchen_auto_rollback`, and the removal with the state directory. `tests/kitchen/render.yml` words the request without a host,
 so that it can be held against a request that is known. Neither is part of `scripts/test.sh`: they need a built
 kitchen clone, ansible-core and Node.

@@ -1,0 +1,145 @@
+---
+# The first start of an agent that is installed from nothing, on a build prepare made and verify held. The gates were
+# passed in main.yml: an executor outside the unit, and the operator's own dated word (there is no agent to say IDLE).
+#
+#   1. nothing moved since verify, nothing is installed, the unit is down; and verify once more
+#   2. kitchen start: the engine writes the environment file and the secret files, sets the pointer, links and enables
+#      the unit, reloads, starts the one unit and asks its health. If a step of that fails the engine itself takes it
+#      back: it stops the unit and removes what it installed. The build stays.
+#   3. the agent runs the new build
+#   4. the same process still runs after connectome_kitchen_watch_seconds
+#   5. verify again (the environment file and the secret files the engine wrote are what the secrets file gives), and
+#      readback
+# If 2, 3 or 4 fails and something is left installed, it is removed (remove.yml: the unit stopped, the links, the
+# drop-in and the root gone; the state directory and the secrets file stay) unless connectome_kitchen_auto_rollback is
+# false. The play then ends failed and says what is there.
+
+- name: Hold that verify held this build, and that nothing is installed yet
+  ansible.builtin.command:
+    argv: "{{ ck_first_script + ['held', connectome_kitchen_build] }}"
+  environment: "{{ ck_first_env }}"
+  changed_when: false
+  failed_when: false
+  register: ck_first_ready
+
+- name: Refuse unless verify held this build, nothing was deployed since, and nothing is installed
+  ansible.builtin.assert:
+    that: ck_first_ready.rc == 0
+    fail_msg: "{{ ck_first_ready.stdout_lines | join(' ') }} Not started."
+
+- name: Verify once more, as the last thing before the first start
+  ansible.builtin.include_tasks: runner.yml
+  vars:
+    ck_mode: verify
+
+- name: Refuse unless the build is prepared, the activation is due, and nothing of an environment is there yet
+  ansible.builtin.assert:
+    that:
+      - ck_result.plan.prepare.changed is false
+      - ck_result.plan.activate.changed is true
+      - ck_environment == 'first-environment'
+    fail_msg: "Not started: the plan is not build prepared and activation due, or an environment file or a secret file of this deployment is there already, which a first install does not find. {{ ck_environment_words }}. Nothing was changed, nothing was started."
+
+- name: The first start, and what follows from it
+  block:
+    - name: Start
+      ansible.builtin.include_tasks: runner.yml
+      vars:
+        ck_mode: start
+
+    - name: Stop here if the start of kitchen did not end well
+      ansible.builtin.assert:
+        that: ck_result.rc == 0
+        fail_msg: "kitchen start exited {{ ck_result.rc }}"
+
+    - name: Ask where the agent is after the first start
+      ansible.builtin.command:
+        argv: "{{ ck_first_script + ['runs', connectome_kitchen_build] }}"
+      environment: "{{ ck_first_env }}"
+      changed_when: false
+      failed_when: false
+      register: ck_first_after
+
+    - name: Show where the agent is after the first start
+      ansible.builtin.debug:
+        var: ck_first_after.stdout_lines
+
+    - name: Stop here unless the agent runs the new build
+      ansible.builtin.assert:
+        that:
+          - ck_first_after.rc == 0
+          - ck_first_after.stdout_lines[-1] is match('^process [1-9][0-9]* [0-9]+$')
+        fail_msg: "start exited 0 but the agent is not active and running on the new build"
+
+    - name: "Wait {{ connectome_kitchen_watch_seconds }} s: the same process must still run"
+      ansible.builtin.command:
+        argv: ["/usr/bin/sleep", "{{ connectome_kitchen_watch_seconds | string }}"]
+      changed_when: false
+
+    - name: Ask where the agent is after the wait
+      ansible.builtin.command:
+        argv: "{{ ck_first_script + ['runs', connectome_kitchen_build] }}"
+      environment: "{{ ck_first_env }}"
+      changed_when: false
+      failed_when: false
+      register: ck_first_stable
+
+    - name: Stop here unless it is the same process with the same restart count
+      ansible.builtin.assert:
+        that:
+          - ck_first_stable.rc == 0
+          - ck_first_stable.stdout_lines[-1] == ck_first_after.stdout_lines[-1]
+        fail_msg: "after {{ connectome_kitchen_watch_seconds }} s the agent is not running the new build in the process the start made: the new build does not stay up"
+
+  rescue:
+    - name: Ask whether anything is installed
+      ansible.builtin.command:
+        argv: "{{ ck_first_script + ['nothing'] }}"
+      environment: "{{ ck_first_env }}"
+      changed_when: false
+      failed_when: false
+      register: ck_first_left
+
+    - name: Show what is there
+      ansible.builtin.debug:
+        var: ck_first_left.stdout_lines
+
+    - name: End where nothing is installed and nothing has to be removed
+      ansible.builtin.fail:
+        msg: "NOT STARTED on {{ connectome_kitchen_build[:8] }}. Nothing of {{ ck_name }} is installed and its unit is down: the start was refused, or it failed and the engine took it back. The prepared build is still there. Read the lines above; then verify and start again, or remove."
+      when: ck_first_left.rc == 0
+
+    - name: End where nothing is removed, on your word
+      ansible.builtin.fail:
+        msg: "FAILED, and connectome_kitchen_auto_rollback is false: nothing was removed. {{ ck_name }} is installed on {{ connectome_kitchen_build[:8] }} and its unit may be running, failing or restarting; it is enabled and would start again at boot. Decide now: the same play with connectome_kitchen_operation=remove."
+      when: not (connectome_kitchen_auto_rollback | bool)
+
+    - name: Remove what the first start installed
+      ansible.builtin.include_tasks: remove.yml
+
+    - name: End where the first install was removed
+      ansible.builtin.fail:
+        msg: "REMOVED. The first start of {{ connectome_kitchen_build[:8] }} or the health of the agent after it failed; the unit of {{ ck_name }} was stopped and its links, its drop-in and its deployment root are gone. The secrets file is untouched. The state directory is left as that process left it: it is not the fresh state of before. To try again: prepare, verify, start."
+
+# From here on the agent runs and is stable. What follows changes nothing and removes nothing.
+
+- name: Verify after the first start
+  ansible.builtin.include_tasks: runner.yml
+  vars:
+    ck_mode: verify
+
+- name: Read back what the agent shows
+  ansible.builtin.include_tasks: inspect.yml
+  vars:
+    ck_inspections: [readback]
+
+- name: Say where the first start leaves it
+  ansible.builtin.debug:
+    msg:
+      - "STARTED: {{ ck_name }} runs build {{ connectome_kitchen_build[:8] }}, installed from nothing; {{ ck_first_stable.stdout_lines[-1] }} (pid, restarts), the same after {{ connectome_kitchen_watch_seconds }} s"
+      - "the environment file and the secret files the engine wrote: {{ 'what the secrets file gives' if ck_result.same_environment else 'LOOK: NOT what the secrets file gives now (it changed during the start, or a file could not be read)' }}"
+      - "verify after the start: {{ 'nothing to change' if ck_result.plan.changed is false else 'LOOK: the plan still has something to change' }}"
+      - "readback: {{ 'every line ok' if (ck_inspect_rc | int) == 0 else 'LOOK lines above (a server may need a moment to connect, and a budget line appears only after the first turn: run readback again then)' }}"
+      - "The check that counts is the agent's own: does it answer."
+      - "The way out, while this is its only build: the same play with connectome_kitchen_operation=remove and your dated word."
+      - "Its next window is a takeover: connectome_kitchen_first_install off, and {{ connectome_kitchen_build }} as connectome_kitchen_live_build."

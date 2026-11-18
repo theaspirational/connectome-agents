@@ -49,4 +49,5 @@
         account: "{{ connectome_kitchen_account }}"
         # `name` asks for the name; the runner is never started with this placeholder.
         request_id: "{{ connectome_kitchen_build if connectome_kitchen_build != '' else '0' * 64 }}"
-        live_build: "{{ connectome_kitchen_live_build }}"
+        # A first install names no live build: null tells the runner that nothing is deployed.
+        live_build: "{{ none if (connectome_kitchen_first_install | bool) else connectome_kitchen_live_build }}"

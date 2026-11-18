@@ -2,7 +2,7 @@
 """Sandbox trial of roles/connectome_kitchen: every operation through ansible-playbook, on a case of kitchen's deploy corpus.
 
     trial.py --kitchen CLONE --ansible ANSIBLE_DIR --scratch DIR [--corpus DIR] --case NAME
-             [--scenario full|fail-start|short-lived|rotated-at-start]
+             [--scenario full|fail-start|short-lived|rotated-at-start|first-install]
              [--new-recipe FILE --expect-leaf POINTER ... --changed-leaf POINTER ... --lock-leaf POINTER ... --new-secret-file SECRET=ENV ...]
 
 Not part of `scripts/test.sh`: it needs a built kitchen clone (with its test harness), ansible-core and Node.
@@ -18,6 +18,12 @@ What stands in, as in kitchen's own tests of its runner: the host model and the 
 The build that runs at the start is made by the Python role's engine with the role's cook command, as the corpus makes
 it: for the engine that is a build with another name than its own, which is what a build of an earlier adapter contract
 is too.
+
+`--scenario first-install` is the other beginning: nothing is deployed. No build is made by the Python role, no unit is
+there and nothing runs; the role is run with connectome_kitchen_first_install. It goes through the refusals, a first
+start that fails (the engine takes it back and nothing is left installed), the first start, readback, `remove`, the
+install again from nothing, a build that does not stay up with and without connectome_kitchen_auto_rollback, and the
+removal with the state directory. `--changed-leaf` there names a leaf the recipe must have, `--connected` a server.
 
 `--new-recipe` puts another recipe in place before the new build is asked for (the running build keeps the case's own),
 and cook is then the corpus stand-in, since a real lock can only be replayed for the recipe it was made from.
@@ -46,7 +52,7 @@ def main():
     parser.add_argument('--scratch', required=True)
     parser.add_argument('--corpus', help='a deploy corpus; default: the synthetic one of the clone')
     parser.add_argument('--case', required=True)
-    parser.add_argument('--scenario', default='full', choices=('full', 'fail-start', 'short-lived', 'rotated-at-start'))
+    parser.add_argument('--scenario', default='full', choices=('full', 'fail-start', 'short-lived', 'rotated-at-start', 'first-install'))
     parser.add_argument('--new-recipe')
     parser.add_argument('--expect-leaf', action='append', default=[])
     parser.add_argument('--changed-leaf', action='append', default=[])
@@ -71,13 +77,14 @@ def main():
     case.data['layers']['agent']['activation'] = 'start'
     world = corpus.World(case, scratch / 'sandbox')
     world.build()
-    role = world.role_apply(world.operator_files())
+    first = args.scenario == 'first-install'
+    role = None if first else world.role_apply(world.operator_files())
     sandbox, root, unit_dir, home = world.sandbox, Path(world.root), Path(world.unit_dir), world.home
-    name, old = world.effective['name'], role['request_id']
+    name, old = world.effective['name'], '' if first else role['request_id']
     unit, state = 'connectome-%s.service' % name, Path(world.effective['state_dir'])
     me, uid = __import__('pwd').getpwuid(os.geteuid()).pw_name, os.geteuid()
     replayed = world.replay is not None
-    print('case %s: deployment %s, the running build %s, %s' % (case.name, name, old[:8], 'a replay of a real cook lock' if replayed else 'the corpus stand-in for cook'))
+    print('case %s: deployment %s, %s, %s' % (case.name, name, 'nothing deployed (a first install)' if first else 'the running build ' + old[:8], 'a replay of a real cook lock' if replayed else 'the corpus stand-in for cook'))
 
     # The service manager, with real processes.
     (sandbox / 'knobs').mkdir()
@@ -85,7 +92,7 @@ def main():
     corpus.write(fake, '#!/bin/sh\nexec %s %s %s %s %s %s "$@"\n' % (sys.executable, HERE / 'fake_manager.py', sandbox, root, unit_dir, state), 0o755)
     sc = lambda *words: subprocess.run([str(fake), '--user', *words], capture_output=True, text=True)
     show = lambda prop: sc('show', '-p', prop, '--value', unit).stdout.strip()
-    calls = lambda: [json.loads(line)[0] for line in (sandbox / 'fake-manager-calls').read_text().splitlines() if json.loads(line)[0] in ('restart', 'start', 'stop', 'daemon-reload')]
+    calls = lambda: [json.loads(line)[0] for line in (sandbox / 'fake-manager-calls').read_text().splitlines() if json.loads(line)[0] in ('restart', 'start', 'stop', 'daemon-reload')] if (sandbox / 'fake-manager-calls').exists() else []
 
     def cooked(build):
         """Cook's copy of the recipe for the host, where the stand-in made none: the staged recipe's bytes."""
@@ -93,11 +100,12 @@ def main():
         if not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / 'builds' / build / 'cook-recipe.json', target)
-    cooked(old)
-    sc('daemon-reload'); sc('start', unit)
+    if not first:
+        cooked(old)
+        sc('daemon-reload'); sc('start', unit)
     pid0 = show('MainPID')
     journal = sandbox / 'journal.txt'
-    servers = sorted(json.loads((root / 'builds' / old / 'cook-recipe.json').read_text()).get('mcpServers') or {})
+    servers = sorted(json.loads((Path(world.raw_layers['agent']['recipe_file']['path']) if first else root / 'builds' / old / 'cook-recipe.json').read_text()).get('mcpServers') or {})
     lines = lambda budget: ''.join('MCPL server "%s" reconnected successfully\n' % server for server in servers) + \
         '[plan-vs-actual] planned=10 actual=10 delta=+0 (+0.0%%) budgetMet=true exhausted=false moves=0 floor=10 hardBudget=%d queuedRelief=0\n' % budget
     journal.write_text(lines(280800))
@@ -173,6 +181,8 @@ def main():
         'connectome_kitchen_lock_changes': args.lock_leaf, 'connectome_kitchen_secret_files_new': new_files, 'connectome_kitchen_servers_connected': args.connected,
         'connectome_kitchen_budget_reported_only': args.budget_reported_only,
     }
+    if first:
+        variables.update(connectome_kitchen_first_install=True, connectome_kitchen_recipe_present=args.changed_leaf)
     play = scratch / 'play.yml'
     play.write_text('- hosts: localhost\n  connection: local\n  gather_facts: false\n  roles:\n    - role: %s\n' % (REPO / 'roles/connectome_kitchen'))
     ansible = Path(args.ansible).resolve()
@@ -193,6 +203,8 @@ def main():
                         os.readlink(unit_dir / 'default.target.wants' / unit), (root / 'state/ownership.json').read_text())
     at = lambda build: pointers()[0] == str(root / 'builds' / build) and pointers()[1] == pointers()[3] == str(root / 'builds' / build / 'managed-units' / unit) and build in pointers()[2]
     idle = lambda offset=0: 'IDLE %s %s' % (name, time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(time.time() + offset)))
+    if first:
+        return first_install(args, corpus, world, op, sc, show, calls, cooked, variables, journal, servers, log, node)
     before = pointers()
     tree = corpus.snapshot(sandbox)
 
@@ -451,6 +463,182 @@ def main():
     pid4, seen = show('MainPID'), len(calls())
     status, out = op('rollback', connectome_kitchen_idle=idle())
     ok('rollback once more: nothing to put back, ownership.json is the saved one, nothing restarted', status == 0 and 'Nothing to put back' in out and 'ownership.json is the saved one.' in out and show('MainPID') == pid4 and calls()[seen:] == [], out)
+    return finish(sc, unit, log)
+
+
+def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, journal, servers, log, node):
+    """Nothing is deployed: the role with connectome_kitchen_first_install, from `name` to a first start, `remove`, and again."""
+    sandbox, root, unit_dir, home = world.sandbox, Path(world.root), Path(world.unit_dir), world.home
+    name, state, save = world.effective['name'], Path(world.effective['state_dir']), sandbox / 'save'
+    unit = 'connectome-%s.service' % name
+    secrets_file = Path(world.effective['secrets_file'])
+    secrets_digest = hashlib.sha256(secrets_file.read_bytes()).hexdigest()
+    four = lambda: [os.path.lexists(path) for path in (root / 'current', unit_dir / unit, unit_dir / 'default.target.wants' / unit, unit_dir / (unit + '.d'))]
+    nothing = lambda: four() == [False] * 4 and show('ActiveState') in ('inactive', 'failed') and show('MainPID') == '0'
+    word = lambda verb='FIRST-START', offset=0, who=name: '%s %s %s' % (verb, who, time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(time.time() + offset)))
+    lines = lambda budget=280800: ''.join('MCPL server "%s" connected\n' % server for server in servers) + \
+        '[plan-vs-actual] planned=10 actual=10 delta=+0 (+0.0%%) budgetMet=true exhausted=false moves=0 floor=10 hardBudget=%d queuedRelief=0\n' % budget
+    journal.write_text('')
+    ok('before anything: no deployment root, no unit directory entry of the deployment, the unit down', not root.exists() and nothing(), (root.exists(), four()))
+
+    status, out = op('name', connectome_kitchen_live_build='f' * 64)
+    ok('a first install that names a live build: refused before anything is read', status != 0 and 'Unusable connectome_kitchen invocation' in out and not root.exists(), out)
+    status, out = op('name')
+    line = next((line for line in out.splitlines() if 'connectome_kitchen_build: ' in line), '')
+    new = line.split('connectome_kitchen_build: ')[1].strip(' ",') if line else ''
+    world.node, world.own_name = node, True
+    expected = world.request_id()
+    ok('name: exit 0, and the build name is the oracle\'s formula over this request (%s)' % new[:8], status == 0 and new == expected, (new, expected, out))
+    request = json.loads((home / 'kitchen-takeover' / name / 'inputs/request.json').read_text())
+    ok('name: the request tells the runner that nothing is deployed (expect.live_build is null)', request['expect']['live_build'] is None and 'live_build' in request['expect'], request['expect'])
+    ok('name: nothing of a deployment was written', not root.exists() and nothing())
+    variables['connectome_kitchen_build'] = new
+    build = root / 'builds' / new
+    for operation in ('rollback', 'clear'):
+        status, out = op(operation, connectome_kitchen_agent_is_down=True)
+        ok('%s of a first install: refused (there is nothing to go back to; the way out is remove)' % operation, status != 0 and 'Unusable connectome_kitchen invocation' in out and nothing(), out)
+    status, out = op('remove', connectome_kitchen_first_install=False, connectome_kitchen_live_build='f' * 64, connectome_kitchen_operator_word=word('REMOVE'))
+    ok('remove without connectome_kitchen_first_install: refused', status != 0 and 'Unusable connectome_kitchen invocation' in out, out)
+
+    status, out = op('plan')
+    ok('plan: exit 0, a build to make and an activation due; nothing written', status == 0 and '"prepare":{"build_dir":"<S>' in out.replace('\\"', '"') and not root.exists() and nothing(), out)
+    status, out = op('verify')
+    ok('verify before prepare: refused', status != 0 and nothing(), out)
+    status, out = op('start', connectome_kitchen_operator_word=word())
+    ok('start before prepare: refused, nothing started', status != 0 and 'holds no marker of a first install' in out and nothing() and calls() == [], out)
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+    ok('remove before prepare: refused (no marker: not a deployment this role installed from nothing)', status != 0 and 'holds no marker of a first install' in out and calls() == [], out)
+
+    status, out = op('prepare')
+    ok('prepare: exit 0, the build is prepared', status == 0 and (build / '.prepared').is_file() and (build / '.prepared').read_text() == new, out)
+    ok('prepare: nothing is installed and nothing was asked of the service manager but questions', nothing() and calls() == [], (four(), calls()))
+    ok('prepare: the runner saw nothing touched, with a complete measurement', '"untouched_by_this_run":true' in out.replace('\\"', '"') and '"measurement_complete":true' in out.replace('\\"', '"'), out)
+    ok('prepare: the marker of a first install is kept, by the operator, 0700; no save of a takeover', (save / 'first-install').read_text() == 'first-install %s\n' % name and (save.stat().st_mode & 0o777) == 0o700 and not (save / 'links').exists())
+    cooked(new)
+    status, out = op('prepare')
+    ok('prepare again: exit 0, already held, nothing built twice', status == 0 and 'already held' in out and nothing(), out)
+
+    status, out = op('verify')
+    ok('verify: exit 0', status == 0, out)
+    for text in ('ok    the new build is prepared', 'ok    the build has its ' + unit, 'ok    the build has its run.sh', 'ok    the lock of the new build names its staged recipe by digest',
+                 'there is no environment file yet, and none of the secret files the start writes is there', 'the build has no LOOK line',
+                 'first install: there is no running build to compare with'):
+        ok('verify: ' + text.strip(), text in out, [line for line in out.splitlines() if text[:24] in line])
+    for leaf in args.changed_leaf:
+        ok('verify: %s is present in the recipe' % leaf, 'ok    cooked recipe: %s is present' % leaf in out, out)
+    for server in args.connected:
+        ok('verify: %s is a server of the recipe' % server, 'ok    MCP %s, which readback will hold to a connected line, is a server of the recipe' % server in out, out)
+    ok('verify: nothing is installed', nothing() and calls() == [])
+
+    status, out = op('start')
+    ok('start without your word: refused, nothing started', status != 0 and 'needs your own word for this run' in out and nothing() and calls() == [], out)
+    for label, extra in (('an agent\'s IDLE in its place', {'connectome_kitchen_idle': 'IDLE %s %s' % (name, word().split(' ')[2])}), ('a word an hour old', {'connectome_kitchen_operator_word': word(offset=-3600)}),
+                         ('the word of a removal', {'connectome_kitchen_operator_word': word('REMOVE')}), ('a word for another agent', {'connectome_kitchen_operator_word': word(who='someone-else')})):
+        status, out = op('start', **extra)
+        ok('start with %s: refused, nothing started' % label, status != 0 and nothing() and calls() == [], out)
+
+    # A first start whose unit does not come up: the engine takes it back, with the one stop the guard lets through.
+    (sandbox / 'knobs' / ('fail-start-' + new[:8])).write_text('')
+    status, out = op('start', connectome_kitchen_operator_word=word())
+    ok('a first start that fails: the play fails and says nothing is installed', status != 0 and 'NOT STARTED on ' + new[:8] in out and 'Nothing of %s is installed' % name in out, out)
+    ok('there: the engine took it back itself (reload, restart, stop, reload); no pointer, no links, no drop-in, no secret file; the build stays; the role removed nothing',
+       calls() == ['daemon-reload', 'restart', 'stop', 'daemon-reload'] and nothing() and not (root / 'state/secret-files').exists() and (build / '.prepared').is_file() and 'removing the first install' not in out, (calls(), four()))
+    (sandbox / 'knobs' / ('fail-start-' + new[:8])).unlink()
+    status, out = op('verify')
+    ok('verify after it: exit 0, the build is still prepared and nothing of an environment is there', status == 0 and 'there is no environment file yet' in out, out)
+
+    def started(label, seen):
+        journal.write_text(lines())
+        status, out = op('start', connectome_kitchen_operator_word=word())
+        ok('%s: exit 0, STARTED' % label, status == 0 and 'STARTED: %s runs build %s, installed from nothing' % (name, new[:8]) in out, out)
+        ok('%s: one daemon-reload and one restart, no stop; the pointer, the links and the drop-in name the build; the unit runs' % label,
+           calls()[seen:] == ['daemon-reload', 'restart'] and four() == [True] * 4 and os.readlink(root / 'current') == str(build) and show('ActiveState') == 'active' and show('MainPID') != '0', (calls()[seen:], four()))
+        ok('%s: what the engine wrote is what the secrets file gives; verify afterwards finds nothing to change' % label,
+           'the environment file and the secret files the engine wrote: what the secrets file gives' in out and 'verify after the start: nothing to change' in out, out)
+        return out
+    out = started('the first start', len(calls()))
+    pid1 = show('MainPID')
+    ok('the first start: readback holds nothing to a process before it, and says so', 'first install: no process ran before this one' in out and 'a baseline of the process before the start' not in out and 'readback: every line ok' in out, out)
+    (state / 'trial-state-of-the-agent').write_text('what the process wrote\n')
+    status, out = op('readback')
+    ok('readback: exit 0, every line ok', status == 0 and 'readback: every line ok' in out, out)
+    ok('readback: one child process for each of the %d MCP servers of the recipe' % len(servers), all(('ok    MCP %s: a child process is there' % server) in out or ('ok    MCP %s (no child process' % server) in out for server in servers), out)
+    ok('readback: the planner\'s budget is reported, not held', 'hardBudget of the planner: 280800 (first install: reported' in out and 'LOOK  ' not in out, out)
+    for server in args.connected:
+        ok('readback: the journal says %s is connected' % server, 'ok    MCP %s: its last connection line in the journal says connected' % server in out, out)
+    for leaf in args.changed_leaf:
+        ok('readback: %s is present in the recipe the process was started with' % leaf, 'ok    cooked recipe: %s is present' % leaf in out, out)
+    journal.write_text(lines().replace('connected', 'initial connect failed: text that must not be shown', 1).split('[plan-vs-actual]')[0])
+    status, out = op('readback')
+    ok('readback with a failed server and no turn yet: LOOK lines, and no text of the journal line', 'LOOK  MCP ' in out and 'LOOK  no [plan-vs-actual] line since the start yet' in out and 'must not be shown' not in out, out)
+
+    seen = len(calls())
+    status, out = op('start', connectome_kitchen_operator_word=word())
+    ok('start a second time: refused, nothing restarted', status != 0 and 'the first start has been done already' in out and show('MainPID') == pid1 and calls()[seen:] == [], out)
+    status, out = op('prepare')
+    ok('prepare of a first install on the running agent: refused (it is not one)', status != 0 and 'installed already: this is not a first install' in out and show('MainPID') == pid1, out)
+    status, out = op('plan')
+    ok('plan of a first install on the running agent: refused by the runner', status != 0 and 'a first install is of a root whose current is not there' in out and show('MainPID') == pid1, out)
+
+    # remove: the way out.
+    status, out = op('remove')
+    ok('remove without your word: refused, nothing stopped', status != 0 and 'needs your own word for this run' in out and show('MainPID') == pid1, out)
+    status, out = op('remove', connectome_kitchen_operator_word=word())
+    ok('remove with the word of a first start: refused, nothing stopped', status != 0 and show('MainPID') == pid1 and calls()[seen:] == [], out)
+    (root / 'builds' / ('0' * 64)).mkdir()
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+    ok('remove where a second build is there (an agent that has had a window since): refused, nothing stopped', status != 0 and 'holds more than one build' in out and show('MainPID') == pid1 and calls()[seen:] == [], out)
+    (root / 'builds' / ('0' * 64)).rmdir()
+    kept = sorted(str(path.relative_to(home / 'kitchen-takeover')) for path in (home / 'kitchen-takeover').rglob('*'))
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+    ok('remove: exit 0', status == 0 and 'remove: exit 0' in out, out)
+    ok('remove: one stop and one daemon-reload; the unit is down; the links, the drop-in and the deployment root are gone', calls()[seen:] == ['stop', 'daemon-reload'] and nothing() and not root.exists(), (calls()[seen:], four(), root.exists()))
+    ok('remove: the secrets file is byte for byte there, the state directory is as the process left it, the log of the account and the marker stay',
+       hashlib.sha256(secrets_file.read_bytes()).hexdigest() == secrets_digest and (state / 'trial-state-of-the-agent').is_file() and (save / 'first-install').is_file() and not (save / 'verified').exists()
+       and set(kept) <= {str(path.relative_to(home / 'kitchen-takeover')) for path in (home / 'kitchen-takeover').rglob('*')})
+    seen = len(calls())
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+    ok('remove again: exit 0, nothing to remove, nothing stopped', status == 0 and 'nothing to remove' in out and calls()[seen:] == [], out)
+    status, out = op('start', connectome_kitchen_operator_word=word())
+    ok('start after a removal: refused (verify has to run again)', status != 0 and 'verify has not run for this build' in out and nothing() and calls()[seen:] == [], out)
+
+    def again():
+        status, out = op('prepare')
+        held = status == 0 and (build / '.prepared').is_file()
+        cooked(new)
+        status, out = op('verify')
+        return held and status == 0, out
+
+    # A build that does not stay up, where nothing is to be removed without a word, and where it is removed at once.
+    (sandbox / 'knobs' / ('short-lived-' + new[:8])).write_text('')
+    held, out = again()
+    ok('from nothing again: prepare and verify exit 0', held, out)
+    seen = len(calls())
+    status, out = op('start', connectome_kitchen_operator_word=word(), connectome_kitchen_auto_rollback=False)
+    ok('a build that does not stay up, auto_rollback false: the play fails, says so and removes nothing', status != 0 and 'FAILED, and connectome_kitchen_auto_rollback is false: nothing was removed' in out and four() == [True] * 4 and 'stop' not in calls()[seen:], (calls()[seen:], out))
+    seen = len(calls())
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+    ok('remove of it: exit 0, the unit down, nothing installed, the root gone', status == 0 and nothing() and not root.exists() and calls()[seen:] == ['stop', 'daemon-reload'], (calls()[seen:], out))
+    held, out = again()
+    ok('from nothing again: prepare and verify exit 0', held, out)
+    seen = len(calls())
+    status, out = op('start', connectome_kitchen_operator_word=word())
+    ok('a build that does not stay up: the play fails and says it removed the first install', status != 0 and 'REMOVED. The first start of ' + new[:8] in out, out)
+    ok('there: the unit is down, nothing is installed, the root is gone; the state directory and the secrets file stay',
+       nothing() and not root.exists() and calls()[seen:] == ['daemon-reload', 'restart', 'stop', 'daemon-reload'] and (state / 'trial-state-of-the-agent').is_file() and hashlib.sha256(secrets_file.read_bytes()).hexdigest() == secrets_digest, (calls()[seen:], four()))
+    (sandbox / 'knobs' / ('short-lived-' + new[:8])).unlink()
+
+    # And the install that stays, from nothing, after all of it.
+    held, out = again()
+    ok('from nothing once more: prepare and verify exit 0', held, out)
+    started('the first start after the removals', len(calls()))
+    seen = len(calls())
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'), connectome_kitchen_remove_state=True)
+    ok('remove with connectome_kitchen_remove_state: exit 0, and the state directory is gone too; the secrets file is byte for byte there',
+       status == 0 and nothing() and not root.exists() and not state.exists() and hashlib.sha256(secrets_file.read_bytes()).hexdigest() == secrets_digest and calls()[seen:] == ['stop', 'daemon-reload'], (calls()[seen:], out))
+    values = [value for value in world.secrets.values() if isinstance(value, str) and len(value) >= 12]
+    ok('no value of the secrets file is in what the plays printed or in what the runner kept (%d values held)' % len(values),
+       not any(value in log.read_text() for value in values) and not any(value in path.read_text(errors='replace') for value in values for path in (home / 'kitchen-takeover').rglob('*') if path.is_file() and 'cook-recipe' not in path.name))
     return finish(sc, unit, log)
 
 

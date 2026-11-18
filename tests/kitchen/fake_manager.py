@@ -26,7 +26,7 @@ book = sandbox / 'fake-manager.json'
 data = json.loads(book.read_text()) if book.exists() else {'loaded': {}, 'units': {}}
 with (sandbox / 'fake-manager-calls').open('a') as stream:
     stream.write(json.dumps(args) + '\n')
-with (root / 'systemctl-calls').open('a') as stream:  # where the unit test counts the engine's verbs
+with ((root if root.exists() else sandbox) / 'systemctl-calls').open('a') as stream:  # where the unit test counts the engine's verbs; beside it while nothing is deployed
     stream.write(json.dumps(sys.argv[5:]) + '\n')
 words = [word for word in args if not word.startswith('-')]
 verb, operands = words[0], words[1:]

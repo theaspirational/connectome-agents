@@ -4,6 +4,10 @@
     kitchen-inspect.py compare  CONFIG.json     before the start: the new build against the running one
     kitchen-inspect.py baseline CONFIG.json     before the start: what the running process shows, kept for `readback`
     kitchen-inspect.py readback CONFIG.json     after the start: recipe keys, MCP children, the context budget
+    kitchen-inspect.py alone    CONFIG.json     a first install, before the start: the new build by itself
+
+A first install (`first_install` in CONFIG.json) has no build that runs: `alone` stands where `compare` and `baseline`
+stand, and `readback` then holds nothing to a process before the start and says so.
 
 CONFIG.json is written by the role (roles/connectome_kitchen/tasks) and holds paths, names and expectations only.
 
@@ -153,6 +157,34 @@ def compare(c):
         print('      web-ui-%s %s' % ('built' if os.path.exists(os.path.join(root, 'builds', build, 'app', 'dist', 'web')) else 'absent', build[:8]))
 
 
+def alone(c):
+    """A first install: no build runs, so there is nothing to compare the new build with. What it is by itself."""
+    new, root, unit = c['new'], c['root'], c['unit']
+    build = os.path.join(root, 'builds', new)
+    cooked = os.path.join(root, 'cook-config', new, 'recipes', 'cook-recipe.json')
+    check('the new build is prepared', read(os.path.join(build, '.prepared')) == new.encode())
+    for leaf in ('run.sh', unit, 'cook-recipe.json', 'connectome.lock'):
+        check('the build has its %s' % leaf, read(os.path.join(build, leaf)) is not None)
+    staged, lock = read(os.path.join(build, 'cook-recipe.json')), read(os.path.join(build, 'connectome.lock'))
+    try:
+        named = pointer(json.loads(lock), '/recipe/sha256') if lock is not None else ABSENT
+    except ValueError:
+        named = ABSENT
+    if named is not ABSENT:
+        check('the lock of the new build names its staged recipe by digest', staged is not None and named == hashlib.sha256(staged).hexdigest())
+    keys(c, build, cooked)
+    try:
+        servers = json.loads(staged).get('mcpServers') if staged is not None else None
+    except ValueError:
+        servers = None
+    servers = servers if isinstance(servers, dict) else {}
+    print('      %d MCP servers in the staged recipe: %s' % (len(servers), ', '.join(sorted(servers)) or 'none'))
+    for name in sorted(c.get('servers_connected', [])):
+        check('MCP %s, which readback will hold to a connected line, is a server of the recipe' % name, name in servers)
+    print('      web-ui-%s %s' % ('built' if os.path.exists(os.path.join(build, 'app', 'dist', 'web')) else 'absent', new[:8]))
+    print('      first install: there is no running build to compare with, and no process to keep a baseline of')
+
+
 def keys(c, build, cooked):
     for label, path in (('staged recipe', os.path.join(build, 'cook-recipe.json')), ('cooked recipe', cooked)):
         data = read(path)
@@ -271,12 +303,18 @@ def readback(c):
     check('the unit is active and running', (state['ActiveState'], state['SubState']) == ('active', 'running'))
     check('its environment file is the new build\'s', state['EnvironmentFiles'].startswith(os.path.join(build, 'secrets.env')))
     check('current names the new build', os.path.realpath(os.path.join(root, 'current')) == os.path.realpath(build))
+    first = bool(c.get('first_install'))
     try:
         with open(c['baseline_file']) as stream:
             before = json.load(stream)
     except (OSError, ValueError):
         before = None
-    check('a baseline of the process before the start is there', before is not None, c['baseline_file'])
+    if first:
+        # Nothing ran before a first start: there is no baseline, and none is missed.
+        before = None
+        print('      first install: no process ran before this one; nothing is held to a baseline')
+    else:
+        check('a baseline of the process before the start is there', before is not None, c['baseline_file'])
     pid = int(state['MainPID']) if state['MainPID'].isdigit() else 0
     if before:
         check('it is another process than before the start', bool(pid) and str(pid) != before['main_pid'])
@@ -339,12 +377,14 @@ def readback(c):
             print('      hardBudget of the planner: %s before the start, %s now (reported, not held to the one before)' % (before['hard_budget'], plan.get('hardBudget')))
         elif before and before.get('hard_budget') is not None:
             check('hardBudget is the one of the process before the start (%s)' % before['hard_budget'], plan.get('hardBudget') == before['hard_budget'], 'now %s' % plan.get('hardBudget'))
+        elif first:
+            print('      hardBudget of the planner: %s (first install: reported; there is no process before the start to hold it to)' % plan.get('hardBudget'))
         else:
             say('LOOK', 'hardBudget=%s, and there is no value from before the start to hold it to' % plan.get('hardBudget'))
 
 
 def main():
-    if len(sys.argv) != 3 or sys.argv[1] not in ('compare', 'baseline', 'readback'):
+    if len(sys.argv) != 3 or sys.argv[1] not in ('compare', 'baseline', 'readback', 'alone'):
         sys.stderr.write(__doc__)
         return 2
     try:
@@ -355,7 +395,7 @@ def main():
     except (OSError, ValueError, KeyError) as error:
         sys.stderr.write('kitchen-inspect: unusable configuration (%s)\n' % type(error).__name__)
         return 2
-    {'compare': compare, 'baseline': baseline, 'readback': readback}[sys.argv[1]](c)
+    {'compare': compare, 'baseline': baseline, 'readback': readback, 'alone': alone}[sys.argv[1]](c)
     print('kitchen-inspect %s: %s' % (sys.argv[1], 'every line ok' if not looks else '%d line(s) marked LOOK' % looks))
     return 5 if looks else 0
 

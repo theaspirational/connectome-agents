@@ -2,6 +2,8 @@
 # Thin layer over connectome-kitchen for one deployment without a catalog. See docs/kitchen.md.
 # One run is one operation on one agent:
 #   name | plan | prepare | verify | start | rollback | readback | clear
+# and, for an agent that is installed from nothing (connectome_kitchen_first_install):
+#   name | plan | prepare | verify | start | readback | remove
 connectome_kitchen_operation: ""
 
 # The kitchen install: a directory with dist/, scripts/takeover.mjs and KITCHEN_COMMIT.
@@ -55,6 +57,19 @@ connectome_kitchen_engines: {}
 connectome_kitchen_live_build: ""
 connectome_kitchen_build: ""
 
+# A first install: nothing of this agent is deployed. No live build is named (connectome_kitchen_live_build stays
+# empty); kitchen's runner is told so and holds it. `prepare` saves nothing and keeps a marker in the save directory;
+# `verify` holds the new build by itself; `start` is the first start; `rollback` and `clear` are refused, and `remove`
+# is the way out. Once the agent runs, its next window is a takeover: this off, and its build as the live one.
+connectome_kitchen_first_install: false
+# In place of the agent's IDLE, which nobody can give yet: the operator's own word for this run, named and dated, held
+# to connectome_kitchen_idle_max_age_minutes like an IDLE.
+#   start:   -e connectome_kitchen_operator_word="FIRST-START <name> <UTC time, YYYY-MM-DDTHH:MMZ>"
+#   remove:  -e connectome_kitchen_operator_word="REMOVE <name> <UTC time, YYYY-MM-DDTHH:MMZ>"
+connectome_kitchen_operator_word: ""
+# `remove` leaves the agent's state directory unless this is true. It never touches the secrets file.
+connectome_kitchen_remove_state: false
+
 # Where `prepare` keeps what `rollback` needs. The operator's, mode 0700, outside the home of the account.
 connectome_kitchen_save_dir: "/var/lib/connectome-kitchen/save/{{ connectome_agent.name }}"
 
@@ -68,7 +83,8 @@ connectome_kitchen_agent_is_down: false
 # After `start`: the same process must still run after this many seconds.
 connectome_kitchen_watch_seconds: 120
 connectome_kitchen_runner_timeout_seconds: 300
-# On a failed start or a failed watch, put the previous build back at once.
+# On a failed start or a failed watch, put the previous build back at once. For a first install: remove what the
+# start installed at once (the state directory stays).
 connectome_kitchen_auto_rollback: true
 # Start although the secrets file gives the new process another environment than the running one has: every
 # difference, named or not (a rotated key, another base URL). The names that differ are printed by `verify`; no value is.

@@ -1,5 +1,6 @@
 ---
-# files/kitchen-inspect.py over the builds and the unit. In: ck_inspections (a list of compare, baseline, readback).
+# files/kitchen-inspect.py over the builds and the unit. In: ck_inspections (a list of compare, baseline, readback; for a
+# first install: alone, readback).
 # Out: ck_inspect_rc: 0 every line ok, 5 a LOOK line. Reads only.
 
 - name: Write what the inspection is told (paths, names and expectations; no secret)
@@ -25,6 +26,7 @@
       journalctl: "{{ connectome_kitchen_journalctl }}"
       baseline_file: "{{ connectome_kitchen_save_dir }}/baseline.json"
       baseline_since: "-6h"
+      first_install: "{{ connectome_kitchen_first_install | bool }}"
 
 - name: Inspect
   ansible.builtin.command:

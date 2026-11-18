@@ -59,7 +59,8 @@ class Files(unittest.TestCase):
     def test_operations_gates_and_defaults(self):
         main = yaml.safe_load((ROLE / 'tasks/main.yml').read_text())
         first = main[0]['ansible.builtin.assert']['that']
-        self.assertIn("connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback', 'clear']", first)
+        # The eight operations of a deployment that runs; `remove` is there for a first install alone.
+        self.assertIn("connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback', 'clear'] or (connectome_kitchen_operation == 'remove' and connectome_kitchen_first_install | bool)", first)
         self.assertIn('not ansible_check_mode', first)
         self.assertIn("ansible_connection == 'local'", first)
         names = [task['name'] for task in main]
@@ -78,6 +79,62 @@ class Files(unittest.TestCase):
         self.assertIn("ck_engine: \"{{ connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start'] }}\"", (ROLE / 'tasks/main.yml').read_text())
         for operation in ('name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback', 'clear'):
             self.assertIn('| `%s` |' % operation, doc)
+
+    def test_a_first_install_is_a_mode_of_its_own_and_leaves_the_takeover_tasks_as_they_were(self):
+        main = yaml.safe_load((ROLE / 'tasks/main.yml').read_text())
+        first = main[0]['ansible.builtin.assert']['that']
+        # No live build with it, a live build without it; no rollback and no clear with it; remove only with it.
+        for line in ("connectome_kitchen_live_build is match('^[0-9a-f]{64}$') or (connectome_kitchen_first_install | bool)", "connectome_kitchen_live_build == '' or not (connectome_kitchen_first_install | bool)",
+                     "not (connectome_kitchen_first_install | bool) or connectome_kitchen_operation not in ['rollback', 'clear']", "connectome_kitchen_operation in ['name', 'plan', 'remove'] or connectome_kitchen_build != ''"):
+            self.assertIn(line, first)
+        defaults = yaml.safe_load((ROLE / 'defaults/main.yml').read_text())
+        self.assertEqual((defaults['connectome_kitchen_first_install'], defaults['connectome_kitchen_operator_word'], defaults['connectome_kitchen_remove_state']), (False, '', False))
+        names = [task['name'] for task in main]
+        when = lambda name: str(main[names.index(name)]['when'])
+        # The gates: the executor for a removal too, and the operator's own word where no agent can say IDLE. Both before any act.
+        word = "Refuse a first start or a removal without the operator's own dated word for this run"
+        self.assertEqual(when('Refuse to restart an agent from inside its own unit'), 'ck_restarts or ck_removes')
+        self.assertEqual(when(word), 'ck_first and (ck_restarts or ck_removes)')
+        self.assertIn('not ck_first', when("Refuse a restart without the agent's own IDLE for this run"))
+        acts = [names.index(name) for name in ('Start the agent on the prepared build', 'Start the agent for the first time', 'Stop the agent and remove its first install', 'Put the previous build back')]
+        self.assertLess(names.index(word), min(acts))
+        gate = main[names.index(word)]
+        self.assertIn("ck_word: \"{{ 'FIRST-START' if ck_restarts else 'REMOVE' }}\"", (ROLE / 'tasks/main.yml').read_text())
+        self.assertIn("connectome_kitchen_operator_word is match('^' + ck_word + ' ' + ck_name + ' [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z$')", gate['ansible.builtin.assert']['that'])
+        # Each task that saves, compares with or marks against a running build is the takeover's alone, and each of the
+        # first install's is its own: none of them registers a result under a name the other reads.
+        takeover = ('Keep what rollback needs (the links, the drop-in, ownership.json)', 'Show what was kept', 'Hold the new build against the running one, and keep the baseline of the process for readback',
+                    'Hold what verify found, for the start', 'Say where verify leaves it', 'Start the agent on the prepared build')
+        own = ('Hold that nothing is deployed, and keep the marker of a first install', 'Show what was held', 'Stop unless nothing is deployed', 'Hold the new build by itself',
+               'Hold what verify found of the first build, for the start', 'Say where verify leaves a first install', 'Start the agent for the first time')
+        for name in takeover:
+            self.assertTrue(when(name).endswith(' and not ck_first'), name)
+        for name in own:
+            self.assertTrue(when(name).endswith(' and ck_first'), name)
+        registered = lambda chosen: {task['register'] for task in main if task['name'] in chosen and 'register' in task}
+        self.assertEqual((registered(takeover), registered(own)), ({'ck_saved'}, {'ck_first_holds'}))
+        self.assertEqual(when('Stop the agent and remove its first install'), 'ck_removes')
+        # The first start and the removal use the first install's own script and never the pointers of a running deployment.
+        for leaf in ('start-first.yml', 'remove.yml'):
+            text = (ROLE / 'tasks' / leaf).read_text()
+            self.assertNotIn('ck_pointers', text)
+            self.assertNotIn('kitchen-secrets', text)
+        self.assertNotIn('ck_first', (ROLE / 'tasks/start.yml').read_text() + (ROLE / 'tasks/rollback.yml').read_text())
+        # The runner is told that nothing is deployed with null, and with the live build's name otherwise.
+        self.assertIn("live_build: \"{{ none if (connectome_kitchen_first_install | bool) else connectome_kitchen_live_build }}\"", (ROLE / 'tasks/request.yml').read_text())
+        runner = yaml.safe_load((ROLE / 'tasks/runner.yml').read_text())
+        for task in runner:
+            if 'kitchen-secrets' in json.dumps(task) or task.get('register') == 'ck_compared':
+                self.assertEqual(task['when'], "ck_mode == 'verify' and not ck_first", task['name'])
+        # What changes the service manager for a first install: its one script, with a stop, a reload and no start.
+        script = (ROLE / 'files/kitchen-first.sh').read_text()
+        asked = sorted({line.split('sc ', 1)[1].split()[0] for line in script.splitlines() if not line.lstrip().startswith('#') and ('step sc ' in line or line.lstrip().startswith('sc ') or '; sc ' in line)})
+        self.assertEqual(asked, ['daemon-reload', 'reset-failed', 'stop'])
+        for verb in (' start ', 'restart', 'enable', 'disable', 'kill', 'mask'):
+            self.assertNotIn(verb, '\n'.join(line for line in script.splitlines() if 'sc ' in line and not line.lstrip().startswith('#')))
+        doc = (ROOT / 'docs/kitchen.md').read_text()
+        for text in ('## A first install', '| `remove` |', 'connectome_kitchen_first_install', 'connectome_kitchen_operator_word', 'connectome_kitchen_remove_state', 'FIRST-START', 'REMOVE'):
+            self.assertIn(text, doc)
 
     def test_engines_from_the_cook_command(self):
         plugin = load(ROLE / 'filter_plugins/connectome_kitchen.py', 'kitchen_filter')
@@ -448,6 +505,212 @@ elif a[0] == 'daemon-reload': d['build'] = (w / 'root/current').resolve().name
         (files / 'GITLAB_TOKEN_FILE').write_text('NEW-SECRET')
         refused = run('clear', 'GITLAB_TOKEN_FILE')
         self.assertEqual((refused.returncode, 'has no list of the secret files' in refused.stdout, listed()), (60, True, ['GITLAB_TOKEN_FILE', 'ZULIP_RC_PATH']), refused.stdout)
+
+    def nothing_deployed(self, active=False):
+        """An account where nothing is deployed, as files, with a service manager that is a file too. For kitchen-first.sh."""
+        w = self.work
+        home = w / 'home'
+        root, units, save, state, secrets = home / 'share/connectome/x', home / 'units', w / 'save', home / 'state/x', home / 'secrets/x.json'
+        for path in (home, state, secrets.parent):
+            path.mkdir(parents=True)
+        secrets.write_text('{"A_KEY": "VALUE"}')
+        (state / 'credentials').mkdir()
+        (w / 'manager.json').write_text(json.dumps({'active': active}))
+        (w / 'systemctl').write_text("""#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+w = Path(__file__).resolve().parent
+d = json.loads((w / 'manager.json').read_text()); a = [x for x in sys.argv[1:] if x != '--user']
+with (w / 'calls').open('a') as stream: stream.write(a[0] + '\\n')
+link = w / 'home/units/connectome-x.service'
+if a[0] == 'show':
+    print({'LoadState': 'loaded' if os.path.lexists(link) else 'not-found', 'ActiveState': 'active' if d['active'] else 'inactive', 'SubState': 'running' if d['active'] else 'dead', 'MainPID': '77' if d['active'] else '0',
+           'NRestarts': '0', 'FragmentPath': str(link) if os.path.lexists(link) else '', 'EnvironmentFiles': (os.readlink(w / 'home/share/connectome/x/current') + '/secrets.env (ignore_errors=no)') if d['active'] and os.path.islink(w / 'home/share/connectome/x/current') else ''}.get(a[a.index('-p') + 1], ''))
+elif a[0] == 'stop':
+    if d.get('stop_fails'): sys.exit(1)
+    d['active'] = False
+(w / 'manager.json').write_text(json.dumps(d))
+""".replace('\\\\n', '\\n'))
+        (w / 'systemctl').chmod(0o755)
+        me = __import__('pwd').getpwuid(os.geteuid()).pw_name
+        env = {'PATH': '/usr/bin:/bin', 'KITCHEN_NAME': 'x', 'KITCHEN_ACCOUNT': me, 'KITCHEN_UID': str(os.geteuid()), 'KITCHEN_OPERATOR_UID': str(os.geteuid()), 'KITCHEN_ACCOUNT_HOME': str(home),
+               'KITCHEN_RUNTIME_DIR': str(w), 'KITCHEN_ROOT': str(root), 'KITCHEN_UNIT_DIR': str(units), 'KITCHEN_SAVE': str(save), 'KITCHEN_SYSTEMCTL': str(w / 'systemctl'), 'KITCHEN_AS_ACCOUNT': '',
+               'KITCHEN_STATE_DIR': str(state)}
+        calls = lambda: [verb for verb in (w / 'calls').read_text().split() if verb not in ('show', 'reset-failed')] if (w / 'calls').exists() else []
+        run = lambda *words, **more: subprocess.run(['/bin/bash', str(ROLE / 'files/kitchen-first.sh'), *words], env={**env, **more}, capture_output=True, text=True)
+        unit = 'connectome-x.service'
+
+        def install(build=NEW):
+            """What the engine leaves after a first start: the build, its bookkeeping, the pointer, the two links, the drop-in."""
+            there = root / 'builds' / build
+            (there / 'managed-units').mkdir(parents=True)
+            for leaf in ('.prepared', 'run.sh', 'secrets.env', 'managed-units/' + unit):
+                (there / leaf).write_text('x')
+            (root / 'state/secret-files').mkdir(parents=True, exist_ok=True)
+            (root / 'state/ownership.json').write_text('{"entries": []}')
+            (root / 'state/secret-files/ZULIP_RC_PATH').write_text('COPY-OF-A-SECRET')
+            (units / 'default.target.wants').mkdir(parents=True, exist_ok=True)
+            (units / (unit + '.d')).mkdir(exist_ok=True)
+            (units / (unit + '.d') / '90-connectome-env.conf').write_text('EnvironmentFile=%s/secrets.env\n' % there)
+            (root / 'current').symlink_to(there)
+            for link in (units / unit, units / 'default.target.wants' / unit):
+                link.symlink_to(there / 'managed-units' / unit)
+            (w / 'manager.json').write_text(json.dumps({'active': True}))
+        four = lambda: [os.path.lexists(path) for path in (root / 'current', units / unit, units / 'default.target.wants' / unit, units / (unit + '.d'))]
+        return run, install, four, calls, (root, units, save, state, secrets)
+
+    def test_first_refuses_before_any_change(self):
+        script = ['/bin/bash', str(ROLE / 'files/kitchen-first.sh')]
+        done = subprocess.run(script + ['remove'], env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True)
+        self.assertEqual((done.returncode, 'REFUSED, nothing changed' in done.stdout), (60, True))
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        for words in ([], ['hold'], ['hold', 'not-a-build'], ['runs'], ['nothing', 'extra'], ['remove', 'everything'], ['remove', 'state', 'more'], ['back'], ['save'], ['mark', NEW, 'a b', 'c']):
+            self.assertEqual(run(*words).returncode, 60, words)
+        # Another operator; a root that is not the deployment's own directory in the home of the account; a path that climbs.
+        self.assertEqual(run('nothing', KITCHEN_OPERATOR_UID=str(os.geteuid() + 1)).returncode, 60)
+        home = str(self.work / 'home')
+        for more in ({'KITCHEN_ROOT': str(self.work / 'outside-home' / 'x')}, {'KITCHEN_ROOT': home + '/share/connectome/other'}, {'KITCHEN_ROOT': home + '/share/../x'}, {'KITCHEN_ROOT': home + '/x/'}, {'KITCHEN_ROOT': home},
+                     {'KITCHEN_UNIT_DIR': '/etc/systemd/user'}, {'KITCHEN_STATE_DIR': '/var/lib/x'}, {'KITCHEN_NAME': '../x'}):
+            done = run('remove', **more)
+            self.assertEqual((done.returncode, 'REFUSED, nothing changed' in done.stdout), (60, True), more)
+        self.assertEqual((calls(), save.exists(), secrets.read_text()), ([], False, '{"A_KEY": "VALUE"}'))
+
+    def test_a_first_install_is_held_only_where_nothing_is_deployed(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        self.assertEqual(run('nothing').returncode, 0)
+        # Without the marker nothing is marked, held or removed: it is not a deployment this role installed from nothing.
+        for words in (['mark', NEW, 'first-environment', 'inspection-ok'], ['held', NEW], ['remove']):
+            done = run(*words)
+            self.assertEqual((done.returncode, 'holds no marker of a first install' in done.stdout), (60, True), words)
+        done = run('hold', NEW)
+        self.assertEqual((done.returncode, (save / 'first-install').read_text(), save.stat().st_mode & 0o777), (0, 'first-install x\n', 0o700), done.stdout)
+        self.assertIn('state directory %s: 1 entries (credentials )' % state, done.stdout)  # names, for the operator to see what a fresh agent starts on
+        self.assertIn('already held', run('hold', NEW).stdout)
+        (root / 'builds' / NEW).mkdir(parents=True)  # its own build may be there (a prepare that ran before)
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        # Not a first install: another build; a pointer; a unit link, also one that names nothing; a drop-in; a unit that runs; a takeover's save.
+        (root / 'builds' / OLD).mkdir()
+        done = run('hold', NEW)
+        self.assertEqual((done.returncode, 'holds another build' in done.stdout), (60, True), done.stdout)
+        (root / 'builds' / OLD).rmdir()
+        units.mkdir()
+        for path, make in ((root / 'current', lambda p: p.symlink_to('/nowhere')), (units / 'connectome-x.service', lambda p: p.symlink_to('/nowhere')),
+                           (units / 'default.target.wants', lambda p: (p.mkdir(), (p / 'connectome-x.service').symlink_to('/nowhere'))), (units / 'connectome-x.service.d', lambda p: p.mkdir())):
+            make(path)
+            done = run('hold', NEW)
+            self.assertEqual((done.returncode, 'is installed already: this is not a first install' in done.stdout, run('nothing').returncode), (60, True, 1), path)
+            shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+        (self.work / 'manager.json').write_text(json.dumps({'active': True}))
+        done = run('hold', NEW)
+        self.assertEqual((done.returncode, 'is not down' in done.stdout, run('nothing').returncode), (60, True, 1))
+        (self.work / 'manager.json').write_text(json.dumps({'active': False}))
+        (save / 'links').write_text('x\n')
+        done = run('hold', NEW)
+        self.assertEqual((done.returncode, 'holds the save of a takeover' in done.stdout), (60, True))
+        (save / 'links').unlink()
+        # verify marks; the start is held to the mark, to ownership.json as it was then, and to nothing being installed.
+        self.assertEqual(run('held', NEW).returncode, 60)
+        (root / 'state').mkdir()
+        (root / 'state/ownership.json').write_text('{"entries": []}')
+        self.assertEqual(run('mark', NEW, 'first-environment', 'inspection-ok').returncode, 0)
+        done = run('held', NEW)
+        self.assertEqual((done.returncode, 'verified: %s first-environment inspection-ok; nothing is installed yet' % NEW in done.stdout), (0, True), done.stdout)
+        self.assertEqual(run('held', OLD).returncode, 60)
+        (root / 'state/ownership.json').write_text('{"entries": [1]}')
+        done = run('held', NEW)
+        self.assertEqual((done.returncode, 'ownership.json changed since verify' in done.stdout), (60, True))
+        self.assertEqual(calls(), [])
+
+    def test_remove_takes_a_first_install_away_and_nothing_else(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        install()
+        (state / 'what-the-agent-wrote').write_text('x')
+        (units / 'other.service').write_text('[Unit]\n')
+        done = run('runs', NEW)
+        self.assertEqual((done.returncode, done.stdout.splitlines()[-1]), (0, 'process 77 0'), done.stdout)
+        self.assertEqual((run('runs', OLD).returncode, run('nothing').returncode), (1, 1))
+        done = run('held', NEW)  # a start that was done is not done again
+        self.assertEqual(done.returncode, 60)
+        # Not removed: a deployment with a second build; a unit link that names a file outside the deployment; a unit that is a file.
+        (root / 'builds' / OLD).mkdir()
+        done = run('remove')
+        self.assertEqual((done.returncode, 'holds more than one build' in done.stdout, four(), calls()), (60, True, [True] * 4, []), done.stdout)
+        (root / 'builds' / OLD).rmdir()
+        link = units / 'connectome-x.service'
+        target = os.readlink(link)
+        for make in (lambda: link.symlink_to('/etc/systemd/user/connectome-x.service'), lambda: link.write_text('[Unit]\n')):
+            link.unlink(); make()
+            done = run('remove')
+            self.assertEqual((done.returncode, 'not a unit this install put there' in done.stdout, calls(), root.exists()), (60, True, [], True), done.stdout)
+        link.unlink(); link.symlink_to(target)
+        # A stop that does not bring the unit down ends it there: nothing was removed.
+        (self.work / 'manager.json').write_text(json.dumps({'active': True, 'stop_fails': True}))
+        done = run('remove')
+        self.assertEqual((done.returncode, 'after the stop the unit is not down' in done.stdout, four(), root.exists()), (62, True, [True] * 4, True), done.stdout)
+        (self.work / 'manager.json').write_text(json.dumps({'active': True}))
+        seen = len(calls())
+        done = run('remove')
+        self.assertEqual((done.returncode, four(), root.exists(), calls()[seen:]), (0, [False] * 4, False, ['stop', 'daemon-reload']), done.stdout)
+        self.assertIn('removed: the unit of x is down', done.stdout)
+        # Left: the secrets file, the state directory, another unit, the marker. No value is printed.
+        self.assertEqual((secrets.read_text(), (state / 'what-the-agent-wrote').is_file(), (units / 'other.service').is_file(), (save / 'first-install').is_file(), (save / 'verified').exists()),
+                         ('{"A_KEY": "VALUE"}', True, True, True, False))
+        self.assertNotIn('SECRET', done.stdout + done.stderr)
+        seen = len(calls())
+        done = run('remove')
+        self.assertEqual((done.returncode, 'nothing to remove' in done.stdout, calls()[seen:]), (0, True, []), done.stdout)
+        # With `state` the state directory goes too; a drop-in file this install did not put there stays, and is named.
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        install()
+        (units / 'connectome-x.service.d/10-operator.conf').write_text('[Service]\nNice=1\n')
+        done = run('remove', 'state')
+        self.assertEqual((done.returncode, state.exists(), root.exists(), (units / 'connectome-x.service.d/10-operator.conf').is_file(), secrets.read_text()), (0, False, False, True, '{"A_KEY": "VALUE"}'), done.stdout)
+        self.assertIn('holds files this install did not put there (10-operator.conf )', done.stdout)
+
+    def test_a_first_build_is_held_by_itself_and_readback_holds_nothing_to_a_process_before(self):
+        root, unit = self.work / 'root', 'connectome-x.service'
+        build, cooked = root / 'builds' / NEW, root / 'cook-config' / NEW / 'recipes'
+        for path in (build, cooked):
+            path.mkdir(parents=True)
+        recipe = json.dumps({'agent': {'systemPrompt': '', 'contextBudgetTokens': 240000, 'name': 'PRIVATE TEXT'}, 'mcpServers': {'zulip': {'command': '/n', 'args': ['/z.js']}, 'shell': {'url': 'ws://x'}}}).encode()
+        for leaf, data in (('.prepared', NEW.encode()), ('run.sh', b'x'), (unit, b'x'), ('cook-recipe.json', recipe), ('connectome.lock', json.dumps({'recipe': {'sha256': hashlib.sha256(recipe).hexdigest()}}).encode())):
+            (build / leaf).write_bytes(data)
+        (cooked / 'cook-recipe.json').write_bytes(recipe)
+        config = {'old': '', 'new': NEW, 'root': str(root), 'unit': unit, 'recipe_changes': [], 'recipe_absent': ['/agent/strategy'], 'recipe_present': ['/agent/contextBudgetTokens', '/agent/systemPrompt'],
+                  'lock_changes': [], 'servers_connected': ['zulip', 'telegram'], 'as_account': [], 'environment': ['PATH=/usr/bin:/bin'], 'systemctl': '/bin/false', 'journalctl': '/bin/false',
+                  'baseline_file': str(self.work / 'baseline.json'), 'baseline_since': '-6h', 'first_install': True}
+        (self.work / 'inspect.json').write_text(json.dumps(config))
+        run = lambda mode: subprocess.run([sys.executable, '-I', str(ROLE / 'files/kitchen-inspect.py'), mode, str(self.work / 'inspect.json')], capture_output=True, text=True)
+        done = run('alone')
+        for line in ('ok    the new build is prepared', 'ok    the build has its ' + unit, 'ok    the lock of the new build names its staged recipe by digest', 'ok    staged recipe: /agent/contextBudgetTokens is present (240000)',
+                     'ok    cooked recipe: /agent/systemPrompt is present (<str>)', 'ok    staged recipe: /agent/strategy is absent', '      2 MCP servers in the staged recipe: shell, zulip',
+                     'ok    MCP zulip, which readback will hold to a connected line, is a server of the recipe', 'LOOK  MCP telegram, which readback will hold to a connected line, is a server of the recipe'):
+            self.assertIn(line, done.stdout)
+        self.assertEqual((done.returncode, 'PRIVATE' in done.stdout, (self.work / 'baseline.json').exists()), (5, False, False), done.stdout)
+        # A recipe that is not the one the lock names, and a build that is not prepared, are LOOK lines.
+        (build / 'cook-recipe.json').write_bytes(recipe + b' ')
+        (build / '.prepared').unlink()
+        done = run('alone')
+        self.assertIn('LOOK  the new build is prepared', done.stdout)
+        self.assertIn('LOOK  the lock of the new build names its staged recipe by digest', done.stdout)
+        # readback of a first install: no baseline is asked for, and the planner's budget is said and held to nothing.
+        inspect = load(ROLE / 'files/kitchen-inspect.py', 'kitchen_inspect')
+        text = (ROLE / 'files/kitchen-inspect.py').read_text()
+        self.assertIn("first = bool(c.get('first_install'))", text)
+        journal = self.work / 'journalctl'
+        journal.write_text('#!/bin/sh\ncat <<"EOF"\nMCPL server "zulip" connected\n[plan-vs-actual] planned=2 actual=2 budgetMet=true exhausted=false floor=2 hardBudget=280800\nEOF\n')
+        journal.chmod(0o755)
+        (build / 'cook-recipe.json').write_bytes(recipe)
+        for first, expected, unexpected in ((True, ('first install: no process ran before this one', 'hardBudget of the planner: 280800 (first install: reported'), ('a baseline of the process before the start', 'no value from before the start')),
+                                            (False, ('LOOK  a baseline of the process before the start is there', 'LOOK  hardBudget=280800, and there is no value from before the start to hold it to'), ('first install',))):
+            (self.work / 'inspect.json').write_text(json.dumps({**config, 'journalctl': str(journal), 'first_install': first}))
+            done = run('readback')
+            for line in expected:
+                self.assertIn(line, done.stdout)
+            for line in unexpected:
+                self.assertNotIn(line, done.stdout)
+        del inspect
 
     def test_the_journal_is_read_and_never_printed(self):
         inspect = load(ROLE / 'files/kitchen-inspect.py', 'kitchen_inspect')

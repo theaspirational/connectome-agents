@@ -1,0 +1,22 @@
+---
+# The way out of a first install: stop the one unit and remove what the install put there (files/kitchen-first.sh says
+# exactly what). Only where `prepare` of a first install kept its marker, and only while the deployment has no more than
+# one build. The gates were passed in main.yml: an executor outside the unit, and the operator's own dated word. The
+# secrets file is never touched; the state directory only with connectome_kitchen_remove_state.
+
+- name: Stop the unit and remove the first install
+  ansible.builtin.command:
+    argv: "{{ ck_first_script + ['remove'] + (['state'] if (connectome_kitchen_remove_state | bool) else []) }}"
+  environment: "{{ ck_first_env }}"
+  changed_when: "'nothing to remove' not in ck_removed.stdout"
+  failed_when: false
+  register: ck_removed
+
+- name: Show the removal
+  ansible.builtin.debug:
+    msg: "{{ ck_removed.stdout_lines + ['remove: exit ' + (ck_removed.rc | string) + ' (' + {0: 'nothing of the deployment is installed, and its root is gone', 60: 'refused before any change', 62: 'a step failed part way: the removal is not complete; run it again when the cause is gone'}.get(ck_removed.rc, 'unexpected') + ')'] }}"
+
+- name: Stop unless it is removed
+  ansible.builtin.assert:
+    that: ck_removed.rc == 0
+    fail_msg: "remove of {{ ck_name }} exited {{ ck_removed.rc }}. Read its lines above: docs/kitchen.md, A first install."

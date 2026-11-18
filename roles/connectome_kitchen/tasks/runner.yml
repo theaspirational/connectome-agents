@@ -3,7 +3,8 @@
 # In: ck_mode (check, prepare, verify, start). Out: ck_result: rc, plan, same_environment, environment_file, secret_files,
 # unclosed (files/kitchen-step.py). After verify also: ck_secrets, the names in which the environment file of a start
 # would differ from the running build's (files/kitchen-secrets.mjs), and ck_environment: same-environment,
-# new-secret-files or ANOTHER-ENVIRONMENT, with ck_environment_words to say it.
+# new-secret-files or ANOTHER-ENVIRONMENT, with ck_environment_words to say it. For a first install there is no running
+# build: ck_environment is first-environment or NOT-A-FIRST-ENVIRONMENT, from the runner's answer alone.
 # The step helper prints the closed part of what the runner wrote. An engine failure that is not one of its refusals has
 # the text of an exception; that line is not shown and stays in the log of the account.
 
@@ -28,12 +29,12 @@
   failed_when: false
   no_log: true
   register: ck_compared
-  when: ck_mode == 'verify'
+  when: ck_mode == 'verify' and not ck_first
 
 - name: "Read the names: {{ ck_mode }}"
   ansible.builtin.set_fact:
     ck_secrets: "{{ (ck_compared.stdout | from_json) if (ck_compared.rc in [0, 3] and ck_compared.stdout[:1] == '{') else {'compared': false, 'reason': 'the comparison could not be run (exit ' + (ck_compared.rc | string) + ')'} }}"
-  when: ck_mode == 'verify'
+  when: ck_mode == 'verify' and not ck_first
 
 # same-environment: the runner says so and no name differs.
 # new-secret-files: nothing is changed and nothing removed; what is added is exactly the secret files named as new, each
@@ -43,7 +44,17 @@
   ansible.builtin.set_fact:
     ck_environment: "{{ 'ANOTHER-ENVIRONMENT' if not ck_secrets.compared else ('same-environment' if (ck_result.same_environment and ((ck_secrets.changed + ck_secrets.added + ck_secrets.removed) | length) == 0) else ('new-secret-files' if ((connectome_kitchen_secret_files_new | length) > 0 and ck_result.environment_file is false and (ck_secrets.changed | length) == 0 and (ck_secrets.removed | length) == 0 and (ck_secrets.added | sort) == (connectome_kitchen_secret_files_new | sort) and (connectome_kitchen_secret_files_new | reject('in', ck_secrets.secret_files) | list | length) == 0 and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='key') | sort) == (connectome_kitchen_secret_files_new | sort) and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='value') | reject('none') | list | length) == 0) else 'ANOTHER-ENVIRONMENT')) }}"
     ck_environment_words: "{{ ('names of the environment file: ' + (ck_secrets.same | length | string) + ' the same; changed: ' + (ck_secrets.changed | join(', ') | default('none', true)) + '; added: ' + (ck_secrets.added | join(', ') | default('none', true)) + '; removed: ' + (ck_secrets.removed | join(', ') | default('none', true)) + '. Secret files that are not what the start would write: ' + (ck_result.secret_files | dict2items | selectattr('value', 'false') | map(attribute='key') | sort | join(', ') | default('none', true)) + '; not there: ' + (ck_result.secret_files | dict2items | selectattr('value', 'none') | map(attribute='key') | sort | join(', ') | default('none', true))) if ck_secrets.compared else ('the environment file could not be held name by name: ' + ck_secrets.reason) }}"
-  when: ck_mode == 'verify'
+  when: ck_mode == 'verify' and not ck_first
+
+# A first install: no build runs, so there is no environment file to hold a start to. What the runner answers is then
+# all there is to say: it refuses a secrets file that lacks a declared name, and says of the environment file and of each
+# secret file whether it is what a start would write (yes), another (no), or not there (null). Before the first start
+# every one of them must be "not there"; after it, every one "yes".
+- name: "Say what a first start finds of the environment: {{ ck_mode }}"
+  ansible.builtin.set_fact:
+    ck_environment: "{{ 'first-environment' if (ck_result.rc == 0 and ck_result.environment_file is none and (ck_result.secret_files | dict2items | map(attribute='value') | reject('none') | list | length) == 0) else 'NOT-A-FIRST-ENVIRONMENT' }}"
+    ck_environment_words: "{{ 'environment file of a build that runs: ' + ({true: 'there, and what a start would write', false: 'there, and NOT what a start would write'}[ck_result.environment_file] | default('none')) + '. Secret files the start writes: ' + (ck_result.secret_files | sort | join(', ') | default('none', true)) + '; there already: ' + (ck_result.secret_files | dict2items | rejectattr('value', 'none') | map(attribute='key') | sort | join(', ') | default('none', true)) }}"
+  when: ck_mode == 'verify' and ck_first
 
 - name: "Show the answer of kitchen: {{ ck_mode }}"
   ansible.builtin.debug:
