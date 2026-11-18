@@ -521,7 +521,7 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     status, out = op('verify')
     ok('verify: exit 0', status == 0, out)
     for text in ('ok    the new build is prepared', 'ok    the build has its ' + unit, 'ok    the build has its run.sh', 'ok    the lock of the new build names its staged recipe by digest',
-                 'there is no environment file yet, and none of the secret files the start writes is there', 'the build has no LOOK line',
+                 'there is no environment file yet, and none of the secret files the start writes is there', 'nothing of it is installed by the first start yet', 'the build has no LOOK line',
                  'first install: there is no running build to compare with'):
         ok('verify: ' + text.strip(), text in out, [line for line in out.splitlines() if text[:24] in line])
     for leaf in args.changed_leaf:
@@ -572,6 +572,9 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     status, out = op('readback')
     ok('readback with a failed server and no turn yet: LOOK lines, and no text of the journal line', 'LOOK  MCP ' in out and 'LOOK  no [plan-vs-actual] line since the start yet' in out and 'must not be shown' not in out, out)
 
+    status, out = op('verify')
+    ok('verify on the running agent: exit 0, and it says the agent is installed and that what the first start wrote is what the secrets file gives',
+       status == 0 and 'the agent is installed on it: the first start has been done' in out and 'the environment file and the secret files the first start wrote are what the secrets file gives now' in out and show('MainPID') == pid1, out)
     seen = len(calls())
     status, out = op('start', connectome_kitchen_operator_word=word())
     ok('start a second time: refused, nothing restarted', status != 0 and 'the first start has been done already' in out and show('MainPID') == pid1 and calls()[seen:] == [], out)

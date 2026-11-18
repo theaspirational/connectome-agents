@@ -4,7 +4,8 @@
 # unclosed (files/kitchen-step.py). After verify also: ck_secrets, the names in which the environment file of a start
 # would differ from the running build's (files/kitchen-secrets.mjs), and ck_environment: same-environment,
 # new-secret-files or ANOTHER-ENVIRONMENT, with ck_environment_words to say it. For a first install there is no running
-# build: ck_environment is first-environment or NOT-A-FIRST-ENVIRONMENT, from the runner's answer alone.
+# build: ck_environment is first-environment, installed-environment (after the first start) or NOT-A-FIRST-ENVIRONMENT,
+# from the runner's answer alone.
 # The step helper prints the closed part of what the runner wrote. An engine failure that is not one of its refusals has
 # the text of an exception; that line is not shown and stays in the log of the account.
 
@@ -49,10 +50,10 @@
 # A first install: no build runs, so there is no environment file to hold a start to. What the runner answers is then
 # all there is to say: it refuses a secrets file that lacks a declared name, and says of the environment file and of each
 # secret file whether it is what a start would write (yes), another (no), or not there (null). Before the first start
-# every one of them must be "not there"; after it, every one "yes".
+# every one of them must be "not there" (first-environment); after it, every one "yes" (installed-environment).
 - name: "Say what a first start finds of the environment: {{ ck_mode }}"
   ansible.builtin.set_fact:
-    ck_environment: "{{ 'first-environment' if (ck_result.rc == 0 and ck_result.environment_file is none and (ck_result.secret_files | dict2items | map(attribute='value') | reject('none') | list | length) == 0) else 'NOT-A-FIRST-ENVIRONMENT' }}"
+    ck_environment: "{{ 'first-environment' if (ck_result.rc == 0 and ck_result.environment_file is none and (ck_result.secret_files | dict2items | map(attribute='value') | reject('none') | list | length) == 0) else ('installed-environment' if (ck_result.rc == 0 and ck_result.same_environment) else 'NOT-A-FIRST-ENVIRONMENT') }}"
     ck_environment_words: "{{ 'environment file of a build that runs: ' + ({true: 'there, and what a start would write', false: 'there, and NOT what a start would write'}[ck_result.environment_file] | default('none')) + '. Secret files the start writes: ' + (ck_result.secret_files | sort | join(', ') | default('none', true)) + '; there already: ' + (ck_result.secret_files | dict2items | rejectattr('value', 'none') | map(attribute='key') | sort | join(', ') | default('none', true)) }}"
   when: ck_mode == 'verify' and ck_first
 

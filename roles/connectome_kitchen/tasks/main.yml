@@ -319,8 +319,8 @@
 - name: Say where verify leaves a first install
   ansible.builtin.debug:
     msg:
-      - "verify: build {{ connectome_kitchen_build[:8] }} is prepared; nothing is installed and nothing runs"
-      - "{{ {'first-environment': 'the secrets file holds every declared name, there is no environment file yet, and none of the secret files the start writes is there', 'NOT-A-FIRST-ENVIRONMENT': 'NOT what a first install finds: an environment file or a secret file of this deployment is there already. The start refuses'}[ck_environment] }}"
+      - "verify: build {{ connectome_kitchen_build[:8] }} is prepared; {{ 'the agent is installed on it: the first start has been done' if ck_environment == 'installed-environment' else 'nothing of it is installed by the first start yet' }}"
+      - "{{ {'first-environment': 'the secrets file holds every declared name, there is no environment file yet, and none of the secret files the start writes is there', 'installed-environment': 'the environment file and the secret files the first start wrote are what the secrets file gives now', 'NOT-A-FIRST-ENVIRONMENT': 'NOT what a first install finds, and not what a first start leaves: an environment file or a secret file of this deployment is there and is not what the secrets file gives. A start refuses'}[ck_environment] }}"
       - "{{ ck_environment_words }}"
       - "{{ 'the build has no LOOK line' if (ck_inspect_rc | int) == 0 else 'the build has LOOK lines above: read them before the start' }}"
   when: connectome_kitchen_operation == 'verify' and ck_first
