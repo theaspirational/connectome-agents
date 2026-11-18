@@ -120,6 +120,9 @@ if verb == 'daemon-reload':
         loaded = load(name)
         if loaded:
             data['loaded'][name] = loaded
+        elif data['units'].get(name, {}).get('active') != 'active':
+            # Reload no longer advertises a stopped fragment whose file was unlinked.
+            data['loaded'].pop(name, None)
     save()
 elif verb in ('start', 'restart'):
     name = operands[0]

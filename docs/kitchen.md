@@ -192,7 +192,7 @@ secret file there too.
 ## A first install
 
 `-e connectome_kitchen_first_install=true`, with `connectome_kitchen_live_build` left empty, installs an agent from
-nothing: no deployment root, no unit, no build, nothing running. It needs a kitchen whose runner takes
+nothing: no deployment root contents, no unit, no build, nothing running. It needs a kitchen whose runner takes
 `expect.live_build: null` (the commit after `e62b4cf` that adds the first install). The account, its linger, its
 secrets file, the state directory and whatever the recipe's servers need are the operator's and are there before.
 The operations are `name`, `plan`, `prepare`, `verify`, `start`, `readback` and `remove`; `rollback` and `clear` are
@@ -202,29 +202,32 @@ another thing in its place:
 | Operation | A takeover | A first install |
 | --- | --- | --- |
 | the request | names the live build | `expect.live_build` is `null`: the runner holds that `builds` has no build but the new one, that `current` is not there, and that the account has no unit link, enable link or drop-in directory of this deployment |
-| `prepare`, first | saves the links, the drop-in and `ownership.json` | `files/kitchen-first.sh hold`: none of the four is there, the unit is down, no other build; keeps the marker `<save>/first-install` and saves nothing. Refuses a save directory that holds a takeover's save |
+| `prepare`, first | saves the links, the drop-in and `ownership.json` | `files/kitchen-first.sh hold`: requires a fresh empty root (or a matching first-install marker), no activation artifacts, and an unloaded unit. Binds `<save>/first-install` to the account, paths and expected build, and records directory identities. Refuses a takeover save or an overlapping layout |
 | `verify` | compares with the running build, keeps a baseline | `files/kitchen-inspect.py alone`: the build is prepared and has its launcher, unit, recipe and lock; the lock names the staged recipe; the recipe keys; each server of `connectome_kitchen_servers_connected` is one of the recipe. No comparison, no baseline |
-| the environment | name by name against the running build's file | from the runner alone: the secrets file holds every declared name, there is no environment file yet, and none of the secret files the start writes is there. (`verify` on the agent once it runs says instead that it is installed, and whether what the start wrote is what the secrets file gives now) |
+| the environment | name by name against the running build's file | from the runner alone: measures the pinned build’s environment even when `current` is absent, and checks the declared secret files. Missing, matching and different/unreadable are distinguished without printing contents. Start requires absence |
 | the gate of `start` | the agent's own IDLE | the operator's own word: `-e connectome_kitchen_operator_word="FIRST-START <name> <UTC time, YYYY-MM-DDTHH:MMZ>"`, as fresh as an IDLE must be; and the executor gate as before |
 | before the start | the agent runs the saved build | nothing is installed and the unit is down; `verify` ran for this build |
-| a start that fails | the engine puts the previous build back | the engine stops the unit and removes what it installed (the guard's `first-start` mode lets that one `stop` through). The play ends `NOT STARTED`: nothing is installed, the prepared build stays; `verify` and `start` again, or `remove` |
-| after the start | another process on the new build; the written environment against the previous one's | the unit runs the new build; the same process after `connectome_kitchen_watch_seconds`; then `verify`, which must find the environment file and the secret files the engine wrote to be what the secrets file gives |
-| a build that does not stay up | `rollback` | `remove` at once (the state directory stays), and the play ends `REMOVED`; with `connectome_kitchen_auto_rollback=false` nothing is removed and it ends `FAILED`, with the unit installed and enabled |
+| a start that fails | the engine puts the previous build back | the engine stops the unit and removes what it installed (the guard's `first-start` mode lets that one `stop` through). The play ends `NOT STARTED`: nothing is installed, the prepared build stays; `verify` reports any retained environment; if present, explicitly remove and prepare again before retrying |
+| after the start | another process on the new build; the written environment against the previous one's | the unit runs the new build; the same process after `connectome_kitchen_watch_seconds`; then `verify` and readback. Diagnostic LOOK lines may require an operator follow-up even on a successful start |
+| a failed watch or fatal post-activation check | `rollback` for a failed watch | guarded cleanup removes boot activation, always preserving state. Default: `REMOVED`; with `connectome_kitchen_auto_rollback=false`: `DEACTIVATED`, retaining the failed build for inspection |
 | `readback` | holds the process and the planner's budget to the baseline | says `first install: no process ran before this one`; the planner's `hardBudget` is reported and held to nothing |
 
 `remove` is the way out, at any time while the deployment still is what a first install leaves:
 
     -e connectome_kitchen_operation=remove -e connectome_kitchen_operator_word="REMOVE <name> <UTC time, YYYY-MM-DDTHH:MMZ>"
 
-It stops the one unit, removes the enable link and the unit link (only where they name a build of this deployment), the
-drop-in `90-connectome-env.conf` and its directory if that leaves it empty, reloads the service manager, and removes the
-deployment root with everything in it: the builds, cook's configuration and credentials, the engine's bookkeeping, its
-copies of the secret files, and the agent's workspace where that lies in the root (`<root>/workspace`). It never touches the secrets file, another unit or the account's `kitchen-takeover` log. The state
-directory stays unless `-e connectome_kitchen_remove_state=true`; left, it is what the process made of it and no longer
-the fresh state of before. It is refused without the marker (a deployment this role did not install from nothing),
-from inside the unit, without the dated word, and where `builds` holds more than one build: an agent that has had a
-window since its first install is not removed here. After it, `prepare`, `verify` and `start` install from nothing
-again; the build is cooked again. Exit 62 means a step failed part way: run it again when the cause is gone.
+It requires the original build pin and a matching operator-owned marker. It validates disjoint deployment, state,
+secrets, unit, and protected paths, then checks the expected build and engine-owned links and drop-in before any
+stop or unlink. It refuses redirected unit paths and leaves unrelated unit files in place. The dedicated root is
+removed with its build, engine records, secret copies and workspace. The source secrets file is never removed.
+The state directory stays unless explicitly opted in with `connectome_kitchen_remove_state=true`; automatic
+failed-start cleanup never honors that opt-in. A successful remove retires the marker; an already-absent target
+can be a no-op. Old markers that lack these bindings are not accepted.
+
+Exit 62 means cleanup was incomplete: inspect and correct the cause, then retry the same guarded operation with
+the original pins and a fresh word. Do not bypass the validator with raw deletion commands. A refusal means
+ownership could not be proved; escalate if the original layout cannot be verified. After a successful remove,
+`prepare`, `verify` and `start` install from nothing again.
 
 Once the agent runs, its next window is a takeover: `connectome_kitchen_first_install` off, the build of the first
 install as `connectome_kitchen_live_build`, and a save directory of its own (the first install's holds its marker and

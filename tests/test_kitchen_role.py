@@ -85,7 +85,7 @@ class Files(unittest.TestCase):
         first = main[0]['ansible.builtin.assert']['that']
         # No live build with it, a live build without it; no rollback and no clear with it; remove only with it.
         for line in ("connectome_kitchen_live_build is match('^[0-9a-f]{64}$') or (connectome_kitchen_first_install | bool)", "connectome_kitchen_live_build == '' or not (connectome_kitchen_first_install | bool)",
-                     "not (connectome_kitchen_first_install | bool) or connectome_kitchen_operation not in ['rollback', 'clear']", "connectome_kitchen_operation in ['name', 'plan', 'remove'] or connectome_kitchen_build != ''"):
+                     "not (connectome_kitchen_first_install | bool) or connectome_kitchen_operation not in ['rollback', 'clear']", "connectome_kitchen_operation in ['name', 'plan'] or connectome_kitchen_build != ''"):
             self.assertIn(line, first)
         defaults = yaml.safe_load((ROLE / 'defaults/main.yml').read_text())
         self.assertEqual((defaults['connectome_kitchen_first_install'], defaults['connectome_kitchen_operator_word'], defaults['connectome_kitchen_remove_state']), (False, '', False))
@@ -164,6 +164,24 @@ class Scripts(unittest.TestCase):
         # Another operator than the one named: refused, whatever the mode.
         done = subprocess.run(script + ['back'], env={**env, 'KITCHEN_OPERATOR_UID': str(os.geteuid() + 1)}, capture_output=True, text=True)
         self.assertEqual((done.returncode, 'run it as the operator' in done.stdout), (60, True))
+
+    def test_first_install_inspection_requires_a_recipe_digest(self):
+        root = self.work / 'deployment'
+        build = root / 'builds' / NEW
+        build.mkdir(parents=True)
+        unit = 'connectome-test.service'
+        for leaf, text in (('.prepared', NEW), ('run.sh', ''), (unit, ''), ('cook-recipe.json', '{}')):
+            (build / leaf).write_text(text)
+        config = self.work / 'config.json'
+        config.write_text(json.dumps(dict(root=str(root), new=NEW, unit=unit, old='', first_install=True,
+                                              recipe_changes=[], recipe_absent=[], recipe_present=[], as_account=[], environment=[],
+                                              systemctl='/bin/false', journalctl='/bin/false', baseline_file='', baseline_since='')))
+        for lock in ('{}', 'not-json'):
+            (build / 'connectome.lock').write_text(lock)
+            done = subprocess.run([sys.executable, '-I', str(ROLE / 'files/kitchen-inspect.py'), 'alone', str(config)],
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 5, done.stdout + done.stderr)
+            self.assertIn('LOOK  the lock of the new build names its staged recipe by digest', done.stdout)
 
     def test_step_shows_the_closed_part_only(self):
         runner = self.work / 'runner'
@@ -529,13 +547,15 @@ if a[0] == 'show':
 elif a[0] == 'stop':
     if d.get('stop_fails'): sys.exit(1)
     d['active'] = False
+elif a[0] == 'daemon-reload' and d.get('reload_fails'):
+    sys.exit(1)
 (w / 'manager.json').write_text(json.dumps(d))
 """.replace('\\\\n', '\\n'))
         (w / 'systemctl').chmod(0o755)
         me = __import__('pwd').getpwuid(os.geteuid()).pw_name
         env = {'PATH': '/usr/bin:/bin', 'KITCHEN_NAME': 'x', 'KITCHEN_ACCOUNT': me, 'KITCHEN_UID': str(os.geteuid()), 'KITCHEN_OPERATOR_UID': str(os.geteuid()), 'KITCHEN_ACCOUNT_HOME': str(home),
-               'KITCHEN_RUNTIME_DIR': str(w), 'KITCHEN_ROOT': str(root), 'KITCHEN_UNIT_DIR': str(units), 'KITCHEN_SAVE': str(save), 'KITCHEN_SYSTEMCTL': str(w / 'systemctl'), 'KITCHEN_AS_ACCOUNT': '',
-               'KITCHEN_STATE_DIR': str(state)}
+               'KITCHEN_RUNTIME_DIR': str(w / 'runtime'), 'KITCHEN_ROOT': str(root), 'KITCHEN_UNIT_DIR': str(units), 'KITCHEN_SAVE': str(save), 'KITCHEN_SYSTEMCTL': str(w / 'systemctl'), 'KITCHEN_AS_ACCOUNT': '',
+               'KITCHEN_STATE_DIR': str(state), 'KITCHEN_SECRETS_FILE': str(secrets), 'KITCHEN_PROTECTED_PATHS': '[]'}
         calls = lambda: [verb for verb in (w / 'calls').read_text().split() if verb not in ('show', 'reset-failed')] if (w / 'calls').exists() else []
         run = lambda *words, **more: subprocess.run(['/bin/bash', str(ROLE / 'files/kitchen-first.sh'), *words], env={**env, **more}, capture_output=True, text=True)
         unit = 'connectome-x.service'
@@ -547,14 +567,21 @@ elif a[0] == 'stop':
             for leaf in ('.prepared', 'run.sh', 'secrets.env', 'managed-units/' + unit):
                 (there / leaf).write_text('x')
             (root / 'state/secret-files').mkdir(parents=True, exist_ok=True)
-            (root / 'state/ownership.json').write_text('{"entries": []}')
             (root / 'state/secret-files/ZULIP_RC_PATH').write_text('COPY-OF-A-SECRET')
             (units / 'default.target.wants').mkdir(parents=True, exist_ok=True)
             (units / (unit + '.d')).mkdir(exist_ok=True)
-            (units / (unit + '.d') / '90-connectome-env.conf').write_text('EnvironmentFile=%s/secrets.env\n' % there)
+            dropin = units / (unit + '.d') / '90-connectome-env.conf'
+            dropin.write_text('[Service]\nEnvironment=DATA_DIR=%s\nEnvironmentFile=%s/secrets.env\n' % (state, there))
             (root / 'current').symlink_to(there)
             for link in (units / unit, units / 'default.target.wants' / unit):
                 link.symlink_to(there / 'managed-units' / unit)
+            source = there / 'managed-units' / unit
+            entries = [dict(path=str(there), kind='directory')]
+            for path in (root / 'current', units / unit, units / 'default.target.wants' / unit):
+                entries.append(dict(path=str(path), kind='link', target=os.readlink(path)))
+            for path in (dropin, source):
+                entries.append(dict(path=str(path), kind='file', sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+            (root / 'state/ownership.json').write_text(json.dumps(dict(version=1, entries=entries)))
             (w / 'manager.json').write_text(json.dumps({'active': True}))
         four = lambda: [os.path.lexists(path) for path in (root / 'current', units / unit, units / 'default.target.wants' / unit, units / (unit + '.d'))]
         return run, install, four, calls, (root, units, save, state, secrets)
@@ -571,7 +598,7 @@ elif a[0] == 'stop':
         home = str(self.work / 'home')
         for more in ({'KITCHEN_ROOT': str(self.work / 'outside-home' / 'x')}, {'KITCHEN_ROOT': home + '/share/connectome/other'}, {'KITCHEN_ROOT': home + '/share/../x'}, {'KITCHEN_ROOT': home + '/x/'}, {'KITCHEN_ROOT': home},
                      {'KITCHEN_UNIT_DIR': '/etc/systemd/user'}, {'KITCHEN_STATE_DIR': '/var/lib/x'}, {'KITCHEN_NAME': '../x'}):
-            done = run('remove', **more)
+            done = run('remove', NEW, **more)
             self.assertEqual((done.returncode, 'REFUSED, nothing changed' in done.stdout), (60, True), more)
         self.assertEqual((calls(), save.exists(), secrets.read_text()), ([], False, '{"A_KEY": "VALUE"}'))
 
@@ -579,19 +606,18 @@ elif a[0] == 'stop':
         run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
         self.assertEqual(run('nothing').returncode, 0)
         # Without the marker nothing is marked, held or removed: it is not a deployment this role installed from nothing.
-        for words in (['mark', NEW, 'first-environment', 'inspection-ok'], ['held', NEW], ['remove']):
+        for words in (['mark', NEW, 'first-environment', 'inspection-ok'], ['held', NEW]):
             done = run(*words)
             self.assertEqual((done.returncode, 'holds no marker of a first install' in done.stdout), (60, True), words)
         done = run('hold', NEW)
-        self.assertEqual((done.returncode, (save / 'first-install').read_text(), save.stat().st_mode & 0o777), (0, 'first-install x\n', 0o700), done.stdout)
+        self.assertEqual((done.returncode, json.loads((save / 'first-install').read_text())['build'], save.stat().st_mode & 0o777), (0, NEW, 0o700), done.stdout)
         self.assertIn('state directory %s: 1 entries (credentials )' % state, done.stdout)  # names, for the operator to see what a fresh agent starts on
         self.assertIn('already held', run('hold', NEW).stdout)
-        (root / 'builds' / NEW).mkdir(parents=True)  # its own build may be there (a prepare that ran before)
-        self.assertEqual(run('hold', NEW).returncode, 0)
+        (root / 'builds').mkdir()
         # Not a first install: another build; a pointer; a unit link, also one that names nothing; a drop-in; a unit that runs; a takeover's save.
         (root / 'builds' / OLD).mkdir()
         done = run('hold', NEW)
-        self.assertEqual((done.returncode, 'holds another build' in done.stdout), (60, True), done.stdout)
+        self.assertEqual((done.returncode, 'different build' in done.stdout), (60, True), done.stdout)
         (root / 'builds' / OLD).rmdir()
         units.mkdir()
         for path, make in ((root / 'current', lambda p: p.symlink_to('/nowhere')), (units / 'connectome-x.service', lambda p: p.symlink_to('/nowhere')),
@@ -611,12 +637,12 @@ elif a[0] == 'stop':
         # verify marks; the start is held to the mark, to ownership.json as it was then, and to nothing being installed.
         self.assertEqual(run('held', NEW).returncode, 60)
         (root / 'state').mkdir()
-        (root / 'state/ownership.json').write_text('{"entries": []}')
+        (root / 'state/ownership.json').write_text('{"version": 1, "entries": []}')
         self.assertEqual(run('mark', NEW, 'first-environment', 'inspection-ok').returncode, 0)
         done = run('held', NEW)
         self.assertEqual((done.returncode, 'verified: %s first-environment inspection-ok; nothing is installed yet' % NEW in done.stdout), (0, True), done.stdout)
         self.assertEqual(run('held', OLD).returncode, 60)
-        (root / 'state/ownership.json').write_text('{"entries": [1]}')
+        (root / 'state/ownership.json').write_text('{"version": 1, "entries": []}\n')
         done = run('held', NEW)
         self.assertEqual((done.returncode, 'ownership.json changed since verify' in done.stdout), (60, True))
         self.assertEqual(calls(), [])
@@ -634,39 +660,66 @@ elif a[0] == 'stop':
         self.assertEqual(done.returncode, 60)
         # Not removed: a deployment with a second build; a unit link that names a file outside the deployment; a unit that is a file.
         (root / 'builds' / OLD).mkdir()
-        done = run('remove')
-        self.assertEqual((done.returncode, 'holds more than one build' in done.stdout, four(), calls()), (60, True, [True] * 4, []), done.stdout)
+        done = run('remove', NEW)
+        self.assertEqual((done.returncode, 'different build' in done.stdout, four(), calls()), (60, True, [True] * 4, []), done.stdout)
         (root / 'builds' / OLD).rmdir()
         link = units / 'connectome-x.service'
         target = os.readlink(link)
         for make in (lambda: link.symlink_to('/etc/systemd/user/connectome-x.service'), lambda: link.write_text('[Unit]\n')):
             link.unlink(); make()
-            done = run('remove')
-            self.assertEqual((done.returncode, 'not a unit this install put there' in done.stdout, calls(), root.exists()), (60, True, [], True), done.stdout)
+            done = run('remove', NEW)
+            self.assertEqual((done.returncode, 'unowned or redirected link' in done.stdout, calls(), root.exists()), (60, True, [], True), done.stdout)
         link.unlink(); link.symlink_to(target)
-        # A stop that does not bring the unit down ends it there: nothing was removed.
+        # A failed stop still removes owned boot enablement; other artifacts remain for retry.
         (self.work / 'manager.json').write_text(json.dumps({'active': True, 'stop_fails': True}))
-        done = run('remove')
-        self.assertEqual((done.returncode, 'after the stop the unit is not down' in done.stdout, four(), root.exists()), (62, True, [True] * 4, True), done.stdout)
+        done = run('remove', NEW)
+        self.assertEqual((done.returncode, 'does not report the unit down' in done.stdout, four(), root.exists()), (62, True, [True, True, False, True], True), done.stdout)
         (self.work / 'manager.json').write_text(json.dumps({'active': True}))
         seen = len(calls())
-        done = run('remove')
+        done = run('remove', NEW)
         self.assertEqual((done.returncode, four(), root.exists(), calls()[seen:]), (0, [False] * 4, False, ['stop', 'daemon-reload']), done.stdout)
-        self.assertIn('removed: the unit of x is down', done.stdout)
-        # Left: the secrets file, the state directory, another unit, the marker. No value is printed.
+        self.assertIn('removed: the unit is down', done.stdout)
+        # Left: the secrets file, the state directory, another unit. The marker is retired. No value is printed.
         self.assertEqual((secrets.read_text(), (state / 'what-the-agent-wrote').is_file(), (units / 'other.service').is_file(), (save / 'first-install').is_file(), (save / 'verified').exists()),
-                         ('{"A_KEY": "VALUE"}', True, True, True, False))
+                         ('{"A_KEY": "VALUE"}', True, True, False, False))
         self.assertNotIn('SECRET', done.stdout + done.stderr)
         seen = len(calls())
-        done = run('remove')
+        done = run('remove', NEW)
         self.assertEqual((done.returncode, 'nothing to remove' in done.stdout, calls()[seen:]), (0, True, []), done.stdout)
         # With `state` the state directory goes too; a drop-in file this install did not put there stays, and is named.
         self.assertEqual(run('hold', NEW).returncode, 0)
         install()
         (units / 'connectome-x.service.d/10-operator.conf').write_text('[Service]\nNice=1\n')
-        done = run('remove', 'state')
+        done = run('remove', NEW, 'state')
         self.assertEqual((done.returncode, state.exists(), root.exists(), (units / 'connectome-x.service.d/10-operator.conf').is_file(), secrets.read_text()), (0, False, False, True, '{"A_KEY": "VALUE"}'), done.stdout)
-        self.assertIn('holds files this install did not put there (10-operator.conf )', done.stdout)
+
+
+    def test_remove_retries_after_unlink_without_readopting_or_bypassing_marker(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        install()
+        # A legacy marker grants no authority, even for exactly the old layout.
+        marker = save / 'first-install'
+        record = marker.read_bytes()
+        marker.write_text('first-install x\n')
+        self.assertEqual((run('remove', NEW).returncode, calls(), four()), (60, [], [True] * 4))
+        marker.write_bytes(record)
+        self.assertEqual(run('claim', NEW).returncode, 0)
+        # The same directory name with a different inode isn't the claimed build.
+        build = root / 'builds' / NEW
+        original = self.work / 'original-build'
+        build.rename(original)
+        build.mkdir()
+        self.assertEqual((run('remove', NEW).returncode, calls(), four()), (60, [], [True] * 4))
+        build.rmdir()
+        original.rename(build)
+        manager = self.work / 'manager.json'
+        manager.write_text(json.dumps({'active': True, 'reload_fails': True}))
+        done = run('remove', NEW)
+        self.assertEqual((done.returncode, four(), root.exists(), marker.exists()), (62, [True, False, False, False], True, True), done.stdout)
+        manager.write_text(json.dumps({'active': False}))
+        done = run('remove', NEW)
+        self.assertEqual((done.returncode, root.exists(), marker.exists(), secrets.is_file(), state.is_dir()), (0, False, False, True, True), done.stdout)
 
     def test_a_first_build_is_held_by_itself_and_readback_holds_nothing_to_a_process_before(self):
         root, unit = self.work / 'root', 'connectome-x.service'

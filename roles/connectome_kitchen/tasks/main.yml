@@ -22,7 +22,7 @@
       - connectome_kitchen_live_build == '' or not (connectome_kitchen_first_install | bool)
       - connectome_kitchen_build == '' or connectome_kitchen_build is match('^[0-9a-f]{64}$')
       - connectome_kitchen_build == '' or connectome_kitchen_build != connectome_kitchen_live_build
-      - connectome_kitchen_operation in ['name', 'plan', 'remove'] or connectome_kitchen_build != ''
+      - connectome_kitchen_operation in ['name', 'plan'] or connectome_kitchen_build != ''
       - connectome_agent.name is defined and connectome_agent.name is match('^[a-z0-9][a-z0-9-]{0,62}$')
       - connectome_agent.activation | default('start') == 'start'
       - connectome_kitchen_save_dir is match('^/[A-Za-z0-9_./@+-]+$')
@@ -61,7 +61,17 @@
     ck_first: "{{ connectome_kitchen_first_install | bool }}"
     ck_removes: "{{ connectome_kitchen_operation == 'remove' }}"
     ck_first_script: ["/bin/bash", "{{ role_path }}/files/kitchen-first.sh"]
-    ck_first_env: "{{ ck_pointers_env | combine({'KITCHEN_STATE_DIR': connectome_agent.state_dir | default('')}) }}"
+    ck_first_env: "{{ ck_pointers_env | combine({'KITCHEN_STATE_DIR': connectome_agent.state_dir | default(''), 'KITCHEN_SECRETS_FILE': connectome_agent.secrets_file | default(''), 'KITCHEN_PROTECTED_PATHS': ck_first_protected | to_json}) }}"
+  vars:
+    ck_first_engines: "{{ connectome_kitchen_engines if connectome_kitchen_engines else ((connectome_cook_command | connectome_kitchen_engines) if connectome_cook_command else {}) }}"
+    ck_first_protected: "{{ [role_path, connectome_kitchen_home, connectome_kitchen_sums_file, connectome_kitchen_node, connectome_kitchen_systemctl, connectome_kitchen_python, connectome_kitchen_journalctl, connectome_versions_file, connectome_kitchen_defaults_file, connectome_kitchen_catalog_dir, (connectome_agent.recipe_file | default({})).path | default('')] + (connectome_agent.cook.host_dependencies | default([]) | map(attribute='archive') | list) + (ck_first_engines.cook | default({}) | dict2items | map(attribute='value') | list) }}"
+  when: connectome_kitchen_first_install | bool
+
+- name: Select the takeover path for this invocation
+  ansible.builtin.set_fact:
+    ck_first: false
+    ck_removes: false
+  when: not (connectome_kitchen_first_install | bool)
 
 # Who runs this, and with which kitchen.
 
@@ -148,6 +158,13 @@
       - connectome_root == connectome_base + '/' + ck_name
     fail_msg: "connectome_kitchen serves a deployment with a pinned recipe file (no catalog), a state directory and a secrets file named in the agent layer, under the base directory by its name. Catalog and spawn deployments stay with the Python role. Nothing was changed."
   when: ck_engine
+
+- name: Check first-install paths before staging any inputs
+  ansible.builtin.command:
+    argv: "{{ ck_first_script + ['scope'] }}"
+  environment: "{{ ck_first_env }}"
+  changed_when: false
+  when: ck_first and ck_engine
 
 - name: Make the directory of the account for the log, the receipts and the inputs of kitchen
   ansible.builtin.file:
@@ -271,6 +288,13 @@
   vars:
     ck_mode: "{{ {'plan': 'check', 'prepare': 'prepare', 'verify': 'verify'}[connectome_kitchen_operation] }}"
   when: connectome_kitchen_operation in ['prepare', 'verify'] or (connectome_kitchen_operation == 'plan' and connectome_kitchen_build != '')
+
+- name: Record the prepared build and state directory identities
+  ansible.builtin.command:
+    argv: "{{ ck_first_script + ['claim', connectome_kitchen_build] }}"
+  environment: "{{ ck_first_env }}"
+  changed_when: false
+  when: ck_first and connectome_kitchen_operation == 'prepare'
 
 # A prepare the engine refused or that failed may leave an unfinished directory under the build's name. The plan then
 # still says there is a build to make: there is nothing to hold against the running build, and nothing to mark.

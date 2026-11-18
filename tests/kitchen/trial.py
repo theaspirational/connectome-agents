@@ -167,10 +167,12 @@ def main():
     world.raw_layers['agent'], world.layers[3] = agent, agent
     import connectome_config
     world.effective = connectome_config.merge_layers(copy.deepcopy(world.layers))
+    runtime = sandbox / 'runtime'
+    runtime.mkdir()
     variables = {
         'connectome_kitchen_home': str(install), 'connectome_kitchen_commit': commit, 'connectome_kitchen_node': str(stub),
         'connectome_kitchen_account': me, 'connectome_kitchen_account_home': str(home), 'connectome_kitchen_account_uid': uid, 'connectome_kitchen_operator_uid': uid,
-        'connectome_kitchen_runtime_dir': str(sandbox), 'connectome_kitchen_systemctl': str(fake), 'connectome_kitchen_as_account': [], 'connectome_kitchen_journalctl': str(stub_journal),
+        'connectome_kitchen_runtime_dir': str(runtime), 'connectome_kitchen_systemctl': str(fake), 'connectome_kitchen_as_account': [], 'connectome_kitchen_journalctl': str(stub_journal),
         'connectome_base': world.base, 'connectome_root': world.root, 'connectome_unit_dir': world.unit_dir,
         'connectome_private': raw['private'], 'connectome_group': raw['group'], 'connectome_agent': agent,
         'connectome_versions_file': str(inputs / 'versions.yml'), 'connectome_cook_command': world.role_command,
@@ -507,13 +509,34 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     status, out = op('start', connectome_kitchen_operator_word=word())
     ok('start before prepare: refused, nothing started', status != 0 and 'holds no marker of a first install' in out and nothing() and calls() == [], out)
     status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
-    ok('remove before prepare: refused (no marker: not a deployment this role installed from nothing)', status != 0 and 'holds no marker of a first install' in out and calls() == [], out)
+    ok('remove before prepare: safe no-op on absent target, no stop', status == 0 and 'nothing to remove' in out and calls() == [], out)
+
+    # Review finding 1: a supported private secrets input must not be claimed by a recursive scope.
+    protected = root / 'private-input' / 'synthetic.json'
+    protected.parent.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    shutil.copyfile(secrets_file, protected)
+    protected.chmod(0o600)
+    status, out = op('prepare', connectome_agent={**variables['connectome_agent'], 'secrets_file': str(protected)})
+    ok('prepare refuses secrets under root before marker/build creation', status != 0 and 'overlapping first-install scopes' in out
+       and protected.is_file() and not (save / 'first-install').exists() and not build.exists(), out)
+    protected.unlink()
+    protected.parent.rmdir()
+    unrelated = root / 'unrelated'
+    unrelated.touch()
+    status, out = op('prepare')
+    ok('prepare refuses a pre-existing nonempty root even when there are no builds', status != 0 and 'nonempty deployment root' in out
+       and unrelated.is_file() and not (save / 'first-install').exists(), out)
+    unrelated.unlink()
+    # The fixture's oracle also journals its read-only manager queries under the root when it exists.
+    (root / 'systemctl-calls').unlink(missing_ok=True)
+    root.rmdir()
 
     status, out = op('prepare')
     ok('prepare: exit 0, the build is prepared', status == 0 and (build / '.prepared').is_file() and (build / '.prepared').read_text() == new, out)
     ok('prepare: nothing is installed and nothing was asked of the service manager but questions', nothing() and calls() == [], (four(), calls()))
     ok('prepare: the runner saw nothing touched, with a complete measurement', '"untouched_by_this_run":true' in out.replace('\\"', '"') and '"measurement_complete":true' in out.replace('\\"', '"'), out)
-    ok('prepare: the marker of a first install is kept, by the operator, 0700; no save of a takeover', (save / 'first-install').read_text() == 'first-install %s\n' % name and (save.stat().st_mode & 0o777) == 0o700 and not (save / 'links').exists())
+    ok('prepare: the marker of a first install is kept, by the operator, 0700; no save of a takeover', json.loads((save / 'first-install').read_text())['build'] == new and (save.stat().st_mode & 0o777) == 0o700 and not (save / 'links').exists())
     cooked(new)
     status, out = op('prepare')
     ok('prepare again: exit 0, already held, nothing built twice', status == 0 and 'already held' in out and nothing(), out)
@@ -545,7 +568,18 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
        calls() == ['daemon-reload', 'restart', 'stop', 'daemon-reload'] and nothing() and not (root / 'state/secret-files').exists() and (build / '.prepared').is_file() and 'removing the first install' not in out, (calls(), four()))
     (sandbox / 'knobs' / ('fail-start-' + new[:8])).unlink()
     status, out = op('verify')
-    ok('verify after it: exit 0, the build is still prepared and nothing of an environment is there', status == 0 and 'there is no environment file yet' in out, out)
+    ok('verify reads the retained environment of the prepared build even without current', status == 0 and
+       'environment file of the prepared build: there, and what a start would write' in out and 'A start refuses' in out
+       and (build / 'secrets.env').is_file(), out)
+    status, out = op('start', connectome_kitchen_operator_word=word())
+    ok('role refuses to retry through retained environment', status != 0 and 'Not started: the plan' in out and nothing(), out)
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+    ok('remove fully cleans the failed activation for retry', status == 0 and not root.exists() and nothing(), out)
+    status, out = op('prepare')
+    ok('prepare again after explicit removal', status == 0, out)
+    cooked(new)
+    status, out = op('verify')
+    ok('verify again after explicit removal and prepare', status == 0, out)
 
     def started(label, seen):
         journal.write_text(lines())
@@ -590,20 +624,55 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     ok('remove with the word of a first start: refused, nothing stopped', status != 0 and show('MainPID') == pid1 and calls()[seen:] == [], out)
     (root / 'builds' / ('0' * 64)).mkdir()
     status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
-    ok('remove where a second build is there (an agent that has had a window since): refused, nothing stopped', status != 0 and 'holds more than one build' in out and show('MainPID') == pid1 and calls()[seen:] == [], out)
+    ok('remove where a second build is there (an agent that has had a window since): refused, nothing stopped', status != 0 and 'different build' in out and show('MainPID') == pid1 and calls()[seen:] == [], out)
     (root / 'builds' / ('0' * 64)).rmdir()
+    for overlap in (state / 'protected.json', root / 'protected.json'):
+        shutil.copyfile(secrets_file, overlap)
+        overlap.chmod(0o600)
+        status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'), connectome_kitchen_remove_state=True,
+                         connectome_agent={**variables['connectome_agent'], 'secrets_file': str(overlap)})
+        ok('remove rejects secrets overlapping ' + overlap.parent.name + ' before any stop or deletion', status != 0
+           and 'overlapping first-install scopes' in out and overlap.is_file() and four() == [True] * 4 and calls()[seen:] == [], out)
+        overlap.unlink()
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'), connectome_kitchen_build='0' * 64)
+    ok('remove verifies the pinned build against the marker', status != 0 and 'marker does not match' in out and four() == [True] * 4 and calls()[seen:] == [], out)
+
+    for leaf in (unit + '.d', 'default.target.wants', unit):
+        victim = unit_dir / leaf
+        original = unit_dir / (leaf + '.original')
+        victim.rename(original)
+        foreign = unit_dir / 'unrelated.service.d'
+        foreign.mkdir()
+        untouched = foreign / '90-connectome-env.conf'
+        untouched.write_text('unrelated\n')
+        victim.symlink_to(foreign)
+        status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+        ok('remove refuses redirected ' + leaf + ' before stop or unlink', status != 0 and 'redirected' in out and
+           calls()[seen:] == [] and victim.is_symlink() and untouched.is_file(), out)
+        victim.unlink()
+        original.rename(victim)
+        untouched.unlink()
+        foreign.rmdir()
+
     kept = sorted(str(path.relative_to(home / 'kitchen-takeover')) for path in (home / 'kitchen-takeover').rglob('*'))
     status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
     ok('remove: exit 0', status == 0 and 'remove: exit 0' in out, out)
     ok('remove: one stop and one daemon-reload; the unit is down; the links, the drop-in and the deployment root are gone', calls()[seen:] == ['stop', 'daemon-reload'] and nothing() and not root.exists(), (calls()[seen:], four(), root.exists()))
-    ok('remove: the secrets file is byte for byte there, the state directory is as the process left it, the log of the account and the marker stay',
-       hashlib.sha256(secrets_file.read_bytes()).hexdigest() == secrets_digest and (state / 'trial-state-of-the-agent').is_file() and (save / 'first-install').is_file() and not (save / 'verified').exists()
+    ok('remove: the secrets file is byte for byte there, the state directory is as the process left it, the log stays and the marker is retired',
+       hashlib.sha256(secrets_file.read_bytes()).hexdigest() == secrets_digest and (state / 'trial-state-of-the-agent').is_file() and not (save / 'first-install').exists() and not (save / 'verified').exists()
        and set(kept) <= {str(path.relative_to(home / 'kitchen-takeover')) for path in (home / 'kitchen-takeover').rglob('*')})
     seen = len(calls())
     status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
     ok('remove again: exit 0, nothing to remove, nothing stopped', status == 0 and 'nothing to remove' in out and calls()[seen:] == [], out)
+    other = root / 'builds' / ('0' * 64)
+    other.mkdir(parents=True)
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+    ok('a later unrelated single build cannot be removed under retired authority', status != 0 and 'holds no marker' in out
+       and other.is_dir() and calls()[seen:] == [], out)
+    shutil.rmtree(root)
+
     status, out = op('start', connectome_kitchen_operator_word=word())
-    ok('start after a removal: refused (verify has to run again)', status != 0 and 'verify has not run for this build' in out and nothing() and calls()[seen:] == [], out)
+    ok('start after a removal: refused (prepare and verify have to run again)', status != 0 and 'holds no marker' in out and nothing() and calls()[seen:] == [], out)
 
     def again():
         status, out = op('prepare')
@@ -612,16 +681,32 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
         status, out = op('verify')
         return held and status == 0, out
 
-    # A build that does not stay up, where nothing is to be removed without a word, and where it is removed at once.
+    # Only the final verify fails, after the process passed the stable watch.
+    held, out = again()
+    ok('prepare and verify before the post-activation failure test', held, out)
+    stub = sandbox / 'node-stub'
+    original = stub.read_text()
+    stub.write_text(original.replace('script=$1; shift', 'script=$1; shift\ncase "$script:$1" in */takeover.mjs:verify) if [ -L "' +
+                                     str(root / 'current') + '" ]; then exit 3; fi ;; esac'))
+    seen = len(calls())
+    status, out = op('start', connectome_kitchen_operator_word=word(), connectome_kitchen_remove_state=True)
+    stub.write_text(original)
+    ok('fatal post-activation verify removes boot activation and preserves state despite remove_state=true',
+       status != 0 and 'REMOVED. The first start' in out and nothing() and not root.exists()
+       and (state / 'trial-state-of-the-agent').is_file() and calls()[seen:] == ['daemon-reload', 'restart', 'stop', 'daemon-reload'], out)
+
+    # A build that does not stay up, with the build kept for inspection or removed at once.
     (sandbox / 'knobs' / ('short-lived-' + new[:8])).write_text('')
     held, out = again()
     ok('from nothing again: prepare and verify exit 0', held, out)
     seen = len(calls())
     status, out = op('start', connectome_kitchen_operator_word=word(), connectome_kitchen_auto_rollback=False)
-    ok('a build that does not stay up, auto_rollback false: the play fails, says so and removes nothing', status != 0 and 'FAILED, and connectome_kitchen_auto_rollback is false: nothing was removed' in out and four() == [True] * 4 and 'stop' not in calls()[seen:], (calls()[seen:], out))
+    ok('auto_rollback false: failure deactivates boot and keeps the build and state', status != 0 and 'DEACTIVATED.' in out
+       and nothing() and (build / '.prepared').is_file() and (state / 'trial-state-of-the-agent').is_file()
+       and calls()[seen:] == ['daemon-reload', 'restart', 'stop', 'daemon-reload'], (calls()[seen:], out))
     seen = len(calls())
     status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
-    ok('remove of it: exit 0, the unit down, nothing installed, the root gone', status == 0 and nothing() and not root.exists() and calls()[seen:] == ['stop', 'daemon-reload'], (calls()[seen:], out))
+    ok('remove of it: exit 0, the unit down, nothing installed, the root gone', status == 0 and nothing() and not root.exists() and calls()[seen:] == ['daemon-reload'], (calls()[seen:], out))
     held, out = again()
     ok('from nothing again: prepare and verify exit 0', held, out)
     seen = len(calls())

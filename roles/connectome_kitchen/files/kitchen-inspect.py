@@ -170,8 +170,8 @@ def alone(c):
         named = pointer(json.loads(lock), '/recipe/sha256') if lock is not None else ABSENT
     except ValueError:
         named = ABSENT
-    if named is not ABSENT:
-        check('the lock of the new build names its staged recipe by digest', staged is not None and named == hashlib.sha256(staged).hexdigest())
+    check('the lock of the new build names its staged recipe by digest',
+          named is not ABSENT and staged is not None and named == hashlib.sha256(staged).hexdigest())
     keys(c, build, cooked)
     try:
         servers = json.loads(staged).get('mcpServers') if staged is not None else None

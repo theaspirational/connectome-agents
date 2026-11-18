@@ -6,7 +6,7 @@
 
 - name: Stop the unit and remove the first install
   ansible.builtin.command:
-    argv: "{{ ck_first_script + ['remove'] + (['state'] if (connectome_kitchen_remove_state | bool) else []) }}"
+    argv: "{{ ck_first_script + ['remove', connectome_kitchen_build] + (['state'] if (connectome_kitchen_operation == 'remove' and connectome_kitchen_remove_state | bool) else []) }}"
   environment: "{{ ck_first_env }}"
   changed_when: "'nothing to remove' not in ck_removed.stdout"
   failed_when: false

@@ -53,8 +53,8 @@
 # every one of them must be "not there" (first-environment); after it, every one "yes" (installed-environment).
 - name: "Say what a first start finds of the environment: {{ ck_mode }}"
   ansible.builtin.set_fact:
-    ck_environment: "{{ 'first-environment' if (ck_result.rc == 0 and ck_result.environment_file is none and (ck_result.secret_files | dict2items | map(attribute='value') | reject('none') | list | length) == 0) else ('installed-environment' if (ck_result.rc == 0 and ck_result.same_environment) else 'NOT-A-FIRST-ENVIRONMENT') }}"
-    ck_environment_words: "{{ 'environment file of a build that runs: ' + ({true: 'there, and what a start would write', false: 'there, and NOT what a start would write'}[ck_result.environment_file] | default('none')) + '. Secret files the start writes: ' + (ck_result.secret_files | sort | join(', ') | default('none', true)) + '; there already: ' + (ck_result.secret_files | dict2items | rejectattr('value', 'none') | map(attribute='key') | sort | join(', ') | default('none', true)) }}"
+    ck_environment: "{{ 'first-environment' if (ck_result.rc == 0 and ck_result.environment_file is none and (ck_result.secret_files | dict2items | map(attribute='value') | reject('none') | list | length) == 0) else ('installed-environment' if (ck_result.rc == 0 and ck_result.same_environment and ck_result.plan.activate.changed is false) else 'NOT-A-FIRST-ENVIRONMENT') }}"
+    ck_environment_words: "{{ 'environment file of the prepared build: ' + ({true: 'there, and what a start would write', false: 'not what a start would write, or unreadable'}[ck_result.environment_file] | default('none')) + '. Secret files the start writes: ' + (ck_result.secret_files | sort | join(', ') | default('none', true)) + '; there already: ' + (ck_result.secret_files | dict2items | rejectattr('value', 'none') | map(attribute='key') | sort | join(', ') | default('none', true)) }}"
   when: ck_mode == 'verify' and ck_first
 
 - name: "Show the answer of kitchen: {{ ck_mode }}"

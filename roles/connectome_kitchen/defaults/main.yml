@@ -84,7 +84,7 @@ connectome_kitchen_agent_is_down: false
 connectome_kitchen_watch_seconds: 120
 connectome_kitchen_runner_timeout_seconds: 300
 # On a failed start or a failed watch, put the previous build back at once. For a first install: remove what the
-# start installed at once (the state directory stays).
+# start installed at once (the state directory stays). False retains the build but still removes boot activation.
 connectome_kitchen_auto_rollback: true
 # Start although the secrets file gives the new process another environment than the running one has: every
 # difference, named or not (a rotated key, another base URL). The names that differ are printed by `verify`; no value is.

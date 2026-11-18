@@ -10,9 +10,8 @@
 #   4. the same process still runs after connectome_kitchen_watch_seconds
 #   5. verify again (the environment file and the secret files the engine wrote are what the secrets file gives), and
 #      readback
-# If 2, 3 or 4 fails and something is left installed, it is removed (remove.yml: the unit stopped, the links, the
-# drop-in and the root gone; the state directory and the secrets file stay) unless connectome_kitchen_auto_rollback is
-# false. The play then ends failed and says what is there.
+# Failures from activation through the final verification/readback enter rescue. Always undo boot
+# activation; auto_rollback controls only whether the build is kept. Rescue never removes agent state.
 
 - name: Hold that verify held this build, and that nothing is installed yet
   ansible.builtin.command:
@@ -91,6 +90,17 @@
           - ck_first_stable.stdout_lines[-1] == ck_first_after.stdout_lines[-1]
         fail_msg: "after {{ connectome_kitchen_watch_seconds }} s the agent is not running the new build in the process the start made: the new build does not stay up"
 
+    - name: Verify after the first start
+      ansible.builtin.include_tasks: runner.yml
+      vars:
+        ck_mode: verify
+
+    - name: Read back what the agent shows
+      ansible.builtin.include_tasks: inspect.yml
+      vars:
+        ck_inspections: [readback]
+
+
   rescue:
     - name: Ask whether anything is installed
       ansible.builtin.command:
@@ -106,32 +116,26 @@
 
     - name: End where nothing is installed and nothing has to be removed
       ansible.builtin.fail:
-        msg: "NOT STARTED on {{ connectome_kitchen_build[:8] }}. Nothing of {{ ck_name }} is installed and its unit is down: the start was refused, or it failed and the engine took it back. The prepared build is still there. Read the lines above; then verify and start again, or remove."
+        msg: "NOT STARTED on {{ connectome_kitchen_build[:8] }}. Nothing of {{ ck_name }} is installed and its unit is down: the start was refused, or it failed and the engine took it back. The prepared build is still there. Read the lines above; A failed activation can leave a prepared environment file: verify reports it without values. If present, remove and prepare again before retrying."
       when: ck_first_left.rc == 0
 
-    - name: End where nothing is removed, on your word
-      ansible.builtin.fail:
-        msg: "FAILED, and connectome_kitchen_auto_rollback is false: nothing was removed. {{ ck_name }} is installed on {{ connectome_kitchen_build[:8] }} and its unit may be running, failing or restarting; it is enabled and would start again at boot. Decide now: the same play with connectome_kitchen_operation=remove."
+    - name: Deactivate the failed first start without deleting its build or state
+      ansible.builtin.command:
+        argv: "{{ ck_first_script + ['deactivate', connectome_kitchen_build] }}"
+      environment: "{{ ck_first_env }}"
       when: not (connectome_kitchen_auto_rollback | bool)
 
-    - name: Remove what the first start installed
+    - name: Report that boot activation was removed and the failed build was kept
+      ansible.builtin.fail:
+        msg: "DEACTIVATED. The first start of {{ connectome_kitchen_build[:8] }} failed. The unit is down and not enabled; the deployment root and the agent state are retained. Inspect the build, then explicitly remove it before preparing again."
+      when: not (connectome_kitchen_auto_rollback | bool)
+
+    - name: Remove what the first start installed, always preserving agent state
       ansible.builtin.include_tasks: remove.yml
 
     - name: End where the first install was removed
       ansible.builtin.fail:
-        msg: "REMOVED. The first start of {{ connectome_kitchen_build[:8] }} or the health of the agent after it failed; the unit of {{ ck_name }} was stopped and its links, its drop-in and its deployment root are gone. The secrets file is untouched. The state directory is left as that process left it: it is not the fresh state of before. To try again: prepare, verify, start."
-
-# From here on the agent runs and is stable. What follows changes nothing and removes nothing.
-
-- name: Verify after the first start
-  ansible.builtin.include_tasks: runner.yml
-  vars:
-    ck_mode: verify
-
-- name: Read back what the agent shows
-  ansible.builtin.include_tasks: inspect.yml
-  vars:
-    ck_inspections: [readback]
+        msg: "REMOVED. The first start of {{ connectome_kitchen_build[:8] }} or a check after it failed; the unit of {{ ck_name }} was stopped and its links, its drop-in and its deployment root are gone. The secrets file is untouched. The state directory is left as that process left it: it is not the fresh state of before. To try again: prepare, verify, start."
 
 - name: Say where the first start leaves it
   ansible.builtin.debug:
