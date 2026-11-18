@@ -67,8 +67,6 @@ connectome_kitchen_first_install: false
 #   start:   -e connectome_kitchen_operator_word="FIRST-START <name> <UTC time, YYYY-MM-DDTHH:MMZ>"
 #   remove:  -e connectome_kitchen_operator_word="REMOVE <name> <UTC time, YYYY-MM-DDTHH:MMZ>"
 connectome_kitchen_operator_word: ""
-# `remove` leaves the agent's state directory unless this is true. It never touches the secrets file.
-connectome_kitchen_remove_state: false
 
 # Where `prepare` keeps what `rollback` needs. The operator's, mode 0700, outside the home of the account.
 connectome_kitchen_save_dir: "/var/lib/connectome-kitchen/save/{{ connectome_agent.name }}"

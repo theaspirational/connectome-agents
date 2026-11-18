@@ -1,4 +1,5 @@
 """First-install ownership checks. Never follows an artifact symlink or prints file contents."""
+import ctypes
 import hashlib
 import json
 import os
@@ -58,6 +59,31 @@ def identity(entry):
     return None if entry is None else [entry.st_dev, entry.st_ino]
 
 
+def incarnation(path, entry):
+    # A Linux export handle carries the filesystem's incarnation evidence (on ext4,
+    # inode generation). Do not fall back to inode/ctime or try to upgrade old holds.
+    class FileHandle(ctypes.Structure):
+        _fields_ = [('size', ctypes.c_uint), ('type', ctypes.c_int), ('data', ctypes.c_ubyte * 128)]
+
+    libc = ctypes.CDLL(None)
+    lookup = getattr(libc, 'name_to_handle_at', None)
+    handle, mount = FileHandle(), ctypes.c_int()
+    handle.size = len(handle.data)
+    at_empty_path = 0x1000  # linux/fcntl.h
+    fd = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        require(lookup is not None and lookup(fd, b'', ctypes.byref(handle), ctypes.byref(mount), at_empty_path) == 0
+                and 0 < handle.size <= len(handle.data),
+                'cannot prove directory identity (filesystem handle unavailable): ' + str(path))
+        # Keep the inode alive during the path check; harmless atime changes
+        # (including our own directory listings) are not changes of identity.
+        require(identity(os.fstat(fd)) == identity(entry) == identity(directory(path)),
+                'directory changed while checking its identity: ' + str(path))
+        return [handle.type, bytes(handle.data[:handle.size]).hex()]
+    finally:
+        os.close(fd)
+
+
 def mounts_below(path):
     # Includes bind mounts, which --one-file-system alone cannot distinguish.
     for line in Path('/proc/self/mountinfo').read_text().splitlines():
@@ -65,7 +91,7 @@ def mounts_below(path):
         require(mount != path and path not in mount.parents, 'mounted entry in removal scope: ' + str(mount))
 
 
-def main(mode, build, state_flag):
+def main(mode, build):
     home, root, state, unit_dir, secrets, save = (literal(env(key)) for key in
                                                   ('ACCOUNT_HOME', 'ROOT', 'STATE_DIR', 'UNIT_DIR', 'SECRETS_FILE', 'SAVE'))
     name, account, uid, operator = env('NAME'), env('ACCOUNT'), int(env('UID')), int(env('OPERATOR_UID'))
@@ -122,13 +148,13 @@ def main(mode, build, state_flag):
         require(all(info(save / leaf) is None for leaf in ('verified', 'ownership.prepared.sha256')),
                 'save contains other deployment records')
         return
-    if not present and mode == 'remove' and not state_flag and root_entry is None and not any(map(info, (unit_link, wants, dropin_dir))):
+    if not present and mode == 'remove' and root_entry is None and not any(map(info, (unit_link, wants, dropin_dir))):
         print('absent')
         return
     require(present or mode == 'create', 'save holds no marker of a first install')
     require(re.fullmatch(r'[a-f0-9]{64}', build), 'first-install operation needs the expected build pin')
 
-    binding = dict(version=2, name=name, account=account, uid=uid, build=build, home=str(home),
+    binding = dict(version=3, name=name, account=account, uid=uid, build=build, home=str(home),
                    root=str(root), unit_dir=str(unit_dir), state=str(state), secrets=str(secrets), save=str(save),
                    runtime=str(runtime), protected=json.loads(env('PROTECTED_PATHS')))
     record = {}
@@ -137,11 +163,14 @@ def main(mode, build, state_flag):
         record = json.loads(marker.read_bytes())
         require(isinstance(record, dict) and all(record.get(key) == value for key, value in binding.items()),
                 'first-install marker does not match the deployment paths and expected build')
-        require(root_entry is None or record.get('root_identity') == identity(root_entry),
-                'deployment root was replaced since it was held')
+        if root_entry:
+            require(record.get('root_identity') == identity(root_entry)
+                    and record.get('root_handle') == incarnation(root, root_entry),
+                    'deployment root was replaced or cannot be proved to be the held root')
     if mode == 'create':
         require(not present and root_entry and not any(root.iterdir()), 'deployment root is no longer fresh')
-        save_marker(marker, dict(binding, root_identity=identity(root_entry), state_identity=identity(state_entry)))
+        save_marker(marker, dict(binding, root_identity=identity(root_entry), root_handle=incarnation(root, root_entry),
+                                 state_identity=identity(state_entry)))
         return
 
     require(mode in ('remove', 'deactivate', 'recheck', 'removing') or root_entry, 'held root has disappeared; remove before preparing again')
@@ -150,8 +179,9 @@ def main(mode, build, state_flag):
     if builds_entry:
         require(all(path == target for path in builds.iterdir()),
                 'builds holds more than the expected build (or a different build)')
+    build_identity = [*identity(target_entry), *incarnation(target, target_entry)] if target_entry else None
     if target_entry:
-        require(target_entry.st_uid == uid and record.get('build_identity', identity(target_entry)) == identity(target_entry),
+        require(target_entry.st_uid == uid and record.get('build_identity', build_identity) == build_identity,
                 'the expected build directory was replaced')
     if mode in ('held', 'claim', 'claim-initial'):
         require(not record.get('removing'), 'cleanup is incomplete; remove before preparing again')
@@ -161,8 +191,6 @@ def main(mode, build, state_flag):
                             and record['state_identity'] is None)
         require(initial_creation or record['state_identity'] == identity(state_entry),
                 'state directory was not held or was replaced; remove without state before preparing again')
-    if state_flag and state_entry:
-        require(record['state_identity'] == identity(state_entry), 'state directory was not held or was replaced')
 
     # The root is dedicated, but unit files live in a shared tree. Require engine ownership and independent
     # exact path/type/target checks there. Missing entries are permitted for retries of interrupted cleanup.
@@ -180,7 +208,7 @@ def main(mode, build, state_flag):
             owned[path] = entry
 
     if target_entry:
-        require((mode in ('remove', 'recheck', 'removing') and record.get('removing') and record.get('build_identity') == identity(target_entry))
+        require((mode in ('remove', 'recheck', 'removing') and record.get('removing') and record.get('build_identity') == build_identity)
                 or owned.get(target) == {'path': str(target), 'kind': 'directory'}, 'build has no first-install ownership evidence')
     source = target / 'managed-units' / unit
     if info(unit_link) and unit_link.is_symlink() and os.readlink(unit_link) == str(target / unit):
@@ -210,9 +238,9 @@ def main(mode, build, state_flag):
     if mode in ('claim', 'claim-initial'):
         require(target_entry is not None, 'prepared build is missing')
         if 'build_identity' not in record:
-            save_marker(marker, dict(record, build_identity=identity(target_entry), state_identity=identity(state_entry)))
+            save_marker(marker, dict(record, build_identity=build_identity, state_identity=identity(state_entry)))
     if mode == 'removing':
-        save_marker(marker, dict(record, removing=True, build_identity=identity(target_entry) if target_entry else record.get('build_identity')))
+        save_marker(marker, dict(record, removing=True, build_identity=build_identity if target_entry else record.get('build_identity')))
     if mode in ('remove', 'deactivate', 'recheck'):
         # The shell checks the manager's fragment before asking it to stop anything.
         print(source)
@@ -233,7 +261,7 @@ def save_marker(path, record):
 
 if __name__ == '__main__':
     try:
-        main(sys.argv[1], sys.argv[2], sys.argv[3] == 'state')
+        main(sys.argv[1], sys.argv[2])
     except (Refused, OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError) as error:
         # Parser and I/O errors may refer to inputs; do not echo their text.
         print(str(error) if isinstance(error, Refused) else 'first-install paths or ownership records could not be validated')

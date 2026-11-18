@@ -551,14 +551,14 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     replacement_data.touch()
     remove = {'connectome_kitchen_operator_word': word('REMOVE'), 'connectome_kitchen_remove_state': True}
     status, out = op('remove', **remove)
-    ok('remove with state refuses restored state before stop', status != 0 and 'state directory was not held or was replaced' in out
+    ok('remove with state refuses restored state before stop', status != 0 and 'connectome_kitchen_remove_state was removed' in out
        and replacement_data.is_file() and marker.read_bytes() == held and calls() == [], out)
     status, out = op('prepare')
     ok('repeat prepare refuses restored state and does not rebind', status != 0 and 'state directory was not held or was replaced' in out
        and replacement_data.is_file() and marker.read_bytes() == held and 'Run kitchen: prepare' not in out, out)
     status, out = op('remove', **remove)
     ok('explicit removal still refuses after the failed retry and preserves replacement data', status != 0
-       and 'state directory was not held or was replaced' in out and replacement_data.is_file() and marker.read_bytes() == held
+       and 'connectome_kitchen_remove_state was removed' in out and replacement_data.is_file() and marker.read_bytes() == held
        and calls() == [], out)
     shutil.rmtree(state)
     prior_state.rename(state)
@@ -654,7 +654,7 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     for overlap in (state / 'protected.json', root / 'protected.json'):
         shutil.copyfile(secrets_file, overlap)
         overlap.chmod(0o600)
-        status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'), connectome_kitchen_remove_state=True,
+        status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'),
                          connectome_agent={**variables['connectome_agent'], 'secrets_file': str(overlap)})
         ok('remove rejects secrets overlapping ' + overlap.parent.name + ' before any stop or deletion', status != 0
            and 'overlapping first-install scopes' in out and overlap.is_file() and four() == [True] * 4 and calls()[seen:] == [], out)
@@ -714,9 +714,9 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     stub.write_text(original.replace('script=$1; shift', 'script=$1; shift\ncase "$script:$1" in */takeover.mjs:verify) if [ -L "' +
                                      str(root / 'current') + '" ]; then exit 3; fi ;; esac'))
     seen = len(calls())
-    status, out = op('start', connectome_kitchen_operator_word=word(), connectome_kitchen_remove_state=True)
+    status, out = op('start', connectome_kitchen_operator_word=word())
     stub.write_text(original)
-    ok('fatal post-activation verify removes boot activation and preserves state despite remove_state=true',
+    ok('fatal post-activation verify removes boot activation and preserves state',
        status != 0 and 'REMOVED. The first start' in out and nothing() and not root.exists()
        and (state / 'trial-state-of-the-agent').is_file() and calls()[seen:] == ['daemon-reload', 'restart', 'stop', 'daemon-reload'], out)
 
@@ -746,9 +746,14 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     ok('from nothing once more: prepare and verify exit 0', held, out)
     started('the first start after the removals', len(calls()))
     seen = len(calls())
-    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'), connectome_kitchen_remove_state=True)
-    ok('remove with connectome_kitchen_remove_state: exit 0, and the state directory is gone too; the secrets file is byte for byte there',
-       status == 0 and nothing() and not root.exists() and not state.exists() and hashlib.sha256(secrets_file.read_bytes()).hexdigest() == secrets_digest and calls()[seen:] == ['stop', 'daemon-reload'], (calls()[seen:], out))
+    for legacy in (True, False):
+        status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'), connectome_kitchen_remove_state=legacy)
+        ok('retired state-deletion variable (%s) refuses before stop' % legacy,
+           status != 0 and 'connectome_kitchen_remove_state was removed' in out and calls()[seen:] == [] and state.is_dir() and all(four()), out)
+    status, out = op('remove', connectome_kitchen_operator_word=word('REMOVE'))
+    ok('remove preserves state on final retry; the secrets file is byte for byte there',
+       status == 0 and nothing() and not root.exists() and (state / 'trial-state-of-the-agent').is_file()
+       and hashlib.sha256(secrets_file.read_bytes()).hexdigest() == secrets_digest and calls()[seen:] == ['stop', 'daemon-reload'], (calls()[seen:], out))
     values = [value for value in world.secrets.values() if isinstance(value, str) and len(value) >= 12]
     ok('no value of the secrets file is in what the plays printed or in what the runner kept (%d values held)' % len(values),
        not any(value in log.read_text() for value in values) and not any(value in path.read_text(errors='replace') for value in values for path in (home / 'kitchen-takeover').rglob('*') if path.is_file() and 'cook-recipe' not in path.name))

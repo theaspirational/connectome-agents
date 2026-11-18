@@ -58,7 +58,7 @@ class Files(unittest.TestCase):
 
     def test_operations_gates_and_defaults(self):
         main = yaml.safe_load((ROLE / 'tasks/main.yml').read_text())
-        first = main[0]['ansible.builtin.assert']['that']
+        first = next(task for task in main if task['name'] == 'Refuse an unusable invocation before anything is read')['ansible.builtin.assert']['that']
         # The eight operations of a deployment that runs; `remove` is there for a first install alone.
         self.assertIn("connectome_kitchen_operation in ['name', 'plan', 'prepare', 'verify', 'start', 'rollback', 'readback', 'clear'] or (connectome_kitchen_operation == 'remove' and connectome_kitchen_first_install | bool)", first)
         self.assertIn('not ansible_check_mode', first)
@@ -82,13 +82,15 @@ class Files(unittest.TestCase):
 
     def test_a_first_install_is_a_mode_of_its_own_and_leaves_the_takeover_tasks_as_they_were(self):
         main = yaml.safe_load((ROLE / 'tasks/main.yml').read_text())
-        first = main[0]['ansible.builtin.assert']['that']
+        first = next(task for task in main if task['name'] == 'Refuse an unusable invocation before anything is read')['ansible.builtin.assert']['that']
         # No live build with it, a live build without it; no rollback and no clear with it; remove only with it.
         for line in ("connectome_kitchen_live_build is match('^[0-9a-f]{64}$') or (connectome_kitchen_first_install | bool)", "connectome_kitchen_live_build == '' or not (connectome_kitchen_first_install | bool)",
                      "not (connectome_kitchen_first_install | bool) or connectome_kitchen_operation not in ['rollback', 'clear']", "connectome_kitchen_operation in ['name', 'plan'] or connectome_kitchen_build != ''"):
             self.assertIn(line, first)
         defaults = yaml.safe_load((ROLE / 'defaults/main.yml').read_text())
-        self.assertEqual((defaults['connectome_kitchen_first_install'], defaults['connectome_kitchen_operator_word'], defaults['connectome_kitchen_remove_state']), (False, '', False))
+        self.assertEqual((defaults['connectome_kitchen_first_install'], defaults['connectome_kitchen_operator_word']), (False, ''))
+        self.assertNotIn('connectome_kitchen_remove_state', defaults)
+        self.assertEqual(main[0]['ansible.builtin.assert']['that'], 'connectome_kitchen_remove_state is not defined')
         names = [task['name'] for task in main]
         when = lambda name: str(main[names.index(name)]['when'])
         # The gates: the executor for a removal too, and the operator's own word where no agent can say IDLE. Both before any act.
@@ -551,6 +553,12 @@ elif a[0] == 'stop':
         wants = link.parent / 'default.target.wants' / link.name
         wants.unlink()
         wants.symlink_to('/unexpected')
+    if d.get('replace_root_after_stop'):
+        import shutil
+        root = w / 'home/share/connectome/x'
+        shutil.rmtree(root)
+        root.mkdir()
+        (root / 'foreign').touch()
 elif a[0] == 'daemon-reload' and d.get('reload_fails'):
     sys.exit(1)
 (w / 'manager.json').write_text(json.dumps(d))
@@ -692,7 +700,7 @@ elif a[0] == 'daemon-reload' and d.get('reload_fails'):
         marker = save / 'first-install'
         held = marker.read_bytes()
         (state / 'keep').touch()
-        done = run('remove', NEW, 'state')
+        done = run('remove', NEW)
         self.assertEqual((done.returncode, calls(), four()), (62, ['stop'], [True] * 4), done.stdout)
         self.assertIn('VALIDATION FAILED: unowned or redirected link', done.stdout)
         self.assertIn('Cleanup is incomplete', done.stdout)
@@ -740,13 +748,77 @@ elif a[0] == 'daemon-reload' and d.get('reload_fails'):
         seen = len(calls())
         done = run('remove', NEW)
         self.assertEqual((done.returncode, 'nothing to remove' in done.stdout, calls()[seen:]), (0, True, []), done.stdout)
-        # With `state` the state directory goes too; a drop-in file this install did not put there stays, and is named.
+        # A drop-in file this install did not put there stays.
         self.assertEqual(run('hold', NEW).returncode, 0)
         install()
         (units / 'connectome-x.service.d/10-operator.conf').write_text('[Service]\nNice=1\n')
-        done = run('remove', NEW, 'state')
-        self.assertEqual((done.returncode, state.exists(), root.exists(), (units / 'connectome-x.service.d/10-operator.conf').is_file(), secrets.read_text()), (0, False, False, True, '{"A_KEY": "VALUE"}'), done.stdout)
+        done = run('remove', NEW)
+        self.assertEqual((done.returncode, state.exists(), root.exists(), (units / 'connectome-x.service.d/10-operator.conf').is_file(), secrets.read_text()), (0, True, False, True, '{"A_KEY": "VALUE"}'), done.stdout)
 
+    def test_hold_allows_directory_atime_updates(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        root.mkdir(parents=True)
+        os.utime(root, ns=(1, root.stat().st_mtime_ns))
+        done = run('hold', NEW)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(run('remove', NEW).returncode, 0)
+
+    def test_remove_does_not_delete_recreated_state(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        install()
+        marker = (save / 'first-install').read_bytes()
+        shutil.rmtree(state)
+        state.mkdir()
+        (state / 'replacement-data').touch()
+        refused = run('remove', NEW, 'state')
+        self.assertEqual((refused.returncode, calls(), four()), (60, [], [True] * 4), refused.stdout)
+        self.assertEqual((save / 'first-install').read_bytes(), marker)
+        removed = run('remove', NEW)
+        self.assertEqual((removed.returncode, root.exists(), (state / 'replacement-data').is_file()),
+                         (0, False, True), removed.stdout)
+
+    def test_remove_refuses_recreated_root_even_with_matching_device_and_inode(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        marker = save / 'first-install'
+        held = json.loads(marker.read_bytes())
+        shutil.rmtree(root)
+        root.mkdir()
+        sentinel = root / 'unrelated-data'
+        sentinel.touch()
+        # Exercise the inode-reuse branch regardless of the allocator's choice:
+        # substitute only the old check's fields, leaving the held kernel handle intact.
+        held['root_identity'] = [root.stat().st_dev, root.stat().st_ino]
+        marker.write_text(json.dumps(held))
+        done = run('remove', NEW)
+        self.assertEqual((done.returncode, calls(), sentinel.is_file()), (60, [], True), done.stdout)
+        self.assertIn('deployment root was replaced', done.stdout)
+
+    def test_remove_reports_incomplete_if_root_is_recreated_after_stop(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        install()
+        (self.work / 'manager.json').write_text(json.dumps({'active': True, 'replace_root_after_stop': True}))
+        marker = save / 'first-install'
+        held = marker.read_bytes()
+        done = run('remove', NEW)
+        self.assertEqual((done.returncode, calls(), four()), (62, ['stop'], [False, True, True, True]), done.stdout)
+        self.assertIn('VALIDATION FAILED: deployment root was replaced', done.stdout)
+        self.assertEqual((marker.read_bytes(), (root / 'foreign').is_file()), (held, True))
+
+    def test_remove_refuses_old_marker_without_incarnation_proof(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        install()
+        marker = save / 'first-install'
+        held = json.loads(marker.read_bytes())
+        held.pop('root_handle')
+        held['version'] = 2
+        marker.write_text(json.dumps(held))
+        done = run('remove', NEW)
+        self.assertEqual((done.returncode, calls(), four(), root.exists()), (60, [], [True] * 4, True), done.stdout)
+        self.assertIn('marker does not match', done.stdout)
 
     def test_remove_retries_after_unlink_without_readopting_or_bypassing_marker(self):
         run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()

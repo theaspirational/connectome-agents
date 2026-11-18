@@ -5,6 +5,11 @@
 # With connectome_kitchen_first_install the same operations install an agent from nothing (docs/kitchen.md, A first
 # install): there is no running build to save, to compare with or to go back to, and `remove` is the way out.
 
+- name: Refuse the retired state-deletion option
+  ansible.builtin.assert:
+    that: connectome_kitchen_remove_state is not defined
+    fail_msg: "connectome_kitchen_remove_state was removed. Unset it (even if false). The role never deletes agent state; handle state separately as an operator action. Nothing was changed."
+
 - name: Refuse an unusable invocation before anything is read
   ansible.builtin.assert:
     that:

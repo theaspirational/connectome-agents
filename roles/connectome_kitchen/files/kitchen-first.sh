@@ -12,7 +12,7 @@ SAVE=$KITCHEN_SAVE; STATE=${KITCHEN_STATE_DIR:-}
 read -r -a AS <<<"${KITCHEN_AS_ACCOUNT:-}"
 MODE=${1:-}; BUILD=${2:-}
 HEX='^[a-f0-9]{64}$'
-USAGE="usage: kitchen-first.sh hold BUILD|nothing|runs BUILD|mark BUILD WORD WORD|held BUILD|claim BUILD|claim-initial BUILD|scope|deactivate BUILD|remove BUILD [state]"
+USAGE="usage: kitchen-first.sh hold BUILD|nothing|runs BUILD|mark BUILD WORD WORD|held BUILD|claim BUILD|claim-initial BUILD|scope|deactivate BUILD|remove BUILD"
 
 say() { printf 'first: %s\n' "$*"; }
 refuse() { say "REFUSED, nothing changed: $*"; exit 60; }
@@ -22,8 +22,7 @@ prop() { sc show -p "$1" --value $U 2>/dev/null; }
 
 case "$MODE" in
   nothing|scope) [ $# -eq 1 ] || refuse "$USAGE" ;;
-  remove) [[ $BUILD =~ $HEX ]] && { [ $# -eq 2 ] || { [ $# -eq 3 ] && [ "$3" = state ]; }; } || refuse "$USAGE" ;;
-  hold|runs|held|claim|claim-initial|deactivate) [ $# -eq 2 ] && [[ $BUILD =~ $HEX ]] || refuse "$USAGE" ;;
+  hold|runs|held|claim|claim-initial|deactivate|remove) [ $# -eq 2 ] && [[ $BUILD =~ $HEX ]] || refuse "$USAGE" ;;
   mark) [ $# -eq 4 ] && [[ $BUILD =~ $HEX ]] && [[ $3 =~ ^[A-Za-z-]+$ ]] && [[ $4 =~ ^[A-Za-z-]+$ ]] || refuse "$USAGE" ;;
   *) refuse "$USAGE" ;;
 esac
@@ -34,7 +33,7 @@ cleanup_started=false
 incomplete() { say "$*. Cleanup is incomplete; correct the cause and retry. Exit 62."; exit 62; }
 check() {
   local reply
-  reply=$(/usr/bin/python3 -I "${BASH_SOURCE[0]%/*}/kitchen-first-scope.py" "$1" "$BUILD" "${STATE_FLAG:-}") || {
+  reply=$(/usr/bin/python3 -I "${BASH_SOURCE[0]%/*}/kitchen-first-scope.py" "$1" "$BUILD") || {
     if $cleanup_started; then incomplete "VALIDATION FAILED: $reply"; fi
     refuse "$reply"
   }
@@ -139,7 +138,6 @@ fi
 
 # remove or deactivate (the latter always keeps the root and agent state).
 grep -Fq -- "$U" /proc/self/cgroup && refuse "this shell is inside $U"
-STATE_FLAG=${3:-}
 check "$MODE"
 if [ "$CHECK" = absent ]; then
   down && [ -z "$(prop FragmentPath)" ] || refuse "no marker and the unit is not down and unloaded"
@@ -191,17 +189,14 @@ if [ "$MODE" = deactivate ]; then
   exit 0
 fi
 
-# Record the verified build inode before recursive removal, so a partial rm can be retried even
+# Record the verified build identity before recursive removal, so a partial rm can be retried even
 # if the engine manifest is already gone. The marker is the last thing retired.
 check removing
 if there "$R/current"; then step t rm -- "$R/current"; fi
+check recheck
 say "removing the first install of $NAME"
 step t rm -rf --one-file-system -- "$R"
-if [ "$STATE_FLAG" = state ]; then
-  check recheck
-  step t rm -rf --one-file-system -- "$STATE"
-fi
-if there "$R" || there "$UD/$U" || there "$UD/default.target.wants/$U" || there "$UD/$U.d/90-connectome-env.conf" || { [ "$STATE_FLAG" = state ] && there "$STATE"; }; then
+if there "$R" || there "$UD/$U" || there "$UD/default.target.wants/$U" || there "$UD/$U.d/90-connectome-env.conf"; then
   say "STEP FAILED: owned entries remain; removal is incomplete. Exit 62."
   exit 62
 fi

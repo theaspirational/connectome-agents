@@ -2,13 +2,13 @@
 # The way out of a first install: stop the one unit and remove what the install put there (files/kitchen-first.sh says
 # exactly what). Only where `prepare` of a first install kept its marker, and only while the deployment has no more than
 # one build. The gates were passed in main.yml: an executor outside the unit, and the operator's own dated word. The
-# secrets file is never touched; the state directory only with connectome_kitchen_remove_state.
+# secrets file is never touched; neither is the agent state directory.
 
 - name: Stop the unit and remove the first install
   ansible.builtin.command:
-    argv: "{{ ck_first_script + ['remove', connectome_kitchen_build] + (['state'] if (connectome_kitchen_operation == 'remove' and connectome_kitchen_remove_state | bool) else []) }}"
+    argv: "{{ ck_first_script + ['remove', connectome_kitchen_build] }}"
   environment: "{{ ck_first_env }}"
-  changed_when: "'nothing to remove' not in ck_removed.stdout"
+  changed_when: "ck_removed.rc != 60 and 'nothing to remove' not in ck_removed.stdout"
   failed_when: false
   register: ck_removed
 
