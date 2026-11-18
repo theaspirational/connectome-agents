@@ -547,6 +547,10 @@ if a[0] == 'show':
 elif a[0] == 'stop':
     if d.get('stop_fails'): sys.exit(1)
     d['active'] = False
+    if d.get('redirect_wants_after_stop'):
+        wants = link.parent / 'default.target.wants' / link.name
+        wants.unlink()
+        wants.symlink_to('/unexpected')
 elif a[0] == 'daemon-reload' and d.get('reload_fails'):
     sys.exit(1)
 (w / 'manager.json').write_text(json.dumps(d))
@@ -646,6 +650,56 @@ elif a[0] == 'daemon-reload' and d.get('reload_fails'):
         done = run('held', NEW)
         self.assertEqual((done.returncode, 'ownership.json changed since verify' in done.stdout), (60, True))
         self.assertEqual(calls(), [])
+
+    def test_only_initial_prepare_can_claim_newly_created_state(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        shutil.rmtree(state)
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        marker = save / 'first-install'
+        held = marker.read_bytes()
+        self.assertIsNone(json.loads(held)['state_identity'])
+
+        # Emulate state and a prepared build appearing between this invocation's hold and claim.
+        state.mkdir()
+        build = root / 'builds' / NEW
+        build.mkdir(parents=True)
+        (root / 'state').mkdir()
+        (root / 'state/ownership.json').write_text(json.dumps(
+            dict(version=1, entries=[dict(path=str(build), kind='directory')])))
+        for mode in ('hold', 'claim'):
+            # Ordinary retry cannot acquire authority from an interrupted initial prepare.
+            done = run(mode, NEW)
+            self.assertEqual((done.returncode, marker.read_bytes()), (60, held), done.stdout)
+            self.assertIn('state directory was not held or was replaced', done.stdout)
+        done = run('claim-initial', NEW)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        claimed = marker.read_bytes()
+        self.assertEqual(json.loads(claimed)['state_identity'], [state.stat().st_dev, state.stat().st_ino])
+        state.rename(state.with_name('old-state'))
+        state.mkdir()
+        for mode in ('claim', 'claim-initial'):
+            done = run(mode, NEW)
+            self.assertEqual((done.returncode, marker.read_bytes()), (60, claimed), done.stdout)
+            self.assertIn('state directory was not held or was replaced', done.stdout)
+
+    def test_remove_reports_incomplete_and_stops_if_post_stop_validation_fails(self):
+        run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()
+        self.assertEqual(run('hold', NEW).returncode, 0)
+        install()
+        manager = self.work / 'manager.json'
+        manager.write_text(json.dumps({'active': True, 'redirect_wants_after_stop': True}))
+        wants = units / 'default.target.wants/connectome-x.service'
+        marker = save / 'first-install'
+        held = marker.read_bytes()
+        (state / 'keep').touch()
+        done = run('remove', NEW, 'state')
+        self.assertEqual((done.returncode, calls(), four()), (62, ['stop'], [True] * 4), done.stdout)
+        self.assertIn('VALIDATION FAILED: unowned or redirected link', done.stdout)
+        self.assertIn('Cleanup is incomplete', done.stdout)
+        self.assertNotIn('nothing changed', done.stdout)
+        self.assertFalse(json.loads(manager.read_text())['active'])
+        self.assertEqual((os.readlink(wants), marker.read_bytes(), root.exists(), (state / 'keep').exists()),
+                         ('/unexpected', held, True, True))
 
     def test_remove_takes_a_first_install_away_and_nothing_else(self):
         run, install, four, calls, (root, units, save, state, secrets) = self.nothing_deployed()

@@ -541,6 +541,31 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     status, out = op('prepare')
     ok('prepare again: exit 0, already held, nothing built twice', status == 0 and 'already held' in out and nothing(), out)
 
+    # A realistic restore includes the external data needed by prepare; it is not a fresh hold.
+    marker = save / 'first-install'
+    held = marker.read_bytes()
+    prior_state = state.with_name(state.name + '-before-restore')
+    state.rename(prior_state)
+    shutil.copytree(prior_state, state)
+    replacement_data = state / 'trial-restored-state'
+    replacement_data.touch()
+    remove = {'connectome_kitchen_operator_word': word('REMOVE'), 'connectome_kitchen_remove_state': True}
+    status, out = op('remove', **remove)
+    ok('remove with state refuses restored state before stop', status != 0 and 'state directory was not held or was replaced' in out
+       and replacement_data.is_file() and marker.read_bytes() == held and calls() == [], out)
+    status, out = op('prepare')
+    ok('repeat prepare refuses restored state and does not rebind', status != 0 and 'state directory was not held or was replaced' in out
+       and replacement_data.is_file() and marker.read_bytes() == held and 'Run kitchen: prepare' not in out, out)
+    status, out = op('remove', **remove)
+    ok('explicit removal still refuses after the failed retry and preserves replacement data', status != 0
+       and 'state directory was not held or was replaced' in out and replacement_data.is_file() and marker.read_bytes() == held
+       and calls() == [], out)
+    shutil.rmtree(state)
+    prior_state.rename(state)
+    status, out = op('prepare')
+    ok('repeat prepare succeeds with the original held state restored in place', status == 0 and 'already held' in out
+       and marker.read_bytes() == held and nothing(), out)
+
     status, out = op('verify')
     ok('verify: exit 0', status == 0, out)
     for text in ('ok    the new build is prepared', 'ok    the build has its ' + unit, 'ok    the build has its run.sh', 'ok    the lock of the new build names its staged recipe by digest',

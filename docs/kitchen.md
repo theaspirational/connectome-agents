@@ -206,7 +206,7 @@ another thing in its place:
 | `verify` | compares with the running build, keeps a baseline | `files/kitchen-inspect.py alone`: the build is prepared and has its launcher, unit, recipe and lock; the lock names the staged recipe; the recipe keys; each server of `connectome_kitchen_servers_connected` is one of the recipe. No comparison, no baseline |
 | the environment | name by name against the running build's file | from the runner alone: measures the pinned build’s environment even when `current` is absent, and checks the declared secret files. Missing, matching and different/unreadable are distinguished without printing contents. Start requires absence |
 | the gate of `start` | the agent's own IDLE | the operator's own word: `-e connectome_kitchen_operator_word="FIRST-START <name> <UTC time, YYYY-MM-DDTHH:MMZ>"`, as fresh as an IDLE must be; and the executor gate as before |
-| before the start | the agent runs the saved build | nothing is installed and the unit is down; `verify` ran for this build |
+| before the start | the agent runs the saved build | nothing is installed and the unit is down; `verify` ran for this build. Before apply, the effective activation must be exactly this unit with its `default.target` enable link and no additional boot links or aliases |
 | a start that fails | the engine puts the previous build back | the engine stops the unit and removes what it installed (the guard's `first-start` mode lets that one `stop` through). The play ends `NOT STARTED`: nothing is installed, the prepared build stays; `verify` reports any retained environment; if present, explicitly remove and prepare again before retrying |
 | after the start | another process on the new build; the written environment against the previous one's | the unit runs the new build; the same process after `connectome_kitchen_watch_seconds`; then `verify` and readback. Diagnostic LOOK lines may require an operator follow-up even on a successful start |
 | a failed watch or fatal post-activation check | `rollback` for a failed watch | guarded cleanup removes boot activation, always preserving state. Default: `REMOVED`; with `connectome_kitchen_auto_rollback=false`: `DEACTIVATED`, retaining the failed build for inspection |
@@ -221,10 +221,14 @@ secrets, unit, and protected paths, then checks the expected build and engine-ow
 stop or unlink. It refuses redirected unit paths and leaves unrelated unit files in place. The dedicated root is
 removed with its build, engine records, secret copies and workspace. The source secrets file is never removed.
 The state directory stays unless explicitly opted in with `connectome_kitchen_remove_state=true`; automatic
-failed-start cleanup never honors that opt-in. A successful remove retires the marker; an already-absent target
+failed-start cleanup never honors that opt-in. Repeat prepare refuses a missing or replaced state directory
+rather than updating the original binding. State first created during the initial prepare can be bound only by
+that invocation. To retry with restored state, keep it: first run guarded remove without state, then hold anew.
+A successful remove retires the marker; an already-absent target
 can be a no-op. Old markers that lack these bindings are not accepted.
 
-Exit 62 means cleanup was incomplete: inspect and correct the cause, then retry the same guarded operation with
+Exit 60 means cleanup was refused before a mutation was attempted. Exit 62 means cleanup was incomplete
+(including a validation failure after a stop or another mutating step was attempted): inspect and correct the cause, then retry the same guarded operation with
 the original pins and a fresh word. Do not bypass the validator with raw deletion commands. A refusal means
 ownership could not be proved; escalate if the original layout cannot be verified. After a successful remove,
 `prepare`, `verify` and `start` install from nothing again.

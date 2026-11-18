@@ -153,8 +153,16 @@ def main(mode, build, state_flag):
     if target_entry:
         require(target_entry.st_uid == uid and record.get('build_identity', identity(target_entry)) == identity(target_entry),
                 'the expected build directory was replaced')
+    if mode in ('held', 'claim', 'claim-initial'):
+        require(not record.get('removing'), 'cleanup is incomplete; remove before preparing again')
+        # Only the role invocation that created the hold may claim state that first appeared during
+        # prepare. An interrupted prepare with changed state must be removed (without state) and held anew.
+        initial_creation = (mode == 'claim-initial' and 'build_identity' not in record
+                            and record['state_identity'] is None)
+        require(initial_creation or record['state_identity'] == identity(state_entry),
+                'state directory was not held or was replaced; remove without state before preparing again')
     if state_flag and state_entry:
-        require(record.get('state_identity') == identity(state_entry), 'state directory was not held or was replaced')
+        require(record['state_identity'] == identity(state_entry), 'state directory was not held or was replaced')
 
     # The root is dedicated, but unit files live in a shared tree. Require engine ownership and independent
     # exact path/type/target checks there. Missing entries are permitted for retries of interrupted cleanup.
@@ -199,9 +207,10 @@ def main(mode, build, state_flag):
     for leaf in ('verified', 'ownership.prepared.sha256'):
         if info(save / leaf):
             regular(save / leaf, operator, 0o600)
-    if mode == 'claim':
+    if mode in ('claim', 'claim-initial'):
         require(target_entry is not None, 'prepared build is missing')
-        save_marker(marker, dict(record, build_identity=identity(target_entry), state_identity=identity(state_entry)))
+        if 'build_identity' not in record:
+            save_marker(marker, dict(record, build_identity=identity(target_entry), state_identity=identity(state_entry)))
     if mode == 'removing':
         save_marker(marker, dict(record, removing=True, build_identity=identity(target_entry) if target_entry else record.get('build_identity')))
     if mode in ('remove', 'deactivate', 'recheck'):

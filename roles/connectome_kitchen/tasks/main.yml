@@ -265,7 +265,7 @@
   ansible.builtin.command:
     argv: "{{ ck_first_script + ['hold', connectome_kitchen_build] }}"
   environment: "{{ ck_first_env }}"
-  changed_when: "'already held' not in ck_first_holds.stdout"
+  changed_when: "(ck_first_holds.stdout_lines[-1] | default('')).startswith('first: held:')"
   failed_when: false
   register: ck_first_holds
   when: connectome_kitchen_operation == 'prepare' and ck_first
@@ -291,7 +291,7 @@
 
 - name: Record the prepared build and state directory identities
   ansible.builtin.command:
-    argv: "{{ ck_first_script + ['claim', connectome_kitchen_build] }}"
+    argv: "{{ ck_first_script + ['claim-initial' if ck_first_holds is changed else 'claim', connectome_kitchen_build] }}"
   environment: "{{ ck_first_env }}"
   changed_when: false
   when: ck_first and connectome_kitchen_operation == 'prepare'

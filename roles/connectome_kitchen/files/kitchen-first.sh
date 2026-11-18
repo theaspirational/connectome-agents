@@ -12,7 +12,7 @@ SAVE=$KITCHEN_SAVE; STATE=${KITCHEN_STATE_DIR:-}
 read -r -a AS <<<"${KITCHEN_AS_ACCOUNT:-}"
 MODE=${1:-}; BUILD=${2:-}
 HEX='^[a-f0-9]{64}$'
-USAGE="usage: kitchen-first.sh hold BUILD|nothing|runs BUILD|mark BUILD WORD WORD|held BUILD|claim BUILD|scope|deactivate BUILD|remove BUILD [state]"
+USAGE="usage: kitchen-first.sh hold BUILD|nothing|runs BUILD|mark BUILD WORD WORD|held BUILD|claim BUILD|claim-initial BUILD|scope|deactivate BUILD|remove BUILD [state]"
 
 say() { printf 'first: %s\n' "$*"; }
 refuse() { say "REFUSED, nothing changed: $*"; exit 60; }
@@ -23,16 +23,21 @@ prop() { sc show -p "$1" --value $U 2>/dev/null; }
 case "$MODE" in
   nothing|scope) [ $# -eq 1 ] || refuse "$USAGE" ;;
   remove) [[ $BUILD =~ $HEX ]] && { [ $# -eq 2 ] || { [ $# -eq 3 ] && [ "$3" = state ]; }; } || refuse "$USAGE" ;;
-  hold|runs|held|claim|deactivate) [ $# -eq 2 ] && [[ $BUILD =~ $HEX ]] || refuse "$USAGE" ;;
+  hold|runs|held|claim|claim-initial|deactivate) [ $# -eq 2 ] && [[ $BUILD =~ $HEX ]] || refuse "$USAGE" ;;
   mark) [ $# -eq 4 ] && [[ $BUILD =~ $HEX ]] && [[ $3 =~ ^[A-Za-z-]+$ ]] && [[ $4 =~ ^[A-Za-z-]+$ ]] || refuse "$USAGE" ;;
   *) refuse "$USAGE" ;;
 esac
 [[ $NAME =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || refuse "KITCHEN_NAME is not the name of a deployment"
 [ "$(id -u)" = "$KITCHEN_OPERATOR_UID" ] || refuse "run it as the operator (uid $KITCHEN_OPERATOR_UID)"
 [ "$(id -u "$KITCHEN_ACCOUNT" 2>/dev/null)" = "$KITCHEN_UID" ] || refuse "$KITCHEN_ACCOUNT is not uid $KITCHEN_UID on this host"
+cleanup_started=false
+incomplete() { say "$*. Cleanup is incomplete; correct the cause and retry. Exit 62."; exit 62; }
 check() {
   local reply
-  reply=$(/usr/bin/python3 -I "${BASH_SOURCE[0]%/*}/kitchen-first-scope.py" "$1" "$BUILD" "${STATE_FLAG:-}") || refuse "$reply"
+  reply=$(/usr/bin/python3 -I "${BASH_SOURCE[0]%/*}/kitchen-first-scope.py" "$1" "$BUILD" "${STATE_FLAG:-}") || {
+    if $cleanup_started; then incomplete "VALIDATION FAILED: $reply"; fi
+    refuse "$reply"
+  }
   CHECK=$reply
 }
 check scope
@@ -110,8 +115,8 @@ if [ "$MODE" = hold ]; then
   exit 0
 fi
 
-if [ "$MODE" = claim ]; then
-  check claim
+if [ "$MODE" = claim ] || [ "$MODE" = claim-initial ]; then
+  check "$MODE"
   exit 0
 fi
 
@@ -153,8 +158,13 @@ fi
 # Recheck after stopping (which may take time) and before recurring into a deletion scope.
 # A stop failure must not prevent removing boot links that we know we own.
 where
-step() { say "step: $*"; "$@" || { say "STEP FAILED: $*. Removal is incomplete; correct the cause and retry. Exit 62."; exit 62; }; }
+step() {
+  cleanup_started=true
+  say "step: $*"
+  "$@" || incomplete "STEP FAILED: $*"
+}
 if { [ -n "$FRAGMENT" ] && there "$UD/$U"; } || ! down; then
+  cleanup_started=true
   say "step: sc stop $U"; sc stop "$U" 2>/dev/null
 fi
 check recheck
