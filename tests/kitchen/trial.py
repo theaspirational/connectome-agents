@@ -217,7 +217,8 @@ def main():
     world.node, world.own_name = node, True
     expected = world.request_id()
     ok('name: exit 0 and a build name', status == 0 and len(new) == 64, out)
-    ok('name: the adapter contract of this kitchen is kitchen-cook-adapter/2', world.contract == 'kitchen-cook-adapter/2', world.contract)
+    # /2 is kitchen 85804c7 (cook 1b874d9), /3 kitchen 5390674 (cook 33ca463): the name below is held with the word the kitchen states.
+    ok('name: the adapter contract of this kitchen is %s, one this trial knows (/2 or /3)' % world.contract, world.contract in ('kitchen-cook-adapter/2', 'kitchen-cook-adapter/3'), world.contract)
     ok('name: it is the oracle\'s formula over this request with that word (%s), and not the running build\'s' % new[:8], new == expected and new != old, (new, expected))
     variables['connectome_kitchen_build'] = new
     build = root / 'builds' / new
