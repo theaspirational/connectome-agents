@@ -3,7 +3,7 @@
 runtime:
   connectome-host: cef933981dc0699fc00e5189b129d854ff8d43f6
   agent-framework: aa134e75fc19bc8cb3b73cb1ec53465dd9cf5c91
-  cook: 1b874d9dd55b529486b8029dd9814a6c0e2147e0
+  cook: 33ca46392867c7ca0841786cadb522b561f87ab6
 connectors:
   slack-mcpl:
     archive: inputs/slack-mcpl.tar.gz

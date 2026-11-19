@@ -114,7 +114,9 @@ also reside under this agent's root. Existing `cook.host_dependencies` hash and
 package-identity checks still apply. Existing `runtime` full-commit pins still
 bind cook/host/framework. The role copies the cook and host checkouts into the build before executing
 code from them; links/special files are refused. The reviewed cook source-tree
-check is performed on that staged copy. The operator-supplied role/Python adapter
+check is performed on that staged copy. Cook refuses a local host path (here the
+staged `<build>/host-source`) containing whitespace, quotes, backslash, `%`, `*`
+or control characters; see [lock contract](lock-contract.md). The operator-supplied role/Python adapter
 bootstrap remains a trusted control-plane prerequisite, not catalog code.
 
 The catalog adapter command only needs `--spec`, `--out`, `--state`, and

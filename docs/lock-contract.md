@@ -1,9 +1,9 @@
 # Lock v2 contract and cook boundary
 
 Source inspected offline: [the public cook fork](https://github.com/theaspirational/connectome-cook),
-commit `1b874d9dd55b529486b8029dd9814a6c0e2147e0` (published fork main, including the
-`source.external` change; tree `f0ab52570f5ff89cca89e6a36d9995c8cddf0aa9`). In particular: `src/lockfile.ts`, `src/cli.ts`,
-`src/backends/host.ts`, `src/source-detector.ts`, and the engine/layout/unit/dependency documentation.
+commit `33ca46392867c7ca0841786cadb522b561f87ab6` (published fork main, including the
+`source.external` change; tree `e2d33886b960ac57023bf75bb5d9dbf5be710386`). In particular: `src/lockfile.ts`, `src/cli.ts`,
+`src/backends/host.ts`, `src/source-detector.ts`, `src/source-url.ts`, and the engine/layout/unit/dependency documentation.
 This is a source compatibility target, **not** a claim of a completed live-host
 qualification. The offline real-cook test reports whether prerequisites let it run.
 
@@ -94,6 +94,15 @@ cook:
     sha256: REPLACE_WITH_REVIEWED_ARCHIVE_SHA256
   connector_state: {}
 ```
+
+`host_repo` may also be an absolute local repository path. Cook at the pinned
+commit grants only that exact path (and its `.git`) as `safe.directory` to
+`upload-pack` for clone, fetch and `ls-remote`, never `*`, and **refuses**
+(`E_LOCAL_SOURCE_PATH`) an absolute local source path containing whitespace,
+quotes, backslash, `%`, `*` or control characters. The adapter does not
+pre-check this; such a path fails in cook as `E_COOK_FAILED`. In catalog mode the
+path cook sees is the staged `<build>/host-source` copy, so the build directory
+is subject to the same restriction.
 
 The framework archive must be a cook-compatible **local** gzip/ustar npm archive,
 pinned by the required SHA-256. When `package.json` contains `gitHead`, it must
@@ -222,18 +231,18 @@ legacy-only gitHead builds keep their documented sidecar compatibility.
 
 The role preserves cook's install script policy; it does not invoke a separate
 package installer, `npm pack`, or archive lifecycle/build command. In this
-adapter cook runs the selected Bun executable as `bun install` for the host
-checkout. It does **not** pass a global `--ignore-scripts`: host/root lifecycle
-scripts and Bun's ordinarily trusted/default-trusted transitive dependencies
-remain subject to Bun's existing policy. Do not treat the host pin as untrusted
-code or infer that all scripts are blocked.
+adapter cook runs the selected Bun executable as `bun install --ignore-scripts`
+for the host checkout (always, at the pinned commit): no host/root
+`preinstall`/`install`/`postinstall`/`prepare` script and no trusted or
+default-trusted dependency lifecycle script runs during that install. This
+covers only the host `bun install`; recipe component installs and connector
+`build` commands are unchanged. Do not treat the host pin as untrusted code: its
+code still runs as the agent.
 
-For each selected local input cook refuses a host `trustedDependencies` entry
-naming that input (`E_HOST_DEPENDENCY_TRUSTED`) before host installation; malformed
-trust lists also refuse. For other inputs Bun applies its existing trust rules:
-untrusted packages' lifecycle scripts remain blocked, while Bun's default trust
-policy is not replaced. The real-cook synthetic packages exercise a blocked
-postinstall marker and a trusted-input refusal. Connector descriptor `build`
+For each selected local input cook still refuses a host `trustedDependencies`
+entry naming that input (`E_HOST_DEPENDENCY_TRUSTED`) before host installation;
+malformed trust lists also refuse. The real-cook synthetic packages exercise a
+blocked postinstall marker and a trusted-input refusal. Connector descriptor `build`
 argv are still quoted into cook's explicit custom shell build commands: they
 are trusted operator code, not archive lifecycle opt-ins.
 
