@@ -85,7 +85,8 @@ class Files(unittest.TestCase):
         first = next(task for task in main if task['name'] == 'Refuse an unusable invocation before anything is read')['ansible.builtin.assert']['that']
         # No live build with it, a live build without it; no rollback and no clear with it; remove only with it.
         for line in ("connectome_kitchen_live_build is match('^[0-9a-f]{64}$') or (connectome_kitchen_first_install | bool)", "connectome_kitchen_live_build == '' or not (connectome_kitchen_first_install | bool)",
-                     "not (connectome_kitchen_first_install | bool) or connectome_kitchen_operation not in ['rollback', 'clear']", "connectome_kitchen_operation in ['name', 'plan'] or connectome_kitchen_build != ''"):
+                     "not (connectome_kitchen_first_install | bool) or connectome_kitchen_operation not in ['rollback', 'clear']", "connectome_kitchen_operation in ['name', 'plan'] or connectome_kitchen_build != ''",
+                     "(connectome_kitchen_agreed_drift | length) == 0 or not (connectome_kitchen_first_install | bool)"):
             self.assertIn(line, first)
         defaults = yaml.safe_load((ROLE / 'defaults/main.yml').read_text())
         self.assertEqual((defaults['connectome_kitchen_first_install'], defaults['connectome_kitchen_operator_word']), (False, ''))
@@ -153,7 +154,8 @@ class Files(unittest.TestCase):
         environment.filters['combine'] = lambda first, second: {**first, **second}
         environment.tests['match'] = lambda value, pattern: __import__('re').match(pattern, value) is not None  # as ansible.builtin.match
         main = yaml.safe_load((ROLE / 'tasks/main.yml').read_text())
-        shape = next(line for line in next(task for task in main if task['name'] == 'Refuse an unusable invocation before anything is read')['ansible.builtin.assert']['that'] if 'connectome_kitchen_agreed_drift' in line)
+        that = next(task for task in main if task['name'] == 'Refuse an unusable invocation before anything is read')['ansible.builtin.assert']['that']
+        shape = next(line for line in that if 'connectome_kitchen_agreed_drift is sequence' in line)
         held = lambda value: environment.from_string('{{ ' + shape + ' }}').render(connectome_kitchen_agreed_drift=value) == 'True'
         good = {'path': 'cook-recipe.json', 'sha256': 'c' * 64}
         self.assertTrue(held([]))
@@ -161,6 +163,11 @@ class Files(unittest.TestCase):
         for bad in ('cook-recipe.json', {'path': 'cook-recipe.json', 'sha256': 'c' * 64}, [good['path']], [{'path': 'cook-recipe.json'}], [{**good, 'locked': 'd' * 64}],
                     [{**good, 'sha256': 'C' * 64}], [{**good, 'sha256': 'c' * 63}], [{**good, 'path': 7}], [good, 'x']):
             self.assertFalse(held(bad), bad)
+        # A first install has no running build to agree a drift of: any nonempty list is refused with it, before anything is read.
+        first = next(line for line in that if 'connectome_kitchen_agreed_drift' in line and 'connectome_kitchen_first_install' in line)
+        alone = lambda value, install: environment.from_string('{{ ' + first + ' }}').render(connectome_kitchen_agreed_drift=value, connectome_kitchen_first_install=install) == 'True'
+        environment.filters['bool'] = bool
+        self.assertEqual([alone([], False), alone([good], False), alone([], True), alone([good], True)], [True, True, True, False])
         # The request: no key at all without a drift, the live build and the files with one.
         request = yaml.safe_load((ROLE / 'tasks/request.yml').read_text())
         task = next(task for task in request if 'agreed' in task['name'])

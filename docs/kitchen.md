@@ -78,6 +78,11 @@ metadata and symlink targets. Prepare and verify can refuse on a concurrent chan
 The comparison `verify` makes (`files/kitchen-inspect.py`) is unchanged and shows the edited recipe as it is.
 With an empty list (the default) the role omits the key; the runner rejects explicit JSON `null`.
 
+A first install has no running build, so it has nothing to agree a drift of: with `connectome_kitchen_first_install`
+a nonempty `connectome_kitchen_agreed_drift` is refused as an unusable invocation, before anything is read or written.
+Kitchen holds the same: its runner refuses any `agreed_drift` key where `expect.live_build` is `null`, in every mode,
+before the record is read and before its log is opened; its engine refuses one where there is no `current`.
+
 ## What the role keeps, and what kitchen owns
 
 | Kept in Ansible | Why |
@@ -233,7 +238,7 @@ nothing: no deployment root contents, no unit, no build, nothing running. It nee
 `expect.live_build: null` (the commit after `e62b4cf` that adds the first install). The account, its linger, its
 secrets file, the state directory and whatever the recipe's servers need are the operator's and are there before.
 The operations are `name`, `plan`, `prepare`, `verify`, `start`, `readback` and `remove`; `rollback` and `clear` are
-refused, since there is nothing to go back to. Everything of a takeover that is held against a running build has
+refused, since there is nothing to go back to, and so is an agreed drift (there is no running build to drift). Everything of a takeover that is held against a running build has
 another thing in its place:
 
 | Operation | A takeover | A first install |

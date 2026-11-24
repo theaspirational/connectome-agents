@@ -75,6 +75,7 @@ connectome_kitchen_operator_word: ""
 # `cook-recipe.json` is one). What was agreed (path, locked and actual digest) is written to
 # <save dir>/agreed-drift.<build>.json and to the receipt of kitchen's plan before `prepare` builds anything.
 # Empty: the request has no agreed drift at all, and nothing differs. Not a switch: nothing else is accepted by it.
+# A first install has no running build: with connectome_kitchen_first_install it must stay empty, or nothing is read.
 #   connectome_kitchen_agreed_drift:
 #     - {path: cook-recipe.json, sha256: <64 hex of the bytes the running build has now>}
 connectome_kitchen_agreed_drift: []

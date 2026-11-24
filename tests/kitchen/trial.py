@@ -98,6 +98,8 @@ def main():
     parser.add_argument('--connected', action='append', default=[], help='an MCP server whose journal line must say connected at readback')
     parser.add_argument('--node', default=shutil.which('node'))
     args = parser.parse_args()
+    if args.soma_drift and args.scenario == 'first-install':
+        parser.error('--soma-drift is a drift of a running build; a first install has none')
     kitchen, scratch, node = Path(args.kitchen).resolve(), Path(args.scratch).resolve(), args.node
     sys.dont_write_bytecode = True
     sys.path[:0] = [str(kitchen / 'test/corpus'), str(kitchen / 'test/differential')]
@@ -561,6 +563,12 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
 
     status, out = op('name', connectome_kitchen_live_build='f' * 64)
     ok('a first install that names a live build: refused before anything is read', status != 0 and 'Unusable connectome_kitchen invocation' in out and not root.exists(), out)
+    # An agreed drift is of a running build; a first install has none. Refused by the role before anything is read.
+    drift = [{'path': 'cook-recipe.json', 'sha256': 'c' * 64}]
+    request_file = home / 'kitchen-takeover' / name / 'inputs/request.json'
+    status, out = op('name', connectome_kitchen_agreed_drift=drift)
+    ok('a first install with an agreed drift: name refused before anything is read or written', status != 0 and 'Unusable connectome_kitchen invocation' in out
+       and not root.exists() and not request_file.exists() and nothing(), out)
     status, out = op('name')
     line = next((line for line in out.splitlines() if 'connectome_kitchen_build: ' in line), '')
     new = line.split('connectome_kitchen_build: ')[1].strip(' ",') if line else ''
@@ -608,6 +616,9 @@ def first_install(args, corpus, world, op, sc, show, calls, cooked, variables, j
     (root / 'systemctl-calls').unlink(missing_ok=True)
     root.rmdir()
 
+    status, out = op('prepare', connectome_kitchen_agreed_drift=drift)
+    ok('a first install with an agreed drift: prepare refused before anything is held, cooked or saved', status != 0 and 'Unusable connectome_kitchen invocation' in out
+       and not root.exists() and not (save / 'first-install').exists() and not build.exists() and not list(save.glob('agreed-drift.*')) and nothing() and calls() == [], out)
     status, out = op('prepare')
     ok('prepare: exit 0, the build is prepared', status == 0 and (build / '.prepared').is_file() and (build / '.prepared').read_text() == new, out)
     ok('prepare: nothing is installed and nothing was asked of the service manager but questions', nothing() and calls() == [], (four(), calls()))

@@ -25,6 +25,7 @@
       - (connectome_kitchen_account_uid | string) is match('^[1-9][0-9]*$')
       - connectome_kitchen_live_build is match('^[0-9a-f]{64}$') or (connectome_kitchen_first_install | bool)
       - connectome_kitchen_live_build == '' or not (connectome_kitchen_first_install | bool)
+      - (connectome_kitchen_agreed_drift | length) == 0 or not (connectome_kitchen_first_install | bool)
       - connectome_kitchen_build == '' or connectome_kitchen_build is match('^[0-9a-f]{64}$')
       - connectome_kitchen_build == '' or connectome_kitchen_build != connectome_kitchen_live_build
       - connectome_kitchen_operation in ['name', 'plan'] or connectome_kitchen_build != ''
@@ -35,7 +36,7 @@
       - connectome_kitchen_secret_files_new is sequence and connectome_kitchen_secret_files_new is not string
       - connectome_kitchen_secret_files_new | reject('match', '^[A-Z_][A-Z0-9_]*$') | list | length == 0
       - "connectome_kitchen_agreed_drift is sequence and connectome_kitchen_agreed_drift is not string and connectome_kitchen_agreed_drift is not mapping and (connectome_kitchen_agreed_drift | reject('mapping') | list | length) == 0 and (connectome_kitchen_agreed_drift | map('dict2items') | map('map', attribute='key') | map('sort') | map('join', ' ') | reject('equalto', 'path sha256') | list | length) == 0 and (connectome_kitchen_agreed_drift | map(attribute='path') | reject('string') | list | length) == 0 and (connectome_kitchen_agreed_drift | map(attribute='sha256') | map('string') | reject('match', '^[0-9a-f]{64}$') | list | length) == 0"
-    fail_msg: "Unusable connectome_kitchen invocation. One operation (name, plan, prepare, verify, start, rollback, readback, clear) on one agent, on the host of the agent, not in check mode (plan is the dry run), with the kitchen install, its commit, the Node, the account with its home and uid, a save directory outside that home, the live build and (but for name and plan) the build this request must give. A first install (connectome_kitchen_first_install) names no live build, has remove in place of rollback and clear, and is the only place for remove. An agreed drift, if any, is a list of {path, sha256} (64 hex). Nothing was changed."
+    fail_msg: "Unusable connectome_kitchen invocation. One operation (name, plan, prepare, verify, start, rollback, readback, clear) on one agent, on the host of the agent, not in check mode (plan is the dry run), with the kitchen install, its commit, the Node, the account with its home and uid, a save directory outside that home, the live build and (but for name and plan) the build this request must give. A first install (connectome_kitchen_first_install) names no live build and no agreed drift, has remove in place of rollback and clear, and is the only place for remove. An agreed drift, if any, is a list of {path, sha256} (64 hex). Nothing was changed."
 
 - name: Name what the operation works on
   ansible.builtin.set_fact:
