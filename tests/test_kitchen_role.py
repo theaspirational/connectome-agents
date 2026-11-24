@@ -138,6 +138,52 @@ class Files(unittest.TestCase):
         for text in ('## A first install', '| `remove` |', 'connectome_kitchen_first_install', 'connectome_kitchen_operator_word', 'connectome_kitchen_remove_state', 'FIRST-START', 'REMOVE'):
             self.assertIn(text, doc)
 
+    def test_agreed_drift_is_one_optional_input_and_no_switch(self):
+        """The agreed drift of the running build: a list that is empty by default, held to its shape before anything is
+        read, put in the request only when it is given, held by kitchen's check and kept in the save before prepare."""
+        try:
+            import jinja2
+        except ImportError:
+            self.skipTest('no jinja2 here; tests/kitchen/trial.py holds the role through ansible-playbook')
+        defaults = yaml.safe_load((ROLE / 'defaults/main.yml').read_text())
+        self.assertEqual(defaults['connectome_kitchen_agreed_drift'], [])
+        self.assertFalse([key for key in defaults if 'drift' in key and key != 'connectome_kitchen_agreed_drift'])
+        environment = jinja2.Environment()
+        environment.filters['dict2items'] = lambda record: [{'key': key, 'value': value} for key, value in record.items()]
+        environment.filters['combine'] = lambda first, second: {**first, **second}
+        environment.tests['match'] = lambda value, pattern: __import__('re').match(pattern, value) is not None  # as ansible.builtin.match
+        main = yaml.safe_load((ROLE / 'tasks/main.yml').read_text())
+        shape = next(line for line in next(task for task in main if task['name'] == 'Refuse an unusable invocation before anything is read')['ansible.builtin.assert']['that'] if 'connectome_kitchen_agreed_drift' in line)
+        held = lambda value: environment.from_string('{{ ' + shape + ' }}').render(connectome_kitchen_agreed_drift=value) == 'True'
+        good = {'path': 'cook-recipe.json', 'sha256': 'c' * 64}
+        self.assertTrue(held([]))
+        self.assertTrue(held([good]))
+        for bad in ('cook-recipe.json', {'path': 'cook-recipe.json', 'sha256': 'c' * 64}, [good['path']], [{'path': 'cook-recipe.json'}], [{**good, 'locked': 'd' * 64}],
+                    [{**good, 'sha256': 'C' * 64}], [{**good, 'sha256': 'c' * 63}], [{**good, 'path': 7}], [good, 'x']):
+            self.assertFalse(held(bad), bad)
+        # The request: no key at all without a drift, the live build and the files with one.
+        request = yaml.safe_load((ROLE / 'tasks/request.yml').read_text())
+        task = next(task for task in request if 'agreed' in task['name'])
+        self.assertEqual(task['when'], '(connectome_kitchen_agreed_drift | length) > 0')
+        document = {'schema': 'connectome.kitchen-takeover/v1', 'expect': {'live_build': OLD}}
+        expression = task['ansible.builtin.set_fact']['ck_document']
+        self.assertTrue(expression.startswith('{{ ') and expression.endswith(' }}'))
+        worded = environment.from_string('{{ (' + expression[3:-3] + ') | tojson }}').render(ck_document=document, connectome_kitchen_live_build=OLD, connectome_kitchen_agreed_drift=[good])
+        self.assertEqual(json.loads(worded), {**document, 'agreed_drift': {'build': OLD, 'files': [good]}})
+        # prepare: kitchen's check first, then what it agreed in the save, then the prepare; for prepare with a drift only.
+        names = [task['name'] for task in main]
+        order = [names.index(name) for name in ('Keep what rollback needs (the links, the drop-in, ownership.json)', 'Hold the running build to the agreed drift (kitchen check; nothing is written but the runner\'s log)',
+                                                'Refuse unless kitchen agreed exactly the declared drift of the running build', 'Keep what kitchen agreed (path, locked and actual digest), before anything is prepared',
+                                                'Run kitchen (check, prepare or verify)')]
+        self.assertEqual(order, sorted(order))
+        for index in order[1:4]:
+            self.assertEqual(main[index]['when'], "connectome_kitchen_operation == 'prepare' and (connectome_kitchen_agreed_drift | length) > 0")
+        self.assertEqual(main[order[1]]['vars'], {'ck_mode': 'check'})
+        kept = main[order[3]]['ansible.builtin.copy']
+        self.assertEqual((kept['dest'], kept['mode']), ('{{ connectome_kitchen_save_dir }}/agreed-drift.{{ connectome_kitchen_build }}.json', '0600'))
+        # The runner's line of what was declared is one the step helper shows.
+        self.assertIn("'agreed drift'", (ROLE / 'files/kitchen-step.py').read_text())
+
     def test_engines_from_the_cook_command(self):
         plugin = load(ROLE / 'filter_plugins/connectome_kitchen.py', 'kitchen_filter')
         argv = ['/usr/bin/python3', '/x/cook-adapter.py', '--runtime', '/b/bun', '--entrypoint', '/c/bin/cook', '--bun-path', '/b/bun', '--node-path', '/n/node', '--spec', '{recipe}']

@@ -18,7 +18,7 @@ Exit status 0 when the runner could be started and ended, whatever its own statu
 """
 import json, subprocess, sys
 
-SHOWN = ('plan answered', 'apply answered', 'engine refused', 'build named', 'tool started', 'tool failed', 'tool refused', 'secrets file', 'running deployment', 'end')
+SHOWN = ('agreed drift', 'plan answered', 'apply answered', 'engine refused', 'build named', 'tool started', 'tool failed', 'tool refused', 'secrets file', 'running deployment', 'end')
 MEANING = {0: 'done', 1: 'the engine refused; the line above says why', 2: 'not a contract request', 3: 'the runner refused; the last line says why',
            124: 'no answer within the time given; the runner was stopped', 137: 'no answer within the time given; the runner was killed'}
 

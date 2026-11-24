@@ -68,6 +68,17 @@ connectome_kitchen_first_install: false
 #   remove:  -e connectome_kitchen_operator_word="REMOVE <name> <UTC time, YYYY-MM-DDTHH:MMZ>"
 connectome_kitchen_operator_word: ""
 
+# An agreed drift of the running build (connectome_kitchen_live_build): files of that build whose bytes were changed by
+# hand after it was cooked, each with the sha256 they are agreed to have now. Kitchen then holds the running build to
+# exactly these bytes in place of the ones its lock recorded, and to its lock in everything else; it refuses a file
+# that is not its agreed digest, a declared file that did not drift, and a file it does not hold to a digest (only
+# `cook-recipe.json` is one). What was agreed (path, locked and actual digest) is written to
+# <save dir>/agreed-drift.<build>.json and to the receipt of kitchen's plan before `prepare` builds anything.
+# Empty: the request has no agreed drift at all, and nothing differs. Not a switch: nothing else is accepted by it.
+#   connectome_kitchen_agreed_drift:
+#     - {path: cook-recipe.json, sha256: <64 hex of the bytes the running build has now>}
+connectome_kitchen_agreed_drift: []
+
 # Where `prepare` keeps what `rollback` needs. The operator's, mode 0700, outside the home of the account.
 connectome_kitchen_save_dir: "/var/lib/connectome-kitchen/save/{{ connectome_agent.name }}"
 

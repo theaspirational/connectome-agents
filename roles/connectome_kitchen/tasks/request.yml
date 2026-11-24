@@ -51,3 +51,9 @@
         request_id: "{{ connectome_kitchen_build if connectome_kitchen_build != '' else '0' * 64 }}"
         # A first install names no live build: null tells the runner that nothing is deployed.
         live_build: "{{ none if (connectome_kitchen_first_install | bool) else connectome_kitchen_live_build }}"
+
+# Only where the operator gives one: without it the document has no such key and is the one it always was.
+- name: Add the agreed drift of the running build to the request
+  ansible.builtin.set_fact:
+    ck_document: "{{ ck_document | combine({'agreed_drift': {'build': connectome_kitchen_live_build, 'files': connectome_kitchen_agreed_drift}}) }}"
+  when: (connectome_kitchen_agreed_drift | length) > 0

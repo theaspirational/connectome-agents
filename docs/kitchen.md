@@ -25,7 +25,7 @@ One run is one operation: `-e connectome_kitchen_operation=<name>`. Ansible's ch
 | --- | --- | --- | --- |
 | `name` | `plan` through `files/kitchen-name.mjs` | the request and the recipe copy in the account's `kitchen-takeover/<name>/inputs` | no |
 | `plan` | runner `check` | the same, and the runner's log and receipt | no |
-| `prepare` | runner `prepare` (`apply`, phase prepare: cook) | the save for `rollback`; the new build beside the running one; one entry of `state/ownership.json` | no |
+| `prepare` | runner `prepare` (`apply`, phase prepare: cook); with an agreed drift, runner `check` first | the save for `rollback` (and, with an agreed drift, what kitchen agreed); the new build beside the running one; one entry of `state/ownership.json` | no |
 | `verify` | runner `verify` | the log; the comparison and the baseline in the save directory | no |
 | `start` | runner `verify`, then `start` (`apply`, both phases) | the environment file, `current`, the unit links, the drop-in | **once** |
 | `rollback` | none (`files/kitchen-pointers.sh back`) | `current`, the unit links, the drop-in, `state/ownership.json`, from the save | **once** (stop, start) |
@@ -40,6 +40,39 @@ that was looked at cannot be built or started under these pins.
 
 These are the operations on an agent that runs: a takeover. An agent that does not exist yet is installed by the same
 operations with `connectome_kitchen_first_install` and no live build: see [A first install](#a-first-install).
+
+## An agreed drift of the running build
+
+A build that runs is read again by kitchen whenever a new one is prepared or started beside it, and its installed
+recipe (`builds/<live>/cook-recipe.json`) must still be the bytes its lock and its `deployment.json` recorded. Where
+that file was edited by hand after cook, `prepare` is refused (`E_LOCK_INVALID`, "invalid operator recipe
+provenance"). Do not put the old bytes back and do not look for a way around the check; name the edit:
+
+```yaml
+connectome_kitchen_agreed_drift:
+  - {path: cook-recipe.json, sha256: <sha256 of the bytes builds/<live>/cook-recipe.json has now>}
+```
+
+The role puts it in the request as `agreed_drift` with `connectome_kitchen_live_build` as its build, and the same list
+is handed to every operation of the window that reaches kitchen (`plan`, `prepare`, `verify`, `start`, and `name`).
+Kitchen (`src/drift.ts`; a kitchen install without it refuses the key, so `connectome_kitchen_commit` must name one that has it) then reads the running build with
+the agreed digest in place of the recorded one for exactly the files named, and as before in everything else. It refuses:
+a file whose bytes are not exactly the agreed digest; a declared drift that is not there (the bytes are the recorded
+ones, or the agreed digest is the recorded one); a path that is not a file it holds to a digest, which today is
+`cook-recipe.json` alone (an absolute path, `..`, a subdirectory, the app, `connectome.lock`, a unit file: all
+refused); any other difference it checks (the lock's own digest, a unit's digest, the mode and owner of the recipe);
+and a drift of any build but the one `current` names. The new build is never read against it.
+
+`prepare` with a drift first runs kitchen's `check`, which holds the running build to it and writes nothing but the
+runner's log and receipt, then keeps what kitchen agreed in `<save dir>/agreed-drift.<build>.json` (operator, 0600):
+`{build, files: [{path, locked_sha256, actual_sha256}]}`. Only then is the build made; its own `plan` and `apply`
+hold the drift again and carry the same record in their receipts. What it does not cover: files kitchen does not hold
+to a digest of the build (the `outputs` digests of the lock, the app with an uncommitted patch, files added to the
+app that no lock names, `framework.lock.json`) do not refuse in the first place and cannot be named: a host bridge
+patched into `app/` needs no entry, and the recipe entry is all a build with both drifts needs (kitchen's tests run a
+window with both); the comparison `verify` makes (`files/kitchen-inspect.py`) is
+not changed and shows the edited recipe as it is. Empty (the default), the request has no such key and nothing differs.
+There is no switch that accepts anything else.
 
 ## What the role keeps, and what kitchen owns
 

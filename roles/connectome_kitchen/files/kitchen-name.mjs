@@ -44,7 +44,10 @@ export async function name(home, file, options = {}) {
   if (recipe !== null) request.set('operator_files', new Map([['cook-recipe.json', fs.readFileSync(recipe.get('source')).toString('base64')]]));
   // `plan` starts nothing. Whatever it would start is refused here.
   const run = argv => { throw new Error('kitchen-name starts no tool: ' + String(argv[0])); };
-  const [receipt, status] = dispatch(dict({ contract: 'connectome.kitchen/v1', command: 'plan', request }), null, { ...options, run });
+  // An agreed drift of the running build (kitchen src/drift.ts) is handed over as the runner hands it: after a prepare,
+  // `plan` reads the running build too. Without the key nothing is handed over.
+  const drift = input.has('agreed_drift') ? { agreed_drift: input.get('agreed_drift') } : {};
+  const [receipt, status] = dispatch(dict({ contract: 'connectome.kitchen/v1', command: 'plan', request }), null, { ...options, ...drift, run });
   const core = JSON.parse(canonical(receipt.get('core')));
   const directory = core.prepare?.build_dir ?? null;
   return [status === 0 ? 0 : 1, JSON.stringify({ status, build: directory === null ? null : path.basename(directory), build_dir: directory, core })];
