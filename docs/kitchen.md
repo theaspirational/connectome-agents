@@ -53,26 +53,30 @@ connectome_kitchen_agreed_drift:
   - {path: cook-recipe.json, sha256: <sha256 of the bytes builds/<live>/cook-recipe.json has now>}
 ```
 
-The role puts it in the request as `agreed_drift` with `connectome_kitchen_live_build` as its build, and the same list
-is handed to every operation of the window that reaches kitchen (`plan`, `prepare`, `verify`, `start`, and `name`).
+The role puts it in the request as `agreed_drift` with `connectome_kitchen_live_build` as its build, and hands it to
+kitchen for `name`, `plan`, `prepare`, `verify`, and `start` before the switch. The verify inside `start` after activation
+uses a request without the agreement: the old build is no longer current.
 Kitchen (`src/drift.ts`; a kitchen install without it refuses the key, so `connectome_kitchen_commit` must name one that has it) then reads the running build with
 the agreed digest in place of the recorded one for exactly the files named, and as before in everything else. It refuses:
 a file whose bytes are not exactly the agreed digest; a declared drift that is not there (the bytes are the recorded
-ones, or the agreed digest is the recorded one); a path that is not a file it holds to a digest, which today is
-`cook-recipe.json` alone (an absolute path, `..`, a subdirectory, the app, `connectome.lock`, a unit file: all
-refused); any other difference it checks (the lock's own digest, a unit's digest, the mode and owner of the recipe);
-and a drift of any build but the one `current` names. The new build is never read against it.
+ones, or the agreed digest is the recorded one); any path other than the exact name `cook-recipe.json`; and drift
+of any build but the one `current` names. The recipe digest recorded in `connectome.lock` must still match the
+one in the build's `deployment.json`; this is not a hash pin on `connectome.lock` itself. Kitchen still checks
+the recipe's mode and owner, explicit unit records against their digests, and framework sidecar contents. Unit
+records are not driftable. The new build is never read against the agreement.
 
 `prepare` with a drift first runs kitchen's `check`, which holds the running build to it and writes nothing but the
 runner's log and receipt, then keeps what kitchen agreed in `<save dir>/agreed-drift.<build>.json` (operator, 0600):
 `{build, files: [{path, locked_sha256, actual_sha256}]}`. Only then is the build made; its own `plan` and `apply`
-hold the drift again and carry the same record in their receipts. What it does not cover: files kitchen does not hold
-to a digest of the build (the `outputs` digests of the lock, the app with an uncommitted patch, files added to the
-app that no lock names, `framework.lock.json`) do not refuse in the first place and cannot be named: a host bridge
-patched into `app/` needs no entry, and the recipe entry is all a build with both drifts needs (kitchen's tests run a
-window with both); the comparison `verify` makes (`files/kitchen-inspect.py`) is
-not changed and shows the edited recipe as it is. Empty (the default), the request has no such key and nothing differs.
-There is no switch that accepts anything else.
+hold the drift again and carry the same record in their receipts.
+
+Lock `outputs` digests are checked for shape only, not compared with file contents. Stable, readable changes and
+additions in `app/` need no entry: kitchen does not compare them with historical or cook-time hashes. The runner
+does inventory the running build, including `app/`, before and after the operation, comparing paths, filesystem
+metadata and symlink targets. Prepare and verify can refuse on a concurrent change or an incomplete inventory
+(for example, an unreadable directory). A successful inventory comparison does not certify the build's contents.
+The comparison `verify` makes (`files/kitchen-inspect.py`) is unchanged and shows the edited recipe as it is.
+With an empty list (the default) the role omits the key; the runner rejects explicit JSON `null`.
 
 ## What the role keeps, and what kitchen owns
 
@@ -299,3 +303,15 @@ first start, `readback`, `remove`, the install again from nothing, a build that 
 `connectome_kitchen_auto_rollback`, and the removal with the state directory. `tests/kitchen/render.yml` words the request without a host,
 so that it can be held against a request that is known. Neither is part of `scripts/test.sh`: they need a built
 kitchen clone, ansible-core and Node.
+
+To exercise both incident drifts through the full window, use the trial's synthetic `example` case. Run with
+the Python of an ansible-core virtual environment (here at `.cache/ansible`) and a fresh scratch directory:
+
+```sh
+.cache/ansible/bin/python tests/kitchen/trial.py --kitchen .cache/kitchen --ansible .cache/ansible \
+  --scratch .cache/soma-trial --case example --scenario full --soma-drift
+```
+
+This case uses stand-in cook for the initial running build, prepare, and prepare after rollback. It first tests
+that a wrong recipe hash is refused without cooking or creating a build, then runs the full window with the
+exact agreement and the stable app patch in place. It does not use a live host.

@@ -2,7 +2,7 @@
 """Sandbox trial of roles/connectome_kitchen: every operation through ansible-playbook, on a case of kitchen's deploy corpus.
 
     trial.py --kitchen CLONE --ansible ANSIBLE_DIR --scratch DIR [--corpus DIR] --case NAME
-             [--scenario full|fail-start|short-lived|rotated-at-start|first-install]
+             [--scenario full|fail-start|short-lived|rotated-at-start|first-install] [--soma-drift]
              [--new-recipe FILE --expect-leaf POINTER ... --changed-leaf POINTER ... --lock-leaf POINTER ... --new-secret-file SECRET=ENV ...]
 
 Not part of `scripts/test.sh`: it needs a built kitchen clone (with its test harness), ansible-core and Node.
@@ -30,6 +30,9 @@ and cook is then the corpus stand-in, since a real lock can only be replayed for
 `--expect-leaf` names a leaf of the recipe that goes, `--changed-leaf` one that comes or changes, `--lock-leaf` a leaf of
 the lock that follows from them. `--new-secret-file` adds a secret file to the agent layer and a placeholder under its
 name to the sandbox's secrets file, after the running build was made: the running deployment then has no such file.
+`--soma-drift` models the incident in the sandbox: the installed recipe bytes change, four app files change against
+recorded output digests, and two unlisted app files are added. An incorrect agreement must refuse before any new cook
+or build, then the full scenario can proceed with the exact installed recipe digest.
 Prints one line a check; exit status 1 if one failed.
 """
 import argparse, copy, hashlib, json, os, shutil, subprocess, sys, time
@@ -45,6 +48,38 @@ def ok(label, held, detail=''):
     results.append(bool(held))
 
 
+def soma_drift(build):
+    """Make the two drifts with synthetic bytes and return the evidence expected from prepare."""
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    recipe = build / 'cook-recipe.json'
+    lock_file = build / 'connectome.lock'
+    lock = json.loads(lock_file.read_text())
+    locked = digest(recipe)
+    ok('drift fixture: the installed recipe starts at the recorded digest', locked == lock['recipe']['sha256'])
+    # Keep the same recipe data so the trial can still compare recipe leaves; the lock holds bytes, not data.
+    recipe.write_bytes(recipe.read_bytes() + b'\n')
+    actual = digest(recipe)
+    changed = ['app/src/headless.ts', 'app/src/modules/fleet-types.ts', 'app/package.json', 'app/bun.lock']
+    added = ['app/src/provider-wait-ipc.ts', 'app/scripts/provider-wait-ipc.mjs']
+    lock['outputs'] = [row for row in lock['outputs'] if row['path'] not in changed + added]
+    for name in changed:
+        path = build / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('cooked %s\n' % name)
+        lock['outputs'].append({'path': name, 'mode': 0o644, 'sha256': digest(path)})
+    lock_file.write_text(json.dumps(lock, sort_keys=True, indent=2) + '\n')
+    for name in changed + added:
+        path = build / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a' if name in changed else 'w') as stream:
+            stream.write('// synthetic host bridge\n')
+    patched = {name: digest(build / name) for name in changed + added}
+    recorded = {row['path']: row['sha256'] for row in lock['outputs']}
+    ok('drift fixture: recipe bytes and four recorded app outputs differ; two app files are unlisted',
+       actual != locked and all(recorded[name] != patched[name] for name in changed) and all(name not in recorded for name in added))
+    return {'build': build.name, 'files': [{'path': recipe.name, 'locked_sha256': locked, 'actual_sha256': actual}]}, {**patched, recipe.name: actual}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--kitchen', required=True)
@@ -53,6 +88,7 @@ def main():
     parser.add_argument('--corpus', help='a deploy corpus; default: the synthetic one of the clone')
     parser.add_argument('--case', required=True)
     parser.add_argument('--scenario', default='full', choices=('full', 'fail-start', 'short-lived', 'rotated-at-start', 'first-install'))
+    parser.add_argument('--soma-drift', action='store_true')
     parser.add_argument('--new-recipe')
     parser.add_argument('--expect-leaf', action='append', default=[])
     parser.add_argument('--changed-leaf', action='append', default=[])
@@ -185,6 +221,12 @@ def main():
     }
     if first:
         variables.update(connectome_kitchen_first_install=True, connectome_kitchen_recipe_present=args.changed_leaf)
+    running = root / 'builds' / old
+    if args.soma_drift:
+        drift_evidence, patched = soma_drift(running)
+        actual = drift_evidence['files'][0]['actual_sha256']
+        agreement = [{'path': 'cook-recipe.json', 'sha256': actual}]
+        variables['connectome_kitchen_agreed_drift'] = agreement
     play = scratch / 'play.yml'
     play.write_text('- hosts: localhost\n  connection: local\n  gather_facts: false\n  roles:\n    - role: %s\n' % (REPO / 'roles/connectome_kitchen'))
     ansible = Path(args.ansible).resolve()
@@ -226,10 +268,31 @@ def main():
                        and not path.startswith(str(sandbox / 'save')) and Path(path).name not in corpus.VOLATILE + ('fake-manager-calls', 'fake-manager.json')}
     ok('name: nothing of the deployment was written', changed() == set() and pointers() == before, sorted(changed())[:8])
 
+    save = sandbox / 'save'
+    if args.soma_drift:
+        evidence_file = save / ('agreed-drift.' + new + '.json')
+        cooks = len(corpus.lines(root / 'cook-calls.jsonl'))
+        builds_before = sorted((root / 'builds').iterdir())
+        absent_before = not os.path.lexists(build)
+        wrong = ('0' if actual[0] != '0' else '1') + actual[1:]
+        status, out = op('prepare', connectome_kitchen_agreed_drift=[{**agreement[0], 'sha256': wrong}])
+        ok('wrong recipe hash: kitchen check refused with E_LOCK_INVALID before a new cook or build',
+           status != 0 and 'runner check: exit 1' in out and 'E_LOCK_INVALID' in out and 'the running build is not its agreed drift' in out
+           and absent_before and not os.path.lexists(build) and sorted((root / 'builds').iterdir()) == builds_before
+           and len(corpus.lines(root / 'cook-calls.jsonl')) == cooks and not evidence_file.exists()
+           and pointers() == before and show('MainPID') == pid0 and changed() == set(), out)
+
     status, out = op('plan', connectome_kitchen_build='0' * 63 + '1')
     ok('plan with another pinned name: refused, nothing written', status != 0 and changed() == set() and pointers() == before, out)
+    check_receipts = lambda: set((home / 'kitchen-takeover' / name).glob('*-check-plan.receipt.json'))
+    previous = check_receipts()
     status, out = op('plan')
-    ok('plan: exit 0, the plan names the build and says there is a build to make', status == 0 and '"prepare":{"build_dir":"<S>' in out.replace('\\"', '"') and changed() == set(), out)
+    written_receipts = check_receipts() - previous
+    prepare_plan = json.loads(next(iter(written_receipts)).read_text())['core'].get('prepare', {}) if len(written_receipts) == 1 else {}
+    ok('plan: exit 0, the plan names the build and says there is a build to make',
+       status == 0 and prepare_plan.get('build_dir') == str(build) and prepare_plan.get('changed') is True and changed() == set(), out)
+    if args.soma_drift:
+        ok('plan: the receipt agrees the exact running recipe drift', prepare_plan.get('agreed_drift') == drift_evidence)
     status, out = op('verify')
     ok('verify before prepare: refused (the build is not there to hold against the running one)', status != 0 and pointers() == before, out)
     status, out = op('start', connectome_kitchen_idle=idle())
@@ -252,9 +315,11 @@ def main():
     ok('prepare: exit 0, the build is prepared', status == 0 and (build / '.prepared').is_file() and (build / '.prepared').read_text() == new, out)
     ok('prepare: the pointer, the unit link, the drop-in and the enable link are as they were; the process too', after[:4] == before[:4] and show('MainPID') == pid0 and set(calls()) <= {'daemon-reload', 'start'} and calls().count('start') == 1)
     ok('prepare: the runner saw the running deployment untouched', '"untouched_by_this_run":true' in out.replace('\\"', '"'), out)
-    save = sandbox / 'save'
     ok('prepare: what rollback needs was saved before the engine wrote, by the operator, 0700', (save / 'links').read_text().split() == [before[0], before[1], before[3]] and (save / 'ownership.json').read_text() == before[4]
        and (save / '90-connectome-env.conf').read_text() == before[2] and (save.stat().st_mode & 0o777) == 0o700)
+    if args.soma_drift:
+        ok('prepare: saved exactly the running build, path and locked/actual recipe digests at 0600',
+           evidence_file.is_file() and evidence_file.stat().st_mode & 0o777 == 0o600 and json.loads(evidence_file.read_text()) == drift_evidence)
     if replayed and not args.new_recipe:
         real = json.loads((case.directory / case.data['cook_build']['directory'] / 'connectome.lock').read_text())
         made = json.loads((build / 'connectome.lock').read_text())
@@ -375,6 +440,13 @@ def main():
     ok('start: one daemon-reload and one restart, no stop', calls()[seen:] == ['daemon-reload', 'restart'], calls()[seen:])
     ok('start: the agent runs the new build in another process, the same after the wait', at(new) and show('ActiveState') == 'active' and pid1 not in ('0', pid0))
     ok('start: verify afterwards finds nothing to change', 'verify after the start: nothing to change' in out, out)
+    if args.soma_drift:
+        inputs = home / 'kitchen-takeover' / name / 'inputs'
+        original = json.loads((inputs / 'request.json').read_text())
+        post_start = inputs / 'request.after-start.json'
+        ok('start: only the post-start verify request omits the old agreement',
+           original.get('agreed_drift') == {'build': old, 'files': agreement} and post_start.is_file()
+           and json.loads(post_start.read_text()) == {key: value for key, value in original.items() if key != 'agreed_drift'})
     written = "environment file as written, against the previous build's: changed: none; added: %s; removed: none" % (', '.join(sorted(new_files)) or 'none')
     ok('start: the environment file the engine wrote differs from the previous build\'s in %s' % ('exactly the named new ' + ', '.join(sorted(new_files)) if new_files else 'no name'), written in out, out)
     for env in new_files:
@@ -409,6 +481,9 @@ def main():
     ok('rollback: the pointers, the drop-in and ownership.json are what prepare saved; the agent runs the previous build', pointers() == before and at(old) and show('ActiveState') == 'active' and show('MainPID') not in ('0', pid1))
     ok('rollback: one stop, one daemon-reload, one start', calls()[seen:] == ['stop', 'daemon-reload', 'start'], calls()[seen:])
     ok('rollback: the agent\'s state directory, both builds and the secrets file are untouched', (build / '.prepared').is_file() and (root / 'builds' / old / '.prepared').is_file())
+    if args.soma_drift:
+        ok('rollback: both drifts remain byte for byte in the running build',
+           all((running / path).is_file() and hashlib.sha256((running / path).read_bytes()).hexdigest() == digest for path, digest in patched.items()))
     status, out = op('plan')
     ok('after rollback, plan refuses the new build directory as unmanaged (ownership.json is the saved one)', status != 0 and 'unmanaged build directory' in out, out)
     shutil.rmtree(build); shutil.rmtree(root / 'cook-config' / new, ignore_errors=True); shutil.rmtree(root / 'cook-credentials' / new, ignore_errors=True)

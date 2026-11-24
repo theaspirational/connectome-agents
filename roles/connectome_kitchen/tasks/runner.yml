@@ -1,6 +1,7 @@
 ---
 # One step of the runner of kitchen (scripts/takeover.mjs MODE --input FILE), as the account, in a closed environment.
-# In: ck_mode (check, prepare, verify, start). Out: ck_result: rc, plan, same_environment, environment_file, secret_files,
+# In: ck_mode (check, prepare, verify, start), optional ck_runner_input (override for post-start verify).
+# Out: ck_result: rc, plan, same_environment, environment_file, secret_files,
 # unclosed (files/kitchen-step.py). After verify also: ck_secrets, the names in which the environment file of a start
 # would differ from the running build's (files/kitchen-secrets.mjs), and ck_environment: same-environment,
 # new-secret-files or ANOTHER-ENVIRONMENT, with ck_environment_words to say it. For a first install there is no running
@@ -11,7 +12,7 @@
 
 - name: "Run kitchen: {{ ck_mode }}"
   ansible.builtin.command:
-    argv: "{{ [connectome_kitchen_python, '-I', role_path + '/files/kitchen-step.py', ck_mode, '/usr/bin/timeout', '-k', '15', connectome_kitchen_runner_timeout_seconds | string] + ck_as + [connectome_kitchen_node, connectome_kitchen_home + '/scripts/takeover.mjs', ck_mode, '--input', ck_keep + '/inputs/request.json'] }}"
+    argv: "{{ [connectome_kitchen_python, '-I', role_path + '/files/kitchen-step.py', ck_mode, '/usr/bin/timeout', '-k', '15', connectome_kitchen_runner_timeout_seconds | string] + ck_as + [connectome_kitchen_node, connectome_kitchen_home + '/scripts/takeover.mjs', ck_mode, '--input', ck_runner_input | default(ck_keep + '/inputs/request.json')] }}"
     chdir: "{{ connectome_kitchen_home }}"
   changed_when: ck_mode in ['prepare', 'start']
   register: ck_run
@@ -24,7 +25,7 @@
 # secrets file and the same request, with kitchen's own reading of the layers. Names only leave the helper.
 - name: "Ask in which names the environment file would differ from the running build's (names, never a value): {{ ck_mode }}"
   ansible.builtin.command:
-    argv: "{{ ck_as + [connectome_kitchen_node, role_path + '/files/kitchen-secrets.mjs', connectome_kitchen_home, ck_keep + '/inputs/request.json', 'proposed'] }}"
+    argv: "{{ ck_as + [connectome_kitchen_node, role_path + '/files/kitchen-secrets.mjs', connectome_kitchen_home, ck_runner_input | default(ck_keep + '/inputs/request.json'), 'proposed'] }}"
     chdir: "{{ connectome_kitchen_home }}"
   changed_when: false
   failed_when: false

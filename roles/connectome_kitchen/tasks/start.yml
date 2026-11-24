@@ -164,12 +164,23 @@
       ansible.builtin.fail:
         msg: "ROLLED BACK. The start of {{ connectome_kitchen_build[:8] }} or the health of the agent after it failed; {{ ck_name }} now runs the previous build {{ connectome_kitchen_live_build[:8] }} in a new process, on its state as the new build left it. Tell the agent it was restarted."
 
-# From here on the agent runs the new build and is stable. What follows changes nothing and puts nothing back.
+# From here on the agent runs the new build and is stable. What follows changes nothing in the deployment.
+# The old build's agreement was only for the build that current named before activation. Keep the original
+# request for the window, and give this last verify the same request with no agreement.
+
+- name: Write the post-start verification request without the old build's agreement
+  ansible.builtin.copy:
+    dest: "{{ ck_keep }}/inputs/request.after-start.json"
+    owner: "{{ connectome_kitchen_account }}"
+    mode: "0600"
+    content: "{{ ck_document | dict2items | rejectattr('key', 'equalto', 'agreed_drift') | list | items2dict | to_nice_json }}"
+  when: ck_document.agreed_drift is defined
 
 - name: Verify after the start
   ansible.builtin.include_tasks: runner.yml
   vars:
     ck_mode: verify
+    ck_runner_input: "{{ ck_keep + '/inputs/' + ('request.after-start.json' if ck_document.agreed_drift is defined else 'request.json') }}"
 
 - name: Read back what the agent shows
   ansible.builtin.include_tasks: inspect.yml
