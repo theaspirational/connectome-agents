@@ -105,6 +105,9 @@ connectome_kitchen_secrets_differ_ok: false
 # none of the named ones is there yet. A direct value that changed, or any other name added or removed, still refuses:
 # naming a new file authorizes that file and nothing beside it. `clear` removes exactly these files after a rollback.
 connectome_kitchen_secret_files_new: []
+# Plain environment names (not secret files) added by this takeover. Nonempty: verify and start require exactly
+# these additions, no changed or removed names, and every secret file already matching. Not sent to kitchen.
+connectome_kitchen_env_names_new: []
 
 # What `verify` and `readback` hold the recipe to. Paths are RFC 6901 pointers into the recipe.
 # The leaves in which the new cooked recipe may differ from the live one (after the build's name is replaced).

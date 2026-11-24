@@ -151,8 +151,16 @@ environment variable in `connectome_kitchen_secret_files_new`: `start` then take
 
 Naming a new file authorizes that file and nothing beside it. A direct value that changed in the secrets file since
 the running process was started (a rotated `ANTHROPIC_API_KEY`, another `ANTHROPIC_BASE_URL`) refuses the start, with
-or without a named new file, and `verify` says which name it is. The one way to start all the same is the separate
-`connectome_kitchen_secrets_differ_ok=true`, which takes every difference.
+or without a named new file, and `verify` says which name it is. With no plain-name declaration, the one way to
+start all the same is the separate `connectome_kitchen_secrets_differ_ok=true`, which takes every difference.
+
+To add plain environment names rather than secret files, set `connectome_kitchen_env_names_new: [NAME]`. This
+does not declare credentials in the agent layer or change the kitchen request; it only authorizes the difference.
+With a nonempty list, `verify` refuses unless the added names are **exactly** those declared, with no changed or
+removed names, no declared name mapping to a secret file, and every secret file already matching what start would
+write. `start` checks again immediately before activation and checks the actual delta after the write, even if
+`connectome_kitchen_secrets_differ_ok` is set. This does not allow adding plain names and secret files in the same
+window. For a first install, leave the list empty.
 
 The engine reads the secrets file again when it starts. So after the restart the role holds the environment file the
 engine wrote against the previous build's in the same way: it must differ in exactly the names that were held before
@@ -303,6 +311,9 @@ a stand-in service manager that keeps real processes: the gates, a start, a star
 does not stay up, the way back, and the retry after it through `clear`, `prepare`, `verify` and a second real
 start; a way back that fails at `ownership.json` and the next one; a direct secret that changed, with and without
 a named new file, before the start and (`--scenario rotated-at-start`) between the check and the start.
+`--scenario new-env-names --case example` focuses on the exact plain-name declaration in verify and start, including
+a change between the final check and the write. Pass `--prepare-with /path/to/roles/connectome_kitchen` to exercise
+an earlier role's prepare against the current role's verify and start.
 `--scenario first-install` begins where nothing is deployed: the refusals, a first start the engine takes back, the
 first start, `readback`, `remove`, the install again from nothing, a build that does not stay up with and without
 `connectome_kitchen_auto_rollback`, and the removal with the state directory. `tests/kitchen/render.yml` words the request without a host,

@@ -350,7 +350,7 @@ class Scripts(unittest.TestCase):
         self.assertIn('LOOK  the lock of the new build names its staged recipe by digest', done.stdout.splitlines())
         self.assertIn("LOOK  %s: unexpected ['/recipe/sha256']; missing []" % no, done.stdout.splitlines())
 
-    def test_new_secret_files_are_the_only_other_environment_a_start_takes(self):
+    def test_only_exact_declared_environment_differences_are_taken(self):
         runner = yaml.safe_load((ROLE / 'tasks/runner.yml').read_text())
         expression = next(task for task in runner if 'ck_environment' in task.get('ansible.builtin.set_fact', {}))['ansible.builtin.set_fact']['ck_environment']
         try:
@@ -360,8 +360,9 @@ class Scripts(unittest.TestCase):
         environment = jinja2.Environment()
         environment.filters['dict2items'] = lambda record: [{'key': key, 'value': value} for key, value in record.items()]  # as ansible.builtin.dict2items
         names = lambda changed=(), added=(), removed=(), files=('A', 'B'), compared=True: {'compared': compared, 'same': ['K'], 'changed': list(changed), 'added': list(added), 'removed': list(removed), 'secret_files': list(files)}
-        render = lambda new, same, env, files, secrets: environment.from_string(expression).render(
-            connectome_kitchen_secret_files_new=new, ck_result={'same_environment': same, 'environment_file': env, 'secret_files': files}, ck_secrets=secrets).strip()
+        render = lambda new, same, env, files, secrets, plain=(): environment.from_string(expression).render(
+            connectome_kitchen_secret_files_new=new, connectome_kitchen_env_names_new=plain,
+            ck_result={'same_environment': same, 'environment_file': env, 'secret_files': files}, ck_secrets=secrets).strip()
         self.assertEqual(render([], True, True, {'A': True}, names()), 'same-environment')
         self.assertEqual(render(['B'], True, True, {'A': True, 'B': True}, names()), 'same-environment')
         self.assertEqual(render(['B'], False, False, {'A': True, 'B': None}, names(added=['B'])), 'new-secret-files')
@@ -377,6 +378,22 @@ class Scripts(unittest.TestCase):
         for new, env, files in (([], False, {'A': True, 'B': None}), (['B'], False, {'A': False, 'B': None}), (['B'], False, {'A': None, 'B': None}), (['B'], False, {'A': True, 'B': False}),
                                 (['B'], None, {'A': True, 'B': None}), (['B'], False, {'A': True}), (['B'], False, {}), (['B', 'C'], False, {'A': True, 'B': None}), ([], False, {'A': True})):
             self.assertEqual(render(new, False, env, files, names(added=['B'])), 'ANOTHER-ENVIRONMENT', (new, env, files))
+        held_files = {'A': True, 'B': True}
+        self.assertEqual(render([], False, False, held_files, names(added=['PLAIN']), ['PLAIN']), 'new-env-names')
+        self.assertEqual(render([], False, False, held_files, names(added=['OTHER', 'PLAIN']), ['PLAIN', 'OTHER']), 'new-env-names')
+        for secrets, files, plain in (
+            (names(added=['PLAIN']), held_files, ['OTHER']),
+            (names(added=['PLAIN']), held_files, ['PLAIN', 'PLAIN']),
+            (names(added=['PLAIN'], changed=['K']), held_files, ['PLAIN']),
+            (names(added=['PLAIN'], removed=['K']), held_files, ['PLAIN']),
+            (names(), held_files, ['PLAIN']),
+            (names(added=['B']), held_files, ['B']),
+            (names(added=['PLAIN']), {'A': True, 'B': False}, ['PLAIN']),
+            (names(added=['PLAIN']), {'A': True, 'B': None}, ['PLAIN']),
+            (names(added=['PLAIN']), {'A': True}, ['PLAIN']),
+            ({'compared': False, 'reason': 'x'}, held_files, ['PLAIN']),
+        ):
+            self.assertEqual(render([], False, False, files, secrets, plain), 'ANOTHER-ENVIRONMENT', (secrets, files, plain))
         start = (ROLE / 'tasks/start.yml').read_text()
         self.assertIn("- ck_environment != 'ANOTHER-ENVIRONMENT' or (connectome_kitchen_secrets_differ_ok | bool)", start)
         # After the restart, what the engine wrote is held to the names held before; a difference is a failed start.
@@ -385,10 +402,12 @@ class Scripts(unittest.TestCase):
         held = next(task for task in block if task['name'].startswith('Stop here unless the environment file the engine wrote'))
         self.assertEqual(held['ansible.builtin.assert']['that'], ['ck_written.compared', 'ck_held_secrets.compared', 'ck_written.changed == ck_held_secrets.changed',
                                                                'ck_written.added == ck_held_secrets.added', 'ck_written.removed == ck_held_secrets.removed'])
-        self.assertEqual(held['when'], 'not (connectome_kitchen_secrets_differ_ok | bool)')
+        self.assertEqual(held['when'], "ck_environment == 'new-env-names' or not (connectome_kitchen_secrets_differ_ok | bool)")
         for task in [task for task in runner if 'kitchen-secrets.mjs' in json.dumps(task)] + [task for task in block if 'kitchen-secrets.mjs' in json.dumps(task)]:
             self.assertIs(task['no_log'], True)
-        self.assertEqual(yaml.safe_load((ROLE / 'defaults/main.yml').read_text())['connectome_kitchen_secret_files_new'], [])
+        defaults = yaml.safe_load((ROLE / 'defaults/main.yml').read_text())
+        self.assertEqual(defaults['connectome_kitchen_secret_files_new'], [])
+        self.assertEqual(defaults['connectome_kitchen_env_names_new'], [])
 
     def secrets(self, layer, values, old_env, mode='proposed', new_env=None):
         """files/kitchen-secrets.mjs over a stand-in of kitchen's three modules: one layer, no merge."""

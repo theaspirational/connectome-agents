@@ -2,7 +2,7 @@
 """Sandbox trial of roles/connectome_kitchen: every operation through ansible-playbook, on a case of kitchen's deploy corpus.
 
     trial.py --kitchen CLONE --ansible ANSIBLE_DIR --scratch DIR [--corpus DIR] --case NAME
-             [--scenario full|fail-start|short-lived|rotated-at-start|first-install] [--soma-drift]
+             [--scenario full|fail-start|short-lived|rotated-at-start|first-install|new-env-names] [--soma-drift]
              [--new-recipe FILE --expect-leaf POINTER ... --changed-leaf POINTER ... --lock-leaf POINTER ... --new-secret-file SECRET=ENV ...]
 
 Not part of `scripts/test.sh`: it needs a built kitchen clone (with its test harness), ansible-core and Node.
@@ -25,6 +25,9 @@ start that fails (the engine takes it back and nothing is left installed), the f
 install again from nothing, a build that does not stay up with and without connectome_kitchen_auto_rollback, and the
 removal with the state directory. `--changed-leaf` there names a leaf the recipe must have, `--connected` a server.
 
+`--scenario new-env-names --case example` tries an exact plain environment addition, unrelated differences, and a
+change between verification and the write. `--prepare-with ROLE_DIR` can run its prepare with an older role checkout.
+
 `--new-recipe` puts another recipe in place before the new build is asked for (the running build keeps the case's own),
 and cook is then the corpus stand-in, since a real lock can only be replayed for the recipe it was made from.
 `--expect-leaf` names a leaf of the recipe that goes, `--changed-leaf` one that comes or changes, `--lock-leaf` a leaf of
@@ -41,6 +44,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 results = []
+PLAIN_NAME = 'EXAMPLE_MCPL_TOKEN'
+PLAIN_VALUE = 'synthetic-trial-value-for-new-name'
+ROTATED_VALUE = 'synthetic-trial-value-that-replaces-an-old-one'
+RETIRED_VALUE = 'synthetic-trial-value-for-retired-name'
 
 
 def ok(label, held, detail=''):
@@ -87,7 +94,8 @@ def main():
     parser.add_argument('--scratch', required=True)
     parser.add_argument('--corpus', help='a deploy corpus; default: the synthetic one of the clone')
     parser.add_argument('--case', required=True)
-    parser.add_argument('--scenario', default='full', choices=('full', 'fail-start', 'short-lived', 'rotated-at-start', 'first-install'))
+    parser.add_argument('--scenario', default='full', choices=('full', 'fail-start', 'short-lived', 'rotated-at-start', 'first-install', 'new-env-names'))
+    parser.add_argument('--prepare-with', type=Path, help='role directory for the prepare in the new-env-names scenario')
     parser.add_argument('--soma-drift', action='store_true')
     parser.add_argument('--new-recipe')
     parser.add_argument('--expect-leaf', action='append', default=[])
@@ -100,6 +108,10 @@ def main():
     args = parser.parse_args()
     if args.soma_drift and args.scenario == 'first-install':
         parser.error('--soma-drift is a drift of a running build; a first install has none')
+    if args.prepare_with and args.scenario != 'new-env-names':
+        parser.error('--prepare-with is for the new-env-names scenario')
+    if args.scenario == 'new-env-names' and (args.case != 'example' or args.new_secret_file):
+        parser.error('new-env-names uses the example case and adds only a plain name')
     kitchen, scratch, node = Path(args.kitchen).resolve(), Path(args.scratch).resolve(), args.node
     sys.dont_write_bytecode = True
     sys.path[:0] = [str(kitchen / 'test/corpus'), str(kitchen / 'test/differential')]
@@ -202,6 +214,10 @@ def main():
         secrets_file = Path(world.effective['secrets_file'])
         secrets_file.write_text(json.dumps({**json.loads(secrets_file.read_text()), secret: 'placeholder-of-the-trial-' + secret}, sort_keys=True))
         new_files.append(env)
+    if args.scenario == 'new-env-names':
+        agent['required_secrets'] = agent['required_secrets'] + [PLAIN_NAME]
+        secrets_file = Path(world.effective['secrets_file'])
+        secrets_file.write_text(json.dumps({**json.loads(secrets_file.read_text()), PLAIN_NAME: PLAIN_VALUE}, sort_keys=True))
     world.raw_layers['agent'], world.layers[3] = agent, agent
     import connectome_config
     world.effective = connectome_config.merge_layers(copy.deepcopy(world.layers))
@@ -230,7 +246,12 @@ def main():
         agreement = [{'path': 'cook-recipe.json', 'sha256': actual}]
         variables['connectome_kitchen_agreed_drift'] = agreement
     play = scratch / 'play.yml'
-    play.write_text('- hosts: localhost\n  connection: local\n  gather_facts: false\n  roles:\n    - role: %s\n' % (REPO / 'roles/connectome_kitchen'))
+    play_template = '- hosts: localhost\n  connection: local\n  gather_facts: false\n  roles:\n    - role: %s\n'
+    play.write_text(play_template % (REPO / 'roles/connectome_kitchen'))
+    prepare_play = play
+    if args.prepare_with:
+        prepare_play = scratch / 'prepare.yml'
+        prepare_play.write_text(play_template % args.prepare_with.resolve())
     ansible = Path(args.ansible).resolve()
     environment = {'PATH': '/usr/bin:/bin', 'HOME': str(scratch / 'controller-home'), 'PYTHONPATH': str(ansible / 'lib'), 'ANSIBLE_NOCOLOR': '1', 'ANSIBLE_LOCAL_TEMP': str(scratch / 'ansible-local'),
                    'ANSIBLE_REMOTE_TEMP': str(scratch / 'ansible-remote'), 'LANG': 'C.UTF-8', 'KITCHEN_BACK_WAIT': '6', 'KITCHEN_BACK_SETTLE': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
@@ -239,7 +260,7 @@ def main():
 
     def op(operation, **extra):
         (scratch / 'vars.json').write_text(json.dumps({**variables, 'connectome_kitchen_operation': operation, **extra}))
-        done = subprocess.run([sys.executable, str(ansible / 'bin/ansible-playbook'), '-i', 'localhost,', str(play), '-e', '@' + str(scratch / 'vars.json')],
+        done = subprocess.run([sys.executable, str(ansible / 'bin/ansible-playbook'), '-i', 'localhost,', str(prepare_play if operation == 'prepare' else play), '-e', '@' + str(scratch / 'vars.json')],
                               env=environment, capture_output=True, text=True, timeout=900, cwd=str(scratch))
         text = done.stdout + done.stderr
         with log.open('a') as stream:
@@ -271,6 +292,9 @@ def main():
     ok('name: nothing of the deployment was written', changed() == set() and pointers() == before, sorted(changed())[:8])
 
     save = sandbox / 'save'
+    if args.scenario == 'new-env-names':
+        return new_env_names(world, op, sc, show, calls, pointers, before, at, idle, cooked, old, new, save, log, unit)
+
     if args.soma_drift:
         evidence_file = save / ('agreed-drift.' + new + '.json')
         cooks = len(corpus.lines(root / 'cook-calls.jsonl'))
@@ -543,6 +567,105 @@ def main():
     pid4, seen = show('MainPID'), len(calls())
     status, out = op('rollback', connectome_kitchen_idle=idle())
     ok('rollback once more: nothing to put back, ownership.json is the saved one, nothing restarted', status == 0 and 'Nothing to put back' in out and 'ownership.json is the saved one.' in out and show('MainPID') == pid4 and calls()[seen:] == [], out)
+    return finish(sc, unit, log)
+
+
+def new_env_names(world, op, sc, show, calls, pointers, before, at, idle, cooked, old, new, save, log, unit):
+    root = Path(world.root)
+    keep = world.home / 'kitchen-takeover' / world.effective['name']
+    request = keep / 'inputs/request.json'
+    marker = save / 'verified'
+    declaration = {'connectome_kitchen_env_names_new': [PLAIN_NAME]}
+    added = 'added: ' + PLAIN_NAME + ';'
+    secrets = Path(world.effective['secrets_file'])
+    filled = secrets.read_text()
+    rotated = json.dumps({**json.loads(filled), 'EXAMPLE_API_KEY': ROTATED_VALUE}, sort_keys=True)
+    pid0 = show('MainPID')
+    seen = len(calls())
+    status, out = op('prepare')
+    ok('prepare without the declaration: build prepared and live deployment untouched',
+       status == 0 and (root / 'builds' / new / '.prepared').is_file() and pointers()[:4] == before[:4], out)
+    if status != 0:
+        return finish(sc, unit, log)
+    prepared_request = request.read_bytes()
+    prepared = pointers()
+    cooked(new)
+
+    status, out = op('verify', connectome_kitchen_env_names_new=['NOT_ADDED'])
+    ok('verify refuses an unrelated addition before IDLE and does not mark the build',
+       status != 0 and 'ANOTHER-ENVIRONMENT: expected exactly' in out and added in out and not marker.exists(), out)
+    status, out = op('verify', **declaration)
+    ok('verify accepts exactly the declared plain name without IDLE or a new prepare',
+       status == 0 and 'plus exactly the declared plain environment names' in out and 'new-env-names' in marker.read_text(), out)
+    ok('request.json is byte-identical with and without the role-only declaration', request.read_bytes() == prepared_request)
+    held = marker.read_bytes()
+
+    def refuse_both(label, word, **extra):
+        for operation in ('verify', 'start'):
+            status, out = op(operation, **extra, **({'connectome_kitchen_idle': idle()} if operation == 'start' else {}))
+            ok(operation + ' refuses ' + label + ' without changing the verified mark or restarting',
+               status != 0 and 'ANOTHER-ENVIRONMENT: expected exactly' in out and word in out and added in out
+               and marker.read_bytes() == held and pointers() == prepared and show('MainPID') == pid0 and calls()[seen:] == [], out)
+
+    refuse_both('an unrelated addition', 'NOT_ADDED', connectome_kitchen_env_names_new=['NOT_ADDED'])
+    secrets.write_text(rotated)
+    refuse_both('a changed old value alongside the allowed addition', 'changed: EXAMPLE_API_KEY;', **declaration)
+    secrets.write_text(filled)
+
+    # Simulate a retired plain name in the previous build's observed environment, without changing the new request.
+    old_env = root / 'builds' / old / 'secrets.env'
+    original = old_env.read_bytes()
+    old_env.write_bytes(original + ('RETIRED_NAME="%s"\n' % RETIRED_VALUE).encode())
+    refuse_both('a removed old name alongside the allowed addition', 'removed: RETIRED_NAME', **declaration)
+    old_env.write_bytes(original)
+
+    secret_copy = root / 'state/secret-files/CHAT_RC_PATH'
+    original_copy = secret_copy.read_bytes()
+    secret_copy.write_text(ROTATED_VALUE)
+    refuse_both('a mismatched secret file alongside the allowed addition', 'write: CHAT_RC_PATH;', **declaration)
+    secret_copy.write_bytes(original_copy)
+
+    status, out = op('verify')
+    ok('with no declaration, verify still reports ANOTHER environment without failing', status == 0 and 'ANOTHER environment or secret file' in out, out)
+    status, out = op('start', connectome_kitchen_idle=idle())
+    ok('with no declaration, start still refuses the addition without a restart',
+       status != 0 and 'another environment or secret file' in out and pointers() == prepared and show('MainPID') == pid0 and calls()[seen:] == [], out)
+
+    # Change the input after the final verify accepted it: the written-delta check must run even with the broad flag.
+    (world.sandbox / 'knobs/secrets-at-start').write_text(rotated)
+    status, out = op('start', connectome_kitchen_idle=idle(), connectome_kitchen_secrets_differ_ok=True, **declaration)
+    rolled_back = (status != 0 and 'the secrets file changed between the check and the start' in out
+                   and 'ROLLED BACK' in out and at(old) and pointers() == before and old_env.read_bytes() == original)
+    ok('post-write check catches a concurrent change even with the broad flag, and rolls back',
+       rolled_back and calls()[seen:] == ['daemon-reload', 'restart', 'stop', 'daemon-reload', 'start'], out)
+    if not rolled_back:
+        return finish(sc, unit, log)
+    # As documented, rollback restores the old ownership manifest, which does not own the new build.
+    # Discard that sandbox build and prepare again (still with --prepare-with if supplied).
+    for directory in ('builds', 'cook-config', 'cook-credentials'):
+        path = root / directory / new
+        if path.exists():
+            shutil.rmtree(path)
+    secrets.write_text(filled)
+    status, out = op('prepare')
+    ok('retry: prepare after discarding the build left by the deliberate rollback', status == 0, out)
+    if status != 0:
+        return finish(sc, unit, log)
+    cooked(new)
+    status, out = op('verify', **declaration)
+    ok('retry: verify holds the prepared build with the exact declaration', status == 0, out)
+    pid0, seen = show('MainPID'), len(calls())
+    status, out = op('start', connectome_kitchen_idle=idle(), **declaration)
+    ok('start with the declaration only: one restart, with exactly the declared name added',
+       status == 0 and 'STARTED: ' in out and 'changed: none; ' + added + ' removed: none' in out
+       and 'verify after the start: nothing to change' in out and at(new) and calls()[seen:] == ['daemon-reload', 'restart']
+       and show('MainPID') not in ('0', pid0)
+       and not (root / 'state/secret-files' / PLAIN_NAME).exists(), out)
+    # Check log, request and receipts without printing any of their contents.
+    recorded = [log, *(path for path in keep.rglob('*') if path.is_file())]
+    values = [*world.secrets.values(), PLAIN_VALUE, ROTATED_VALUE, RETIRED_VALUE]
+    ok('no secret fixture value occurs in play output, runner logs, requests or receipts',
+       not any(value in path.read_text(errors='replace') for path in recorded for value in values))
     return finish(sc, unit, log)
 
 

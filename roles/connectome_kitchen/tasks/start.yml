@@ -90,6 +90,7 @@
         fail_msg: "start exited 0 but the agent is not active and running on the new build in a new process"
 
     # The engine reads the secrets file again when it starts. What it wrote is held to what was held before.
+    # A new-env-names delta was authorized exactly; the legacy broad override cannot skip that check.
     - name: Ask in which names the environment file the engine wrote differs from the previous build's (names, never a value)
       ansible.builtin.command:
         argv: "{{ ck_as + [connectome_kitchen_node, role_path + '/files/kitchen-secrets.mjs', connectome_kitchen_home, ck_keep + '/inputs/request.json', 'written'] }}"
@@ -112,7 +113,7 @@
           - ck_written.added == ck_held_secrets.added
           - ck_written.removed == ck_held_secrets.removed
         fail_msg: "the environment file the engine wrote for the new build does not differ from the previous build's in exactly the names held before the start ({{ ('changed: ' + (ck_written.changed | join(', ') | default('none', true)) + '; added: ' + (ck_written.added | join(', ') | default('none', true)) + '; removed: ' + (ck_written.removed | join(', ') | default('none', true))) if ck_written.compared else ck_written.reason }}): the secrets file changed between the check and the start"
-      when: not (connectome_kitchen_secrets_differ_ok | bool)
+      when: ck_environment == 'new-env-names' or not (connectome_kitchen_secrets_differ_ok | bool)
 
     - name: "Wait {{ connectome_kitchen_watch_seconds }} s: the same process must still run"
       ansible.builtin.command:
@@ -180,6 +181,7 @@
   ansible.builtin.include_tasks: runner.yml
   vars:
     ck_mode: verify
+    ck_after_start: true
     ck_runner_input: "{{ ck_keep + '/inputs/' + ('request.after-start.json' if ck_document.agreed_drift is defined else 'request.json') }}"
 
 - name: Read back what the agent shows

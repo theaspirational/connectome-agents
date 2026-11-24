@@ -38,6 +38,15 @@
       - "connectome_kitchen_agreed_drift is sequence and connectome_kitchen_agreed_drift is not string and connectome_kitchen_agreed_drift is not mapping and (connectome_kitchen_agreed_drift | reject('mapping') | list | length) == 0 and (connectome_kitchen_agreed_drift | map('dict2items') | map('map', attribute='key') | map('sort') | map('join', ' ') | reject('equalto', 'path sha256') | list | length) == 0 and (connectome_kitchen_agreed_drift | map(attribute='path') | reject('string') | list | length) == 0 and (connectome_kitchen_agreed_drift | map(attribute='sha256') | map('string') | reject('match', '^[0-9a-f]{64}$') | list | length) == 0"
     fail_msg: "Unusable connectome_kitchen invocation. One operation (name, plan, prepare, verify, start, rollback, readback, clear) on one agent, on the host of the agent, not in check mode (plan is the dry run), with the kitchen install, its commit, the Node, the account with its home and uid, a save directory outside that home, the live build and (but for name and plan) the build this request must give. A first install (connectome_kitchen_first_install) names no live build and no agreed drift, has remove in place of rollback and clear, and is the only place for remove. An agreed drift, if any, is a list of {path, sha256} (64 hex). Nothing was changed."
 
+- name: Refuse an unusable declaration of new environment names
+  ansible.builtin.assert:
+    that:
+      - connectome_kitchen_env_names_new is sequence and connectome_kitchen_env_names_new is not string and connectome_kitchen_env_names_new is not mapping
+      - connectome_kitchen_env_names_new | reject('string') | list | length == 0
+      - connectome_kitchen_env_names_new | reject('regex', '[A-Z_][A-Z0-9_]*', match_type='fullmatch') | list | length == 0
+      - (connectome_kitchen_env_names_new | length) == 0 or not (connectome_kitchen_first_install | bool)
+    fail_msg: "connectome_kitchen_env_names_new must be a list of uppercase environment names and must be empty for a first install. Nothing was changed."
+
 - name: Name what the operation works on
   ansible.builtin.set_fact:
     ck_name: "{{ connectome_agent.name }}"
@@ -358,7 +367,7 @@
   ansible.builtin.debug:
     msg:
       - "verify: build {{ connectome_kitchen_build[:8] }} is prepared beside the running {{ connectome_kitchen_live_build[:8] }}; nothing of the running deployment was changed"
-      - "the secrets file gives the new process {{ {'same-environment': 'the environment the running one has', 'new-secret-files': 'the environment and the secret files the running one has and the new ones named (' + (connectome_kitchen_secret_files_new | sort | join(', ')) + '), which are not there yet; the environment file differs in those names and in no other', 'ANOTHER-ENVIRONMENT': 'ANOTHER environment or secret file than the running one has, beyond what is named as new: the start refuses. Know why first (connectome_kitchen_secrets_differ_ok takes every difference, named or not)'}[ck_environment] }}"
+      - "the secrets file gives the new process {{ {'same-environment': 'the environment the running one has', 'new-secret-files': 'the environment and the secret files the running one has and the new ones named (' + (connectome_kitchen_secret_files_new | sort | join(', ')) + '), which are not there yet; the environment file differs in those names and in no other', 'new-env-names': 'the environment the running one has plus exactly the declared plain environment names (' + (connectome_kitchen_env_names_new | sort | join(', ')) + ')', 'ANOTHER-ENVIRONMENT': 'ANOTHER environment or secret file than the running one has, beyond what is named as new: the start refuses. Know why first (connectome_kitchen_secrets_differ_ok takes every difference, named or not)'}[ck_environment] }}"
       - "{{ ck_environment_words }}"
       - "{{ 'the comparison with the running build has no LOOK line' if (ck_inspect_rc | int) == 0 else 'the comparison with the running build has LOOK lines above: read them before the start' }}"
   when: connectome_kitchen_operation == 'verify' and not ck_first

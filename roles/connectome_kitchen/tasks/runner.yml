@@ -1,10 +1,10 @@
 ---
 # One step of the runner of kitchen (scripts/takeover.mjs MODE --input FILE), as the account, in a closed environment.
-# In: ck_mode (check, prepare, verify, start), optional ck_runner_input (override for post-start verify).
+# In: ck_mode (check, prepare, verify, start), optional ck_runner_input and ck_after_start (for post-start verify).
 # Out: ck_result: rc, plan, same_environment, environment_file, secret_files,
 # unclosed (files/kitchen-step.py). After verify also: ck_secrets, the names in which the environment file of a start
 # would differ from the running build's (files/kitchen-secrets.mjs), and ck_environment: same-environment,
-# new-secret-files or ANOTHER-ENVIRONMENT, with ck_environment_words to say it. For a first install there is no running
+# new-secret-files, new-env-names or ANOTHER-ENVIRONMENT, with ck_environment_words to say it. For a first install there is no running
 # build: ck_environment is first-environment, installed-environment (after the first start) or NOT-A-FIRST-ENVIRONMENT,
 # from the runner's answer alone.
 # The step helper prints the closed part of what the runner wrote. An engine failure that is not one of its refusals has
@@ -41,10 +41,12 @@
 # same-environment: the runner says so and no name differs.
 # new-secret-files: nothing is changed and nothing removed; what is added is exactly the secret files named as new, each
 # a secret file of the request; and, by the runner, every other secret file is what the start would write and none of
-# the named ones is there yet. Any other difference, or no comparison: ANOTHER-ENVIRONMENT.
+# the named ones is there yet.
+# With plain environment names declared, only new-env-names is allowed: exactly those additions and no other
+# difference, none a secret file, every secret file already matching. No comparison or no match: ANOTHER-ENVIRONMENT.
 - name: "Say what the secrets file gives the new process: {{ ck_mode }}"
   ansible.builtin.set_fact:
-    ck_environment: "{{ 'ANOTHER-ENVIRONMENT' if not ck_secrets.compared else ('same-environment' if (ck_result.same_environment and ((ck_secrets.changed + ck_secrets.added + ck_secrets.removed) | length) == 0) else ('new-secret-files' if ((connectome_kitchen_secret_files_new | length) > 0 and ck_result.environment_file is false and (ck_secrets.changed | length) == 0 and (ck_secrets.removed | length) == 0 and (ck_secrets.added | sort) == (connectome_kitchen_secret_files_new | sort) and (connectome_kitchen_secret_files_new | reject('in', ck_secrets.secret_files) | list | length) == 0 and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='key') | sort) == (connectome_kitchen_secret_files_new | sort) and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='value') | reject('none') | list | length) == 0) else 'ANOTHER-ENVIRONMENT')) }}"
+    ck_environment: "{%- if not ck_secrets.compared -%} ANOTHER-ENVIRONMENT {%- elif (connectome_kitchen_env_names_new | length) > 0 -%} {{ 'new-env-names' if ( not ck_secrets.changed and not ck_secrets.removed and (ck_secrets.added | sort) == (connectome_kitchen_env_names_new | sort) and (connectome_kitchen_env_names_new | select('in', ck_secrets.secret_files) | list | length) == 0 and (ck_result.secret_files | sort) == (ck_secrets.secret_files | sort) and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | list | length) == 0 ) else 'ANOTHER-ENVIRONMENT' }} {%- elif ck_result.same_environment and ((ck_secrets.changed + ck_secrets.added + ck_secrets.removed) | length) == 0 -%} same-environment {%- elif (connectome_kitchen_secret_files_new | length) > 0 and ck_result.environment_file is false and (ck_secrets.changed | length) == 0 and (ck_secrets.removed | length) == 0 and (ck_secrets.added | sort) == (connectome_kitchen_secret_files_new | sort) and (connectome_kitchen_secret_files_new | reject('in', ck_secrets.secret_files) | list | length) == 0 and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='key') | sort) == (connectome_kitchen_secret_files_new | sort) and (ck_result.secret_files | dict2items | rejectattr('value', 'true') | map(attribute='value') | reject('none') | list | length) == 0 -%} new-secret-files {%- else -%} ANOTHER-ENVIRONMENT {%- endif -%}"
     ck_environment_words: "{{ ('names of the environment file: ' + (ck_secrets.same | length | string) + ' the same; changed: ' + (ck_secrets.changed | join(', ') | default('none', true)) + '; added: ' + (ck_secrets.added | join(', ') | default('none', true)) + '; removed: ' + (ck_secrets.removed | join(', ') | default('none', true)) + '. Secret files that are not what the start would write: ' + (ck_result.secret_files | dict2items | selectattr('value', 'false') | map(attribute='key') | sort | join(', ') | default('none', true)) + '; not there: ' + (ck_result.secret_files | dict2items | selectattr('value', 'none') | map(attribute='key') | sort | join(', ') | default('none', true))) if ck_secrets.compared else ('the environment file could not be held name by name: ' + ck_secrets.reason) }}"
   when: ck_mode == 'verify' and not ck_first
 
@@ -69,3 +71,11 @@
       - ck_result.plan.prepare.build_dir == connectome_root + '/builds/' + connectome_kitchen_build
     fail_msg: "kitchen {{ ck_mode }} exited {{ ck_result.rc }}, or its plan names another build than {{ connectome_kitchen_build }}. Nothing of the running deployment was changed by this step."
   when: ck_mode != 'start'
+
+# This same gate runs in standalone verify (before marking) and in the last verify before activation. The final
+# verify after activation is diagnostic; the actual delta has already been checked by start.yml.
+- name: Refuse unless the environment adds exactly the declared plain names
+  ansible.builtin.assert:
+    that: ck_environment == 'new-env-names'
+    fail_msg: "ANOTHER-ENVIRONMENT: expected exactly the declared new plain environment names ({{ connectome_kitchen_env_names_new | sort | join(', ') }}), with no changed or removed names and every secret file matching. {{ ck_environment_words }}. Nothing of the running deployment was changed, no restart."
+  when: ck_mode == 'verify' and not ck_first and not (ck_after_start | default(false)) and (connectome_kitchen_env_names_new | length) > 0
